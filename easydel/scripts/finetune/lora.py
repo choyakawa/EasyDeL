@@ -19,7 +19,7 @@ python -m easydel.scripts.sft_finetune \
 	--total-batch-size 16 \
 	--dataset_text_field messages
 """
-LORA_RANK = 256
+LORA_RANK = 128
 LORA_PATTERN = ".*(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj).*"
 
 from dataclasses import field
