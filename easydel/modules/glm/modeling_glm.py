@@ -175,12 +175,21 @@ class GlmAttention(AttentionModule):
         value_states = value_states.reshape(kv_shape)
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
-        query_states, key_states = self.rotary(
+        # query_states, key_states = self.rotary(
+        #     positions=position_ids,
+        #     query=query_states,
+        #     key=key_states,
+        #     frequencies=frequencies,
+        # )
+        rotary_dim = query_states.shape[-1] // 2
+        query_rot, key_rot = self.rotary(
             positions=position_ids,
-            query=query_states,
-            key=key_states,
+            query=query_states[..., :rotary_dim],
+            key=key_states[..., :rotary_dim],
             frequencies=frequencies,
         )
+        query_states = torch.cat((query_rot, query_states[..., rotary_dim:]), dim=-1)
+        key_states = torch.cat((key_rot, key_states[..., rotary_dim:]), dim=-1)
 
         (
             key_states,
