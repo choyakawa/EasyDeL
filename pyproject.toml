@@ -36,7 +36,7 @@ dependencies = [
 	"eformer>=0.0.62",
 	"einops~=0.8.0",
 	"transformers>=4.53.1",
-	"flax==0.11.0",
+	"flax",
 	"optax>=0.2.2",
 	"triton~=3.2.0",
 	"jaxtyping~=0.3.2",
