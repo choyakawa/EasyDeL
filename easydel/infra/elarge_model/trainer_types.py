@@ -134,7 +134,7 @@ class BaseTrainerCfg(TypedDict, total=False):
     backend: NotRequired[str | None]
     auto_shard_states: NotRequired[bool]
     performance_mode: NotRequired[bool]
-    track_memory: NotRequired[bool | float]
+    track_memory: NotRequired[bool]
     low_mem_usage: NotRequired[bool]
 
     model_name: NotRequired[str | None]
