@@ -1178,6 +1178,7 @@ def pad_and_truncate_dataset(
     def process_batch(batch: dict[str, list[tp.Any]]) -> dict[str, list[tp.Any]]:
         processed: dict[str, list[tp.Any]] = {}
         for k, v in batch.items():
+            v = jnp.asarray(v)
             pad_val = get_padding_value(k)
             pad = max_length - v.shape[-1]
             if pad < 0 and truncate:
