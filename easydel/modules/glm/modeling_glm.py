@@ -70,7 +70,8 @@ class GlmMLP(nn.Module):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.gate_up_proj = linear_class(config.hidden_size, 2 * config.intermediate_size)
+        self.gate_proj = linear_class(config.hidden_size, config.intermediate_size)
+        self.up_proj = linear_class(config.hidden_size, config.intermediate_size)
         self.down_proj = linear_class(config.intermediate_size, config.hidden_size)
         self.act_fn = ACT2FN[self.config.hidden_act]
 
@@ -80,9 +81,9 @@ class GlmMLP(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        gate_up_states = self.gate_up_proj(hidden_states)
-        gate, up_states = jnp.split(gate_up_states, 2, axis=-1)
-        hidden_states = self.down_proj(up_states * self.act_fn(gate))
+        gate = self.gate_proj(hidden_states)
+        up = self.up_proj(hidden_states)
+        hidden_states = self.down_proj(up * self.act_fn(gate))
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
