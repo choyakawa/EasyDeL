@@ -129,7 +129,7 @@ class GlmAttention(AttentionModule):
         self.v_proj = linear_class(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
         self.o_proj = linear_class(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
 
-        self.rotary = self.config.get_basic_rope(self.dtype, self.head_dim, self.head_dim // 2, False)
+        self.rotary = self.config.get_basic_rope(self.dtype, self.head_dim, self.head_dim, False)
 
         self.attention_performer = FlexibleAttentionModule(
             rngs=rngs,
