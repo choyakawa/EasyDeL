@@ -149,8 +149,12 @@ class GlmConfig(EasyDeLBaseConfig):
         return (
             # Column-wise Sharding (split output dimensions)
             (r".*attn/.*(q_proj|k_proj|v_proj)/(?:base_module/)?kernel", pmag.resolve(ColumnWise)),
+            (r".*attn/.*(q_proj|k_proj|v_proj)/lora_b", pmag.resolve(ColumnWise)),
+            (r".*attn/.*(q_proj|k_proj|v_proj)/lora_a", pmag.resolve(Replicated)),
             # QKV Projections
             (r".*mlp/(gate_proj|up_proj)/(?:base_module/)?kernel", pmag.resolve(ColumnWise)),
+            (r".*mlp/(gate_proj|up_proj)/lora_b", pmag.resolve(ColumnWise)),
+            (r".*mlp/(gate_proj|up_proj)/lora_a", pmag.resolve(Replicated)),
             # MLP Up-Projections
             (r".*embed_tokens/embedding", pmag.resolve(ColumnWise)),  # Token Embeddings
             (r".*embed_vision/embedding", pmag.resolve(ColumnWise)),  # Vision Embeddings
@@ -158,7 +162,11 @@ class GlmConfig(EasyDeLBaseConfig):
             (r".*vision_head/kernel", pmag.resolve(ColumnWise)),  # Vision Model Head
             # Row-wise Sharding (split input dimensions)
             (r".*attn/o_proj/(?:base_module/)?kernel", pmag.resolve(RowWise)),  # Attention Output
+            (r".*attn/o_proj/lora_a", pmag.resolve(RowWise)),
+            (r".*attn/o_proj/lora_b", pmag.resolve(Replicated)),
             (r".*mlp/down_proj/(?:base_module/)?kernel", pmag.resolve(RowWise)),  # MLP Down-Projection
+            (r".*mlp/down_proj/lora_a", pmag.resolve(RowWise)),
+            (r".*mlp/down_proj/lora_b", pmag.resolve(Replicated)),
             (r".*score/kernel", pmag.resolve(RowWise)),  # Sequence Classifier Head
             # Replicated Parameters
             (r".*bias", pmag.resolve(Replicated)),  # All biases
