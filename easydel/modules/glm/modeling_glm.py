@@ -107,7 +107,6 @@ class GlmMLP(nn.Module):
         gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
-        hidden_states = self.dropout(hidden_states)
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
