@@ -148,17 +148,17 @@ class GlmConfig(EasyDeLBaseConfig):
         pmag = self.partition_manager
         return (
             # Column-wise Sharding (split output dimensions)
-            (r".*attn/.*(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
+            (r".*attn/.*(q_proj|k_proj|v_proj)/(?:base_module/)?kernel", pmag.resolve(ColumnWise)),
             # QKV Projections
-            (r".*mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
+            (r".*mlp/(gate_proj|up_proj)/(?:base_module/)?kernel", pmag.resolve(ColumnWise)),
             # MLP Up-Projections
             (r".*embed_tokens/embedding", pmag.resolve(ColumnWise)),  # Token Embeddings
             (r".*embed_vision/embedding", pmag.resolve(ColumnWise)),  # Vision Embeddings
             (r".*lm_head/kernel", pmag.resolve(ColumnWise)),  # Language Model Head
             (r".*vision_head/kernel", pmag.resolve(ColumnWise)),  # Vision Model Head
             # Row-wise Sharding (split input dimensions)
-            (r".*attn/o_proj/kernel", pmag.resolve(RowWise)),  # Attention Output
-            (r".*mlp/down_proj/kernel", pmag.resolve(RowWise)),  # MLP Down-Projection
+            (r".*attn/o_proj/(?:base_module/)?kernel", pmag.resolve(RowWise)),  # Attention Output
+            (r".*mlp/down_proj/(?:base_module/)?kernel", pmag.resolve(RowWise)),  # MLP Down-Projection
             (r".*score/kernel", pmag.resolve(RowWise)),  # Sequence Classifier Head
             # Replicated Parameters
             (r".*bias", pmag.resolve(Replicated)),  # All biases
