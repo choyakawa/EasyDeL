@@ -23,6 +23,7 @@ LORA_RANK = 256
 LORA_PATTERN = ".*(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj).*"
 
 from dataclasses import field
+import os
 
 import jax
 from datasets import load_dataset
@@ -174,7 +175,27 @@ def main():
         formatting_func=lambda x: processor.apply_chat_template(x[sft_config.dataset_text_field], tokenize=False),
     )
 
-    trainer.train()
+    output = trainer.train()
+
+    # Get final training state
+    state = getattr(output, "state", None)
+    if state is None:
+        state = trainer.model_state
+
+    # Merge LoRA adapters into base weights
+    merged_model = state.model.unwrap_lora_to_layers()
+
+    # Gather parameters on the model level to avoid graphother structure mismatch
+    gathered_model = merged_model.gather_model()
+
+    # Only save once from the main process
+    if jax.process_index() == 0:
+        # Use DLPack-based transfer to preserve bf16 during JAX→PyTorch conversion
+        os.environ.setdefault("EASY_SAFE_TRANSFER", "0")
+        # Save as Hugging Face Torch format using direct conversion
+        save_dir = str(trainer.arguments.get_path())
+        hf_model = gathered_model.to_torch(use_meta_torch=True)
+        hf_model.save_pretrained(save_dir, safe_serialization=True)
 
 
 if __name__ == "__main__":
