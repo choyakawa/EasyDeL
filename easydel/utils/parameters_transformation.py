@@ -134,25 +134,32 @@ class TensorConverter:
             platform = jax.extend.backend.get_backend()
             cpu_force = not cuda.is_available()
 
+            def _to_dlpack_capsule(arr):
+                """Create a DLPack capsule from a JAX array, compatible with JAX >= 0.7."""
+                try:
+                    # Preferred path on modern JAX: use __dlpack__
+                    return arr.__dlpack__()
+                except Exception:
+                    # Fallback for older JAX versions
+                    if hasattr(dlpack, "to_dlpack"):
+                        return dlpack.to_dlpack(arr)
+                    # Last resort: host copy then try again
+                    host_arr = jax.device_get(arr)
+                    return host_arr.__dlpack__() if hasattr(host_arr, "__dlpack__") else dlpack.to_dlpack(host_arr)
+
             if (
                 platform in ["cpu", "gpu"]
                 and not cpu_force
                 and not check_bool_flag("EASYDEL_FORCE_TORCH_USE_CPU", False)
             ):
-                dl_pack_jax = dlpack.to_dlpack(
-                    x,
-                    stream=True if (platform == "gpu" and not cpu_force) else None,
-                    src_device=next(iter(x.devices())),
-                )
+                capsule = _to_dlpack_capsule(x)
             else:
-                dl_pack_jax = dlpack.to_dlpack(
-                    jax.device_put(
-                        jax.device_get(x),
-                        jax.devices(EASYDEL_PERFRED_HOST_COPY)[EASYDEL_PERFRED_HOST_COPY_INDEX],
-                    ),
-                    stream=None,
+                y = jax.device_put(
+                    jax.device_get(x),
+                    jax.devices(EASYDEL_PERFRED_HOST_COPY)[EASYDEL_PERFRED_HOST_COPY_INDEX],
                 )
-            return dlpack_pt.from_dlpack(dl_pack_jax)
+                capsule = _to_dlpack_capsule(y)
+            return dlpack_pt.from_dlpack(capsule)
 
     @staticmethod
     def pytorch_to_jax(x: tp.Any) -> jnp.ndarray:
