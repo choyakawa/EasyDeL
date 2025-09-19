@@ -595,7 +595,9 @@ class ModelConverter:
             if len(list(key_shape_checks.keys())) != len(list(state_dict.keys())):
                 warnings.warn("There might be an issue with converted `state_dict`.", stacklevel=1)
             for key, shape in key_shape_checks.items():
-                if state_dict[key].shape != shape:
+                if key not in state_dict:
+                    warnings.warn(f"Missing {key}.", stacklevel=1)
+                elif state_dict[key].shape != shape:
                     warnings.warn(f"Shape conflict at {key}.", stacklevel=1)
             model.load_state_dict(state_dict, assign=True, strict=True)
 
