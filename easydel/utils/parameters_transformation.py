@@ -27,6 +27,7 @@ import jax.extend
 import numpy as np
 from jax import dlpack
 from jax import numpy as jnp
+from jax.experimental import multihost_utils as mhutils
 from tqdm.autonotebook import tqdm
 
 from easydel.utils.helpers import check_bool_flag, get_logger
@@ -124,42 +125,172 @@ class TensorConverter:
     @staticmethod
     def jax_to_pytorch(x: jax.Array) -> tp.Any:
         """Convert JAX array to PyTorch tensor."""
+        def _get_local_array(arr):
+            """Return an addressable local device array for multi-host safe transfer."""
+            try:
+                if getattr(arr, "is_fully_addressable", False):
+                    return arr
+            except Exception:
+                ...
+            try:
+                shards = getattr(arr, "addressable_shards", None)
+                if shards and len(shards) > 0:
+                    return shards[0].data
+            except Exception:
+                ...
+            return arr
+
+        platform = jax.extend.backend.get_backend()
+
+        def _cpu_chunked_transfer(arr: jax.Array):
+            """Safely transfer possibly-large JAX array to torch via CPU in chunks to avoid HBM spikes.
+
+            Strategy:
+            - Always flatten to 1D on-device (reshape is cheap/view) to enable uniform chunking.
+            - Copy chunks of size <= EASYDEL_CHUNK_BYTES from device to host and stitch on CPU.
+            - Finally, reshape back to original shape on CPU and convert to torch.
+            """
+            import math
+            torch = TensorConverter.get_torch()
+            local = _get_local_array(arr)
+            shape = tuple(local.shape)
+            # Fast path for scalars/small tensors
+            total_elems = int(np.prod(shape)) if len(shape) > 0 else 1
+            dtype_np = np.dtype(str(local.dtype)) if isinstance(local.dtype, jnp.dtype) else local.dtype
+            if total_elems == 0:
+                return torch.from_numpy(np.array(jax.device_get(local)))
+
+            # Flatten to 1D for consistent chunking
+            local_1d = jnp.reshape(local, (total_elems,))
+            # Default 128MB per chunk on TPU unless overridden
+            chunk_bytes = int(os.getenv("EASYDEL_CHUNK_BYTES", str(128 * 1024 * 1024)))
+            bytes_per_elem = np.dtype(dtype_np).itemsize
+            elems_per_chunk = max(1, chunk_bytes // max(1, bytes_per_elem))
+
+            host_np_flat = np.empty((total_elems,), dtype=dtype_np)
+            for start in range(0, total_elems, elems_per_chunk):
+                end = min(total_elems, start + elems_per_chunk)
+                # Device to host for a flat slice to minimize transient allocations
+                chunk = jax.device_get(local_1d[start:end])
+                host_np_flat[start:end] = np.asarray(chunk, dtype=dtype_np)
+            host_np = host_np_flat.reshape(shape)
+            return torch.from_numpy(host_np)
+
+        # TPU 专用路径：使用多主机安全的全局收集，避免一次性在某个 TPU 上分配大缓冲
+        if str(platform).lower() == "tpu":
+            host_np = TensorConverter.global_array_to_host_numpy(x, x.dtype)
+            torch = TensorConverter.get_torch()
+            if host_np is None:
+                # 非主进程不返回内容；这里返回一个占位 0 张量，调用方在主进程执行
+                return torch.zeros((), dtype=torch.float32)
+            return torch.from_numpy(host_np)
+
+        # CPU/GPU 平台或强制安全转移：走分块 CPU 转移，避免单次大拷贝
         if check_bool_flag("EASY_SAFE_TRANSFER", True):
-            x = jax.device_get(x)
-            return TensorConverter.get_torch().from_numpy(np.array(x.tolist(), dtype=x.dtype))
+            try:
+                return _cpu_chunked_transfer(x)
+            except Exception:
+                return _cpu_chunked_transfer(_get_local_array(x))
         else:
             from torch import cuda
             from torch.utils import dlpack as dlpack_pt
 
-            platform = jax.extend.backend.get_backend()
             cpu_force = not cuda.is_available()
 
             def _to_dlpack_capsule(arr):
                 """Create a DLPack capsule from a JAX array, compatible with JAX >= 0.7."""
                 try:
-                    # Preferred path on modern JAX: use __dlpack__
-                    return arr.__dlpack__()
+                    # Preferred path on modern JAX: use __dlpack__ on a local-addressable view
+                    _arr = _get_local_array(arr)
+                    return _arr.__dlpack__()
                 except Exception:
                     # Fallback for older JAX versions
                     if hasattr(dlpack, "to_dlpack"):
-                        return dlpack.to_dlpack(arr)
+                        try:
+                            return dlpack.to_dlpack(_get_local_array(arr))
+                        except Exception:
+                            ...
                     # Last resort: host copy then try again
-                    host_arr = jax.device_get(arr)
+                    host_arr = jax.device_get(_get_local_array(arr))
                     return host_arr.__dlpack__() if hasattr(host_arr, "__dlpack__") else dlpack.to_dlpack(host_arr)
 
             if (
-                platform in ["cpu", "gpu"]
+                str(platform).lower() in ["cpu", "gpu"]
                 and not cpu_force
                 and not check_bool_flag("EASYDEL_FORCE_TORCH_USE_CPU", False)
             ):
                 capsule = _to_dlpack_capsule(x)
             else:
                 y = jax.device_put(
-                    jax.device_get(x),
+                    jax.device_get(_get_local_array(x)),
                     jax.devices(EASYDEL_PERFRED_HOST_COPY)[EASYDEL_PERFRED_HOST_COPY_INDEX],
                 )
                 capsule = _to_dlpack_capsule(y)
             return dlpack_pt.from_dlpack(capsule)
+
+    @staticmethod
+    def global_array_to_host_numpy(x: jax.Array, target_dtype: jnp.dtype) -> np.ndarray | None:
+        """Gather a potentially multi-host sharded JAX array into host numpy on process 0.
+
+        - On fully addressable arrays: simple device_get.
+        - On sharded arrays: gather addressable shards per process, all-gather across processes,
+          and assemble the full array on process 0 CPU. Other processes return None.
+        """
+        is_main = jax.process_index() == 0
+
+        # Fast path: already fully addressable
+        try:
+            if getattr(x, "is_fully_addressable", False):
+                host_arr = jax.device_get(x)
+                return np.asarray(host_arr, dtype=np.dtype(DtypeHandler.get_dtype(target_dtype)))
+        except Exception:
+            ...
+
+        # Sharded path: collect local shards
+        local_chunks: list[tuple[list[tuple[int, int]], np.ndarray]] = []
+        try:
+            shards = getattr(x, "addressable_shards", None)
+        except Exception:
+            shards = None
+
+        if shards is None or len(shards) == 0:
+            # Fallback: try to get a local view; may still fail if non-addressable
+            try:
+                host_arr = jax.device_get(x)
+                return np.asarray(host_arr, dtype=np.dtype(DtypeHandler.get_dtype(target_dtype)))
+            except Exception:
+                # As a last resort, return None on non-main to avoid crashes
+                return None if not is_main else np.asarray(
+                    jax.device_get(x.addressable_shards[0].data),
+                    dtype=np.dtype(DtypeHandler.get_dtype(target_dtype)),
+                )
+
+        for shard in shards:
+            idx_pairs: list[tuple[int, int]] = []
+            for dim, sl in enumerate(shard.index):
+                start = 0 if sl.start is None else int(sl.start)
+                stop = x.shape[dim] if sl.stop is None else int(sl.stop)
+                idx_pairs.append((start, stop))
+            chunk_np = np.asarray(
+                jax.device_get(shard.data),
+                dtype=np.dtype(DtypeHandler.get_dtype(target_dtype)),
+            )
+            local_chunks.append((idx_pairs, chunk_np))
+
+        # Cross-host gather (host-only). All processes must participate.
+        gathered: list[list[tuple[list[tuple[int, int]], np.ndarray]]] = mhutils.process_allgather(local_chunks)
+
+        if not is_main:
+            # Other processes do not assemble to save memory
+            return None
+
+        # Assemble on process 0
+        full_np = np.empty(x.shape, dtype=np.dtype(DtypeHandler.get_dtype(target_dtype)))
+        for proc_chunks in gathered:
+            for idx_pairs, chunk in proc_chunks:
+                slices = tuple(slice(s0, s1) for s0, s1 in idx_pairs)
+                full_np[slices] = chunk
+        return full_np
 
     @staticmethod
     def pytorch_to_jax(x: tp.Any) -> jnp.ndarray:
@@ -504,6 +635,7 @@ class StateDictConverter:
         graphtree = unflatten_dict(module.parameters)
         model_parameters = flatten_dict(graphtree, sep=".")
 
+
         from easydel.layers.moe import BaseMoeModule, ParallelMoELinear
         from easydel.utils import traversals
 
@@ -531,8 +663,6 @@ class StateDictConverter:
                     tensor = tensor.materialize()
                 if hasattr(tensor, "value") and hasattr(tensor.value, "materialize"):
                     tensor = tensor.value.materialize()
-                if tensor.dtype != DtypeHandler.get_dtype(dtype):
-                    tensor = tensor.astype(DtypeHandler.get_dtype(dtype))
                 tensor = TensorConverter.jax_to_pytorch(jax.block_until_ready(tensor))
                 is_stacked_moe = key in stacked_moe_keys
 
