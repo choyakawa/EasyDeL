@@ -672,13 +672,6 @@ class StateDictConverter:
                     potential_key = f"{block_path}.experts.{moe_name}.kernel"
                     if potential_key in model_parameters:
                         stacked_moe_keys.add(potential_key)
-        # 准备逐参数 gather 函数（如果可用，用于确保张量是全局形状而非本地分片形状）
-        try:
-            gather_fns_tree = module._gather_fns  # type: ignore[attr-defined]
-            gather_fns = flatten_dict(gather_fns_tree, sep=".") if gather_fns_tree is not None else {}
-        except Exception:
-            gather_fns = {}
-
         torch_state_dict = {}
         with tqdm(model_parameters.items(), desc=f"Converting {module.__class__.__name__} to torch") as pbar:
             for key, tensor in pbar:
@@ -688,12 +681,6 @@ class StateDictConverter:
                     tensor = tensor.materialize()
                 if hasattr(tensor, "value") and hasattr(tensor.value, "materialize"):
                     tensor = tensor.value.materialize()
-                # 尝试对单参数进行 gather，避免仅拿到本地分片（导致形状变成 1/N）
-                try:
-                    if key in gather_fns:
-                        tensor = gather_fns[key](tensor)
-                except Exception:
-                    ...
                 tensor = TensorConverter.jax_to_pytorch(jax.block_until_ready(tensor))
                 is_stacked_moe = key in stacked_moe_keys
 
