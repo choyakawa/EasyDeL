@@ -124,9 +124,27 @@ class TensorConverter:
     @staticmethod
     def jax_to_pytorch(x: jax.Array) -> tp.Any:
         """Convert JAX array to PyTorch tensor."""
+        def _get_local_array(arr):
+            """Return an addressable local device array for multi-host safe transfer."""
+            try:
+                if getattr(arr, "is_fully_addressable", False):
+                    return arr
+            except Exception:
+                ...
+            try:
+                shards = getattr(arr, "addressable_shards", None)
+                if shards and len(shards) > 0:
+                    return shards[0].data
+            except Exception:
+                ...
+            return arr
+
         if check_bool_flag("EASY_SAFE_TRANSFER", True):
-            x = jax.device_get(x)
-            return TensorConverter.get_torch().from_numpy(np.array(x.tolist(), dtype=x.dtype))
+            try:
+                host_arr = jax.device_get(x)
+            except Exception:
+                host_arr = jax.device_get(_get_local_array(x))
+            return TensorConverter.get_torch().from_numpy(np.array(host_arr.tolist(), dtype=host_arr.dtype))
         else:
             from torch import cuda
             from torch.utils import dlpack as dlpack_pt
@@ -137,14 +155,18 @@ class TensorConverter:
             def _to_dlpack_capsule(arr):
                 """Create a DLPack capsule from a JAX array, compatible with JAX >= 0.7."""
                 try:
-                    # Preferred path on modern JAX: use __dlpack__
-                    return arr.__dlpack__()
+                    # Preferred path on modern JAX: use __dlpack__ on a local-addressable view
+                    _arr = _get_local_array(arr)
+                    return _arr.__dlpack__()
                 except Exception:
                     # Fallback for older JAX versions
                     if hasattr(dlpack, "to_dlpack"):
-                        return dlpack.to_dlpack(arr)
+                        try:
+                            return dlpack.to_dlpack(_get_local_array(arr))
+                        except Exception:
+                            ...
                     # Last resort: host copy then try again
-                    host_arr = jax.device_get(arr)
+                    host_arr = jax.device_get(_get_local_array(arr))
                     return host_arr.__dlpack__() if hasattr(host_arr, "__dlpack__") else dlpack.to_dlpack(host_arr)
 
             if (
@@ -155,7 +177,7 @@ class TensorConverter:
                 capsule = _to_dlpack_capsule(x)
             else:
                 y = jax.device_put(
-                    jax.device_get(x),
+                    jax.device_get(_get_local_array(x)),
                     jax.devices(EASYDEL_PERFRED_HOST_COPY)[EASYDEL_PERFRED_HOST_COPY_INDEX],
                 )
                 capsule = _to_dlpack_capsule(y)
@@ -504,6 +526,11 @@ class StateDictConverter:
         graphtree = unflatten_dict(module.parameters)
         model_parameters = flatten_dict(graphtree, sep=".")
 
+        try:
+            gather_fns_map = flatten_dict(module._gather_fns, sep=".")  # type: ignore[attr-defined]
+        except Exception:
+            gather_fns_map = {}
+
         from easydel.layers.moe import BaseMoeModule, ParallelMoELinear
         from easydel.utils import traversals
 
@@ -527,6 +554,13 @@ class StateDictConverter:
             for key, tensor in pbar:
                 if tensor is None:
                     continue
+                # 单参数聚合：将分布式 shard 聚合为本地可寻址数组，避免多主机场景下直接 device_get 失败
+                gather_fn = gather_fns_map.get(key)
+                if callable(gather_fn):
+                    try:
+                        tensor = gather_fn(tensor)
+                    except Exception as _:
+                        ...
                 if hasattr(tensor, "materialize"):
                     tensor = tensor.materialize()
                 if hasattr(tensor, "value") and hasattr(tensor.value, "materialize"):
