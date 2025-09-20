@@ -159,7 +159,7 @@ def main():
             dataset = load_from_disk(runtime_config.processed_dataset_cache_dir)
             use_cached = True
             if jax.process_index() == 0:
-                print(f"Load processed daaset cache: {runtime_config.processed_dataset_cache_dir}")
+                print(f"Load processed dataset cache: {runtime_config.processed_dataset_cache_dir}")
         except Exception:
             dataset = None
 
@@ -179,13 +179,14 @@ def main():
         load_module = ed.AutoEasyDeLModelForCausalLM
 
     # Initialize model
+    local_sft_config = sft_config  # avoid reassigning global variable inside function
     model = load_module.from_pretrained(
         runtime_config.repo_id,
         auto_shard_model=True,
         sharding_axis_dims=runtime_config.sharding_axis,
         config_kwargs=ed.EasyDeLBaseConfigDict(
-            freq_max_position_embeddings=sft_config.max_sequence_length,
-            mask_max_position_embeddings=sft_config.max_sequence_length,
+            freq_max_position_embeddings=local_sft_config.max_sequence_length,
+            mask_max_position_embeddings=local_sft_config.max_sequence_length,
             attn_dtype=runtime_config.attn_dtype,
             attn_softmax_dtype=runtime_config.attn_softmax_dtype,
             gradient_checkpointing=runtime_config.gradient_checkpointing,
@@ -203,15 +204,15 @@ def main():
     # Build trainer first
 
     # If using processed cache, avoid re-packing
-    formatting_func = None if use_cached else (lambda x: processor.apply_chat_template(x[sft_config.dataset_text_field], tokenize=False))
-    if use_cached and sft_config.packing:
+    formatting_func = None if use_cached else (lambda x: processor.apply_chat_template(x[local_sft_config.dataset_text_field], tokenize=False))
+    if use_cached and local_sft_config.packing:
         from dataclasses import replace as _dc_replace
 
-        sft_config = _dc_replace(sft_config, packing=False)
+        local_sft_config = _dc_replace(local_sft_config, packing=False)
 
     trainer = ed.SFTTrainer(
         model=model,
-        arguments=sft_config,
+        arguments=local_sft_config,
         train_dataset=dataset,
         processing_class=processor,
         formatting_func=formatting_func,
