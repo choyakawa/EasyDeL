@@ -185,7 +185,8 @@ def main():
     # Merge LoRA adapters into base weights
     merged_model = state.model.unwrap_lora_to_layers()
     save_dir = str(trainer.arguments.get_path())
-    merged_model.save_pretrained(save_dir, to_torch=True)
+    hf_model = merged_model.to_torch(use_meta_torch=True)
+    hf_model.save_pretrained(save_dir)
 
 
 if __name__ == "__main__":
