@@ -184,9 +184,13 @@ def main():
 
     # Merge LoRA adapters into base weights
     merged_model = state.model.unwrap_lora_to_layers()
-    save_dir = str(trainer.arguments.get_path())
-    hf_model = merged_model.to_torch(use_meta_torch=True)
-    hf_model.save_pretrained(save_dir)
+    
+    if jax.process_index() == 0:
+        gathered_model = merged_model.gather_model()
+        os.environ.setdefault("EASY_SAFE_TRANSFER", "0")
+        save_dir = str(trainer.arguments.get_path())
+        hf_model = gathered_model.to_torch(use_meta_torch=True)
+        hf_model.save_pretrained(save_dirsave_dir, safe_serialization=True)
 
 
 if __name__ == "__main__":
