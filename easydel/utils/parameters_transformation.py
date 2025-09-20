@@ -140,7 +140,15 @@ class TensorConverter:
                 ...
             return arr
 
-        platform = jax.extend.backend.get_backend()
+        # 更稳健的平台检测：优先使用已存在设备的平台集合
+        try:
+            device_platforms = {d.platform for d in jax.devices()}
+        except Exception:
+            device_platforms = set()
+        try:
+            default_backend = jax.default_backend()
+        except Exception:
+            default_backend = None
 
         def _cpu_chunked_transfer(arr: jax.Array):
             """Safely transfer possibly-large JAX array to torch via CPU in chunks to avoid HBM spikes.
@@ -180,7 +188,7 @@ class TensorConverter:
             return torch.from_numpy(host_np)
 
         # TPU 专用路径：使用多主机安全的全局收集，避免一次性在某个 TPU 上分配大缓冲
-        if str(platform).lower() == "tpu":
+        if ("tpu" in device_platforms) or (isinstance(default_backend, str) and default_backend.lower() == "tpu"):
             host_np = TensorConverter.global_array_to_host_numpy(x, x.dtype)
             torch = TensorConverter.get_torch()
             if host_np is None:
@@ -633,7 +641,12 @@ class StateDictConverter:
 
     @staticmethod
     def easydel_to_torch(module: EasyDeLBaseModule, dtype: jnp.dtype = jnp.float16) -> dict[str, tp.Any]:
-        """Convert EasyDeL module to PyTorch state dict."""
+        """Convert EasyDeL module to PyTorch state dict.
+
+        为确保多机/多设备分片权重被正确合并，同时避免一次性全模型 gather 造成 OOM，
+        在逐参数级别上优先尝试使用模块自带的 gather 函数将单个参数聚合为全局张量，
+        随后立刻进行主机分块拷贝到 torch，从而控制峰值内存占用。
+        """
         if dtype is None:
             dtype = module.param_dtype
 
@@ -659,6 +672,13 @@ class StateDictConverter:
                     potential_key = f"{block_path}.experts.{moe_name}.kernel"
                     if potential_key in model_parameters:
                         stacked_moe_keys.add(potential_key)
+        # 准备逐参数 gather 函数（如果可用，用于确保张量是全局形状而非本地分片形状）
+        try:
+            gather_fns_tree = module._gather_fns  # type: ignore[attr-defined]
+            gather_fns = flatten_dict(gather_fns_tree, sep=".") if gather_fns_tree is not None else {}
+        except Exception:
+            gather_fns = {}
+
         torch_state_dict = {}
         with tqdm(model_parameters.items(), desc=f"Converting {module.__class__.__name__} to torch") as pbar:
             for key, tensor in pbar:
@@ -668,6 +688,12 @@ class StateDictConverter:
                     tensor = tensor.materialize()
                 if hasattr(tensor, "value") and hasattr(tensor.value, "materialize"):
                     tensor = tensor.value.materialize()
+                # 尝试对单参数进行 gather，避免仅拿到本地分片（导致形状变成 1/N）
+                try:
+                    if key in gather_fns:
+                        tensor = gather_fns[key](tensor)
+                except Exception:
+                    ...
                 tensor = TensorConverter.jax_to_pytorch(jax.block_until_ready(tensor))
                 is_stacked_moe = key in stacked_moe_keys
 
