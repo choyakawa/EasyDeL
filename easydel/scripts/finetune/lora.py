@@ -190,8 +190,6 @@ def main():
 
     # Only save once from the main process
     if jax.process_index() == 0:
-        # Use DLPack-based transfer to preserve bf16 during JAX→PyTorch conversion
-        os.environ.setdefault("EASY_SAFE_TRANSFER", "0")
         # Save as Hugging Face Torch format using direct conversion
         save_dir = str(trainer.arguments.get_path())
         hf_model = gathered_model.to_torch(use_meta_torch=True)
