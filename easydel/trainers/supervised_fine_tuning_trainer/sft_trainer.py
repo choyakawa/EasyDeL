@@ -28,6 +28,7 @@ from easydel.trainers.prompt_utils import (
     is_conversational_from_value,
     keep_arrays_map,
     maybe_convert_to_chatml,
+    maybe_convert_instruction_history_to_messages,
     pack_dataset,
     pad_and_truncate_dataset,
     remove_none_values,
@@ -124,6 +125,7 @@ class SFTTrainer(Trainer):
         self.dataset_batch_size = arguments.dataset_batch_size
         self.arguments = arguments
         self.tokenizer = tokenizer
+        self.preview_formatted_text: str | None = None
         if arguments.dataset_kwargs is None:
             arguments.dataset_kwargs = {}
         if train_dataset is not None:
@@ -199,6 +201,30 @@ class SFTTrainer(Trainer):
         if isinstance(dataset, Dataset):  # IterableDataset does not support `with_transform`
             dataset = dataset.with_transform(remove_none_values)
 
+        # Detect and convert instruction/input/output/history/system format to messages first
+        first_example_peek = next(iter(dataset))
+        if (
+            isinstance(first_example_peek, dict)
+            and ("messages" not in first_example_peek)
+            and (
+                ("instruction" in first_example_peek)
+                or ("history" in first_example_peek)
+                or ("system" in first_example_peek)
+            )
+            and ("output" in first_example_peek)
+        ):
+            if isinstance(dataset, Dataset):
+                map_kwargs["desc"] = "Converting instruction/history dataset to ChatML messages"
+            dataset = dataset.map(
+                maybe_convert_instruction_history_to_messages,
+                remove_columns=[
+                    c
+                    for c in ["instruction", "input", "output", "system", "history"]
+                    if c in first_example_peek
+                ],
+                **map_kwargs,
+            )
+
         column_names = list(next(iter(dataset)).keys())
         is_processed = "input_ids" in column_names
 
@@ -221,6 +247,33 @@ class SFTTrainer(Trainer):
                 return {"text": formatting_func(example)}
 
             dataset = dataset.map(_func, batched=False, **map_kwargs)
+
+        # Capture a preview of formatted text before tokenization (no on-the-fly conversions in script)
+        try:
+            first_after_format = next(iter(dataset))
+            preview_text: str | None = None
+            if isinstance(first_after_format, dict):
+                if "text" in first_after_format and isinstance(first_after_format["text"], str):
+                    preview_text = first_after_format["text"]
+                elif "messages" in first_after_format and isinstance(first_after_format["messages"], list):
+                    tools = first_after_format.get("tools")
+                    preview_text = processing_class.apply_chat_template(
+                        first_after_format["messages"],
+                        tokenize=False,
+                        tools=tools,
+                        **first_after_format.get("chat_template_kwargs", {}),
+                    )
+                elif "prompt" in first_after_format and "completion" in first_after_format:
+                    preview_text = processing_class.apply_chat_template(
+                        [
+                            {"role": "user", "content": first_after_format["prompt"]},
+                            {"role": "assistant", "content": first_after_format["completion"]},
+                        ],
+                        tokenize=False,
+                    )
+            self.preview_formatted_text = preview_text
+        except Exception:
+            self.preview_formatted_text = None
 
         if not is_processed:
             first_example = next(iter(dataset))

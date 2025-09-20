@@ -21,9 +21,11 @@ python -m easydel.scripts.sft_finetune \
 """
 
 from dataclasses import field
+import os
+import copy
 
 import jax
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from eformer.aparser import DataClassArgumentParser
 from eformer.pytree import auto_pytree
 from jax import numpy as jnp
@@ -32,6 +34,10 @@ from transformers import AutoConfig, AutoTokenizer
 import easydel as ed
 from easydel.infra.factory import registry
 from easydel.modules import *  # noqa # init
+from easydel.trainers.prompt_utils import (
+    maybe_convert_instruction_history_to_messages,
+    maybe_convert_to_chatml,
+)
 
 
 @auto_pytree
@@ -98,6 +104,22 @@ class RunTimeConfig:
         default=jnp.float32,
         metadata={"help": "The data type for attention softmax computation."},
     )
+    processed_dataset_cache_dir: str | None = field(
+        default=None,
+        metadata={"help": "Directory to save/load processed dataset (with input_ids)."},
+    )
+    reuse_processed_dataset: bool = field(
+        default=True,
+        metadata={"help": "If cache dir exists, load processed dataset from disk directly."},
+    )
+    save_processed_dataset: bool = field(
+        default=False,
+        metadata={"help": "After building the Trainer, save the processed dataset to disk."},
+    )
+    preview_first_formatted_example: bool = field(
+        default=True,
+        metadata={"help": "Print the first formatted (pre-tokenization) example for inspection on startup."},
+    )
 
     def __post_init__(self):
         """Post-initialization to set dependent parameters."""
@@ -125,11 +147,27 @@ def main():
     if processor.pad_token_id is None:
         processor.pad_token_id = processor.eos_token_id
 
-    # Load dataset
-    dataset = load_dataset(
-        runtime_config.dataset_name,
-        split=runtime_config.dataset_split,
-    )
+    # Load dataset or processed cache
+    use_cached = False
+    dataset = None
+    if (
+        runtime_config.processed_dataset_cache_dir
+        and runtime_config.reuse_processed_dataset
+        and os.path.isdir(runtime_config.processed_dataset_cache_dir)
+    ):
+        try:
+            dataset = load_from_disk(runtime_config.processed_dataset_cache_dir)
+            use_cached = True
+            if jax.process_index() == 0:
+                print(f"Load processed daaset cache: {runtime_config.processed_dataset_cache_dir}")
+        except Exception:
+            dataset = None
+
+    if dataset is None:
+        dataset = load_dataset(
+            runtime_config.dataset_name,
+            split=runtime_config.dataset_split,
+        )
 
     hf_config = AutoConfig.from_pretrained(runtime_config.repo_id)
 
@@ -162,13 +200,45 @@ def main():
         partition_axis=ed.PartitionAxis(),
     )
 
+    # Build trainer first
+
+    # If using processed cache, avoid re-packing
+    formatting_func = None if use_cached else (lambda x: processor.apply_chat_template(x[sft_config.dataset_text_field], tokenize=False))
+    if use_cached and sft_config.packing:
+        from dataclasses import replace as _dc_replace
+
+        sft_config = _dc_replace(sft_config, packing=False)
+
     trainer = ed.SFTTrainer(
         model=model,
         arguments=sft_config,
         train_dataset=dataset,
         processing_class=processor,
-        formatting_func=lambda x: processor.apply_chat_template(x[sft_config.dataset_text_field], tokenize=False),
+        formatting_func=formatting_func,
     )
+
+    # Preview first example (formatted, before tokenize) using trainer's prepared preview
+    if runtime_config.preview_first_formatted_example:
+        try:
+            preview_text = getattr(trainer, "preview_formatted_text", None)
+            if preview_text is not None and jax.process_index() == 0:
+                print("Preview first example (formatted, pre-tokenization)\n----------------------")
+                print(preview_text)
+                print("----------------------")
+        except Exception as _:
+            if jax.process_index() == 0:
+                print("Preview failed (does not block training)")
+
+    # Save processed dataset to disk if requested
+    if runtime_config.save_processed_dataset and runtime_config.processed_dataset_cache_dir:
+        try:
+            os.makedirs(runtime_config.processed_dataset_cache_dir, exist_ok=True)
+            trainer.dataset_train.save_to_disk(runtime_config.processed_dataset_cache_dir)
+            if jax.process_index() == 0:
+                print(f"The processed dataset has been saved to: {runtime_config.processed_dataset_cache_dir}")
+        except Exception as _:
+            if jax.process_index() == 0:
+                print("Failed to save the processed dataset (does not affect training)")
 
     trainer.train()
 
