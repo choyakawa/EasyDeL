@@ -184,16 +184,8 @@ def main():
 
     # Merge LoRA adapters into base weights
     merged_model = state.model.unwrap_lora_to_layers()
-
-    # Gather parameters on the model level to avoid graphother structure mismatch
-    gathered_model = merged_model.gather_model()
-
-    # Only save once from the main process
-    if jax.process_index() == 0:
-        # Save as Hugging Face Torch format using direct conversion
-        save_dir = str(trainer.arguments.get_path())
-        hf_model = gathered_model.to_torch(use_meta_torch=True)
-        hf_model.save_pretrained(save_dir, safe_serialization=True)
+    save_dir = str(trainer.arguments.get_path())
+    merged_model.save_pretrained(save_dir, to_torch=True)
 
 
 if __name__ == "__main__":
