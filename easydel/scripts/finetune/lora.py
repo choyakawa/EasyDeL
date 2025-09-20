@@ -31,10 +31,12 @@ from eformer.aparser import DataClassArgumentParser
 from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 from transformers import AutoConfig, AutoTokenizer
+from jax.experimental import multihost_utils as mhutils
 
 import easydel as ed
 from easydel.infra.factory import registry
 from easydel.modules import *  # noqa # init
+from easydel.utils.parameters_transformation import StateDictConverter
 
 
 @auto_pytree
@@ -185,11 +187,32 @@ def main():
     # Merge LoRA adapters into base weights
     merged_model = state.model.unwrap_lora_to_layers()
     
+    # 在 TPU 多机环境中，避免先 gather 整模导致 OOM。
+    # 让所有进程并行逐参数 allgather，只有 rank0 构建并保存 HF 模型。
+    # 限制单次主机拷贝块大小，降低峰值内存占用。
+    os.environ.setdefault("EASY_SAFE_TRANSFER", "1")
+    os.environ.setdefault("EASYDEL_CHUNK_BYTES", str(64 * 1024 * 1024))  # 64MB
+
+    # 同步后开始转换，每个进程都会参与 allgather 协议
+    mhutils.sync_global_devices("before_hf_save")
+
+    # 所有进程都执行逐参数转换（非主进程仅参与 allgather，不返回完整权重）
+    state_dict = StateDictConverter.easydel_to_torch(module=merged_model, dtype=runtime_config.param_dtype)
+
     if jax.process_index() == 0:
-        os.environ["EASY_SAFE_TRANSFER"] = "0"
+        import torch
+
         save_dir = str(trainer.arguments.get_path())
-        hf_model = merged_model.to_torch(use_meta_torch=True)
+        base_hf_cls = merged_model.get_torch_loader()._model_mapping[type(merged_model.config)]
+        base_config = base_hf_cls.config_class.from_dict(merged_model.config.to_dict())
+        # 在 meta 设备上构建，再按键加载，避免显存/内存峰值
+        with torch.device("meta"):
+            hf_model = base_hf_cls(config=base_config)
+            hf_model.load_state_dict(state_dict, assign=True, strict=True)
         hf_model.save_pretrained(save_dir, safe_serialization=True, max_shard_size="2GB")
+
+    # 再次同步，确保所有进程完成收集
+    mhutils.sync_global_devices("after_hf_save")
 
 
 if __name__ == "__main__":
