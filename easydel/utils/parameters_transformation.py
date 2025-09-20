@@ -174,6 +174,9 @@ class TensorConverter:
                 chunk = jax.device_get(local_1d[start:end])
                 host_np_flat[start:end] = np.asarray(chunk, dtype=dtype_np)
             host_np = host_np_flat.reshape(shape)
+            # torch.from_numpy 不支持 ml_dtypes.bfloat16，需转换
+            if str(dtype_np) in ("bfloat16", "bf16"):
+                return torch.from_numpy(host_np.astype(np.float32)).to(torch.bfloat16)
             return torch.from_numpy(host_np)
 
         # TPU 专用路径：使用多主机安全的全局收集，避免一次性在某个 TPU 上分配大缓冲
@@ -183,6 +186,8 @@ class TensorConverter:
             if host_np is None:
                 # 非主进程不返回内容；这里返回一个占位 0 张量，调用方在主进程执行
                 return torch.zeros((), dtype=torch.float32)
+            if str(host_np.dtype) in ("bfloat16", "bf16"):
+                return torch.from_numpy(host_np.astype(np.float32)).to(torch.bfloat16)
             return torch.from_numpy(host_np)
 
         # CPU/GPU 平台或强制安全转移：走分块 CPU 转移，避免单次大拷贝
