@@ -301,7 +301,27 @@ class TensorConverter:
         full_np = np.empty(x.shape, dtype=np.dtype(DtypeHandler.get_dtype(target_dtype)))
         for proc_chunks in gathered:
             for idx_pairs, chunk in proc_chunks:
-                slices = tuple(slice(s0, s1) for s0, s1 in idx_pairs)
+                # 兼容 (start, stop) 或 (start, stop, step) 或直接 slice 对象
+                slices_list = []
+                for item in idx_pairs:
+                    if isinstance(item, slice):
+                        s = item
+                    elif isinstance(item, (list, tuple)):
+                        if len(item) == 2:
+                            s = slice(item[0], item[1])
+                        elif len(item) >= 3:
+                            s = slice(item[0], item[1], item[2])
+                        else:
+                            s = slice(0, None)
+                    else:
+                        # 单值索引不预期，这里退化为范围 1 的切片
+                        try:
+                            idx_int = int(item)
+                            s = slice(idx_int, idx_int + 1)
+                        except Exception:
+                            s = slice(0, None)
+                    slices_list.append(s)
+                slices = tuple(slices_list)
                 full_np[slices] = chunk
         return full_np
 
