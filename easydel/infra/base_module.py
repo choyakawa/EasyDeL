@@ -990,7 +990,9 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         def _create_state(gstruct, gstate, gother):
             return state_class.create(
                 step=0,
-                model=self.merge_module(gstruct, gstate, gother),
+                graphdef=gstruct,
+                graphstate=gstate,
+                graphother=gother,
             )
 
         return _create_state(*self.split_module())
