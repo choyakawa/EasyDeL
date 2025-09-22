@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
+from functools import partial, cached_property
 
 import chex
 import jax
@@ -161,7 +161,14 @@ class GlmAttention(AttentionModule):
         self.v_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
         self.o_proj = row_parallel_linear(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
 
-        self.rotary = self.config.get_basic_rope(self.dtype, self.head_dim, self.head_dim, False)
+        # Apply GPT-J style RoPE with partial rotary factor
+        rotary_dim = int(self.head_dim * getattr(config, "partial_rotary_factor", 1.0))
+        self.rotary = self.config.get_basic_rope(
+            self.dtype,
+            head_size=self.head_dim,
+            rotary_dim=rotary_dim,
+            is_neox_style=False,
+        )
 
         self.attention_performer = FlexibleAttentionModule(
             rngs=rngs,
@@ -206,6 +213,26 @@ class GlmAttention(AttentionModule):
         key_states = key_states.reshape(kv_shape)
         value_states = value_states.reshape(kv_shape)
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
+
+        # Optional RoPE debug output
+        if getattr(self.config, "debug_rope", False):
+            try:
+                freq_arr = frequencies.value if hasattr(frequencies, "value") else frequencies
+                bsz, seqlen = position_ids.shape
+                cos_shape = (bsz, seqlen, self.rotary.rotary_dim // 2)
+                jax.debug.print(
+                    "[GLM-RoPE] layer={} head_dim={} rotary_dim={} partial={:.3f} neox={} pos_shape={} freq_shape={} cos_shape={}",
+                    self.layer_idx,
+                    self.head_dim,
+                    self.rotary.rotary_dim,
+                    self.rotary.rotary_dim / self.head_dim,
+                    self.rotary.is_neox_style,
+                    position_ids.shape,
+                    None if freq_arr is None else freq_arr.shape,
+                    cos_shape,
+                )
+            except Exception:
+                pass
 
         query_states, key_states = self.rotary(
             positions=position_ids,
@@ -428,6 +455,20 @@ class GlmModel(EasyDeLBaseModule):
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
+        )
+
+    @cached_property
+    def frequencies(self):
+        """Override to ensure frequency cache matches partial rotary dim for GLM.
+
+        Uses GPT-J style RoPE (non-NeoX), but cache shape must be consistent with
+        the applied rotary_dim in attention (partial_rotary_factor * head_dim).
+        """
+        head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
+        rotary_dim = int(head_dim * getattr(self.config, "partial_rotary_factor", 1.0))
+        return self.config.get_basic_frequencies(
+            head_size=rotary_dim,
+            rotary_dim=rotary_dim,
         )
 
     def __call__(

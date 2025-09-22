@@ -103,6 +103,10 @@ class RunTimeConfig:
         default=jnp.float32,
         metadata={"help": "The data type for attention softmax computation."},
     )
+    debug_rope: bool = field(
+        default=False,
+        metadata={"help": "Enable RoPE debug prints (EASYDEL_DEBUG_ROPE=1)."},
+    )
 
     def __post_init__(self):
         """Post-initialization to set dependent parameters."""
@@ -125,6 +129,10 @@ if jax.process_index() == 0:
 
 
 def main():
+    # Enable RoPE debug prints if requested via runtime config
+    if os.environ.get("EASYDEL_DEBUG_ROPE") is None and runtime_config.debug_rope:
+        os.environ["EASYDEL_DEBUG_ROPE"] = "1"
+
     processor = AutoTokenizer.from_pretrained(runtime_config.processor_repo_id)
 
     if processor.pad_token_id is None:
