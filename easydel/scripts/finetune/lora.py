@@ -103,6 +103,15 @@ class RunTimeConfig:
         default=jnp.float32,
         metadata={"help": "The data type for attention softmax computation."},
     )
+    sharding_dcn_axis: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "DCN sharding axis dims for multi-host. Example: '1, 8, 1, 1, 1'. "
+                "If provided, you can avoid using -1 in --sharding_axis and explicitly place cross-host splits."
+            )
+        },
+    )
     debug_rope: bool = field(
         default=False,
         metadata={"help": "Enable RoPE debug prints (EASYDEL_DEBUG_ROPE=1)."},
@@ -114,6 +123,8 @@ class RunTimeConfig:
             self.processor_repo_id = self.repo_id
         if isinstance(self.sharding_axis, str):
             self.sharding_axis = tuple(map(int, self.sharding_axis.split(",")))
+        if isinstance(self.sharding_dcn_axis, str):
+            self.sharding_dcn_axis = tuple(map(int, self.sharding_dcn_axis.split(",")))
 
 
 parser = DataClassArgumentParser((ed.SFTConfig, RunTimeConfig))
@@ -158,6 +169,7 @@ def main():
         runtime_config.repo_id,
         auto_shard_model=True,
         sharding_axis_dims=runtime_config.sharding_axis,
+        sharding_dcn_axis_dims=runtime_config.sharding_dcn_axis,
         config_kwargs=ed.EasyDeLBaseConfigDict(
             freq_max_position_embeddings=sft_config.max_sequence_length,
             mask_max_position_embeddings=sft_config.max_sequence_length,
