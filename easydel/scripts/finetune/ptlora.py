@@ -194,7 +194,7 @@ def main():
         arguments=sft_config,
         train_dataset=dataset,
         processing_class=processor,
-        formatting_func=lambda x: x["text"],
+        formatting_func=None,
     )
 
     output = trainer.train()
