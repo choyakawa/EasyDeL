@@ -375,7 +375,7 @@ class SFTTrainer(Trainer):
                     else:
                         output = processing_class(
                             text=example[dataset_text_field],
-                            return_dict=True,
+                            # return_dict=True,
                             return_attention_mask=True,
                             truncation=True,
                             max_length=self.arguments.max_sequence_length,
