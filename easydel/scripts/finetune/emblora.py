@@ -262,7 +262,7 @@ def main():
         with torch.device("meta"):
             hf_model = base_hf_cls(config=base_config)
             hf_model.load_state_dict(state_dict, assign=True, strict=True)
-        hf_model.save_pretrained(save_dir, safe_serialization=True, max_shard_size="20GB")
+        hf_model.save_pretrained(save_dir, safe_serialization=True, max_shard_size="30GB")
 
     # 再次同步，确保所有进程完成收集
     mhutils.sync_global_devices("after_hf_save")
