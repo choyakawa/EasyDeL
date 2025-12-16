@@ -356,7 +356,7 @@ class SFTTrainer(Trainer):
                         processed = processing_class.apply_chat_template(
                             example["messages"],
                             return_dict=True,
-                            return_assistant_tokens_mask=False,
+                            return_assistant_tokens_mask=assistant_only_loss,
                             return_attention_mask=True,
                             tools=tools,
                             truncation=True,
@@ -387,7 +387,7 @@ class SFTTrainer(Trainer):
                 fn_kwargs={
                     "processing_class": processing_class,
                     "dataset_text_field": dataset_text_field,
-                    "assistant_only_loss": False,
+                    "assistant_only_loss": self.arguments.assistant_only_loss,
                 },
                 **map_kwargs,
             )
