@@ -1673,7 +1673,11 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
 
         assert labels is not None, "`labels` can not be `None` for computing loss."
         loss_kwargs = loss_kwargs or {}
-        outputs = self(**batch)
+        
+        explicit_loss_args = ["assistant_masks", "completion_mask"]
+        model_inputs = {k: v for k, v in batch.items() if k not in explicit_loss_args}
+        
+        outputs = self(**model_inputs)
 
         loss_output: LossMetrics = self.loss_function(
             labels=labels,
