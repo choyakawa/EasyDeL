@@ -364,13 +364,57 @@ class SFTTrainer(Trainer):
                             **example.get("chat_template_kwargs", {}),
                         )
                         if "assistant_masks" in processed and 1 not in processed["assistant_masks"]:
-                            raise RuntimeError(
-                                "You're using `assistant_only_loss=True`, but at least one example has no "
-                                "assistant tokens. This usually means the tokenizer's chat template doesn't "
-                                "generate assistant masks — it may be missing the `{% generation %}` keyword. Please "
-                                "check the template and ensure it's correctly configured to support assistant "
-                                "masking."
+                            # Automatic retry with fixed ChatML template
+                            logger.warning(
+                                "Assistant masks are missing. Attempting to use a standard ChatML template with generation blocks."
                             )
+                            chat_template_fixed = (
+                                "{% for message in messages %}"
+                                "{% if loop.first and messages[0]['role'] != 'system' %}{{ '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n' }}{% endif %}"
+                                "{% if message['role'] == 'assistant' %}"
+                                "{{ '<|im_start|>' + message['role'] + '\n' }}"
+                                "{% generation %}"
+                                "{{ message['content'] }}"
+                                "{% endgeneration %}"
+                                "{{ '<|im_end|>' + '\n' }}"
+                                "{% else %}"
+                                "{{ '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n' }}"
+                                "{% endif %}"
+                                "{% endfor %}"
+                                "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+                            )
+                            # Temporarily override tokenizer template
+                            original_template = processing_class.chat_template
+                            processing_class.chat_template = chat_template_fixed
+                            try:
+                                processed = processing_class.apply_chat_template(
+                                    example["messages"],
+                                    return_dict=True,
+                                    return_assistant_tokens_mask=assistant_only_loss,  # Should be True here
+                                    return_attention_mask=True,
+                                    tools=tools,
+                                    truncation=True,
+                                    max_length=self.arguments.max_sequence_length,
+                                    **example.get("chat_template_kwargs", {}),
+                                )
+                            except Exception as e:
+                                # Restore original template if this fails too
+                                processing_class.chat_template = original_template
+                                raise RuntimeError(
+                                    "Failed to apply fixed ChatML template for assistant masking."
+                                ) from e
+                            
+                            # Restore original template
+                            processing_class.chat_template = original_template
+
+                            if "assistant_masks" in processed and 1 not in processed["assistant_masks"]:
+                                raise RuntimeError(
+                                    "You're using `assistant_only_loss=True`, but at least one example has no "
+                                    "assistant tokens. This usually means the tokenizer's chat template doesn't "
+                                    "generate assistant masks — it may be missing the `{% generation %}` keyword. Please "
+                                    "check the template and ensure it's correctly configured to support assistant "
+                                    "masking."
+                                )
                         output = processed
                     else:
                         output = processing_class(
