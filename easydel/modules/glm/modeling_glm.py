@@ -214,26 +214,6 @@ class GlmAttention(AttentionModule):
         value_states = value_states.reshape(kv_shape)
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
-        # Optional RoPE debug output
-        if getattr(self.config, "debug_rope", False):
-            try:
-                freq_arr = frequencies.value if hasattr(frequencies, "value") else frequencies
-                bsz, seqlen = position_ids.shape
-                cos_shape = (bsz, seqlen, self.rotary.rotary_dim // 2)
-                jax.debug.print(
-                    "[GLM-RoPE] layer={} head_dim={} rotary_dim={} partial={:.3f} neox={} pos_shape={} freq_shape={} cos_shape={}",
-                    self.layer_idx,
-                    self.head_dim,
-                    self.rotary.rotary_dim,
-                    self.rotary.rotary_dim / self.head_dim,
-                    self.rotary.is_neox_style,
-                    position_ids.shape,
-                    None if freq_arr is None else freq_arr.shape,
-                    cos_shape,
-                )
-            except Exception:
-                pass
-
         query_states, key_states = self.rotary(
             positions=position_ids,
             query=query_states,

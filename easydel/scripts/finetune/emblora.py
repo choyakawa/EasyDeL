@@ -113,10 +113,6 @@ class RunTimeConfig:
             )
         },
     )
-    debug_rope: bool = field(
-        default=False,
-        metadata={"help": "Enable RoPE debug prints (EASYDEL_DEBUG_ROPE=1)."},
-    )
 
     def __post_init__(self):
         """Post-initialization to set dependent parameters."""
@@ -141,10 +137,6 @@ if jax.process_index() == 0:
 
 
 def main():
-    # Enable RoPE debug prints if requested via runtime config
-    if os.environ.get("EASYDEL_DEBUG_ROPE") is None and runtime_config.debug_rope:
-        os.environ["EASYDEL_DEBUG_ROPE"] = "1"
-
     processor = AutoTokenizer.from_pretrained(runtime_config.processor_repo_id)
 
     if processor.pad_token_id is None:
@@ -239,7 +231,7 @@ def main():
             _lmh.kernel = nn.Param(_lmh.kernel.value)
     except Exception:
         ...
-    
+
     # 在 TPU 多机环境中，避免先 gather 整模导致 OOM。
     # 让所有进程并行逐参数 allgather，只有 rank0 构建并保存 HF 模型。
     # 限制单次主机拷贝块大小，降低峰值内存占用。

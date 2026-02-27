@@ -728,23 +728,6 @@ def apply_basic_rope(
     if offsets is not None:
         positions = positions + offsets
     cos, sin = jnp.split(frequencies[positions], 2, -1)
-
-    # Optional debug: print shapes and rotary meta when enabled
-    try:
-        import os
-
-        if os.environ.get("EASYDEL_DEBUG_ROPE", "0") == "1":
-            jax.debug.print(
-                "[RoPE] q={qshape} k={kshape} pos={pos_shape} freq={fshape} rotary_dim={rotary_dim} neox={neox}",
-                qshape=query.shape,
-                kshape=key.shape,
-                pos_shape=positions.shape,
-                fshape=frequencies.shape,
-                rotary_dim=rotary_dim,
-                neox=is_neox_style,
-            )
-    except Exception:
-        pass
     if rotary_dim != query.shape[-1]:
         query_rot = _apply_rotary_emb(query[..., :rotary_dim], cos, sin, is_neox_style)
         query = jnp.concatenate((query_rot, query[..., rotary_dim:]), axis=-1)
