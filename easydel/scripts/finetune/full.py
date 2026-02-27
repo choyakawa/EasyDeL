@@ -200,6 +200,8 @@ def main():
     if state is None:
         state = trainer.model_state
 
+	merged_model = state.model
+
     # 在 TPU 多机环境中，避免先 gather 整模导致 OOM。
     # 让所有进程并行逐参数 allgather，只有 rank0 构建并保存 HF 模型。
     # 限制单次主机拷贝块大小，降低峰值内存占用。
