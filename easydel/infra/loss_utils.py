@@ -1794,17 +1794,34 @@ def ForCausalLMLoss(
     if config is None:
         config = LossConfig()
     assert logits is not None and labels is not None
+
+    assistant_masks = kwargs.pop("assistant_masks", None)
+    completion_mask = kwargs.pop("completion_mask", None)
+
     if config.shift_tokens:
         shift_logits = logits[:, :-1, :]
         shift_labels = labels[:, 1:]
         if attention_mask is not None:
             shift_attn_m = attention_mask[:, 1:]
+        if assistant_masks is not None:
+            assistant_masks = assistant_masks[:, 1:]
+        if completion_mask is not None:
+            completion_mask = completion_mask[:, 1:]
     else:
         shift_logits = logits
         shift_labels = labels
 
         if attention_mask is not None:
             shift_attn_m = attention_mask
+
+    # Combine loss masks: only compute loss on assistant/completion tokens.
+    loss_mask = assistant_masks if assistant_masks is not None else completion_mask
+    if loss_mask is not None:
+        loss_mask = jnp.asarray(loss_mask)
+        if shift_attn_m is not None:
+            shift_attn_m = jnp.asarray(shift_attn_m) * loss_mask
+        else:
+            shift_attn_m = loss_mask
 
     loss = fixed_cross_entropy(
         source=shift_logits,
