@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
