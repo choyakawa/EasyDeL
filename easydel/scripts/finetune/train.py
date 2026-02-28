@@ -198,7 +198,7 @@ def main():
             gradient_checkpointing=runtime_config.gradient_checkpointing,
             attn_mechanism=runtime_config.attn_mechanism,
         ),
-        platform=ed.EasyDeLPlatforms.JAX,
+        platform=ed.EasyDeLPlatforms.PALLAS,
         param_dtype=runtime_config.param_dtype,
         dtype=runtime_config.dtype,
         precision=jax.lax.Precision.DEFAULT,
