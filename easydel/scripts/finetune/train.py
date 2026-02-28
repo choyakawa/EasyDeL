@@ -191,8 +191,8 @@ def main():
         sharding_axis_dims=runtime_config.sharding_axis,
         sharding_dcn_axis_dims=runtime_config.sharding_dcn_axis,
         config_kwargs=ed.EasyDeLBaseConfigDict(
-            freq_max_position_embeddings=sft_config.max_sequence_length,
-            mask_max_position_embeddings=sft_config.max_sequence_length,
+            freq_max_position_embeddings=sft_config.max_length,
+            mask_max_position_embeddings=sft_config.max_length,
             attn_dtype=runtime_config.attn_dtype,
             attn_softmax_dtype=runtime_config.attn_softmax_dtype,
             gradient_checkpointing=runtime_config.gradient_checkpointing,
