@@ -55,6 +55,7 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
+import functools
 from functools import lru_cache, partial
 
 import jax
