@@ -171,17 +171,15 @@ class GlmAttention(UnifiedAttention):
         )
 
     def _create_rotary(self, config, dtype):
-        """Override to apply partial_rotary_factor (GPT-J style, non-NeoX).
+        """Override to use GPT-J style (non-NeoX) rotation for GLM.
 
-        The default UnifiedAttention._create_rotary uses rotary_dim=head_dim,
-        which is incorrect for GLM where partial_rotary_factor=0.5 means only
-        half of the head dimensions participate in RoPE.
+        GLM uses interleaved even/odd rotation (is_neox_style=False) and
+        partial_rotary_factor=0.5 (applied automatically by get_basic_rope).
         """
-        rotary_dim = int(self.head_dim * getattr(config, "partial_rotary_factor", 1.0))
         return config.get_basic_rope(
             dtype,
             head_size=self.head_dim,
-            rotary_dim=rotary_dim,
+            rotary_dim=self.head_dim,
             is_neox_style=False,
         )
 
@@ -406,14 +404,12 @@ class GlmModel(EasyDeLBaseModule):
     def frequencies(self):
         """Override to ensure frequency cache matches partial rotary dim for GLM.
 
-        Uses GPT-J style RoPE (non-NeoX), but cache shape must be consistent with
-        the applied rotary_dim in attention (partial_rotary_factor * head_dim).
+        The partial_rotary_factor is applied automatically by get_basic_frequencies.
         """
         head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
-        rotary_dim = int(head_dim * getattr(self.config, "partial_rotary_factor", 1.0))
         return self.config.get_basic_frequencies(
-            head_size=rotary_dim,
-            rotary_dim=rotary_dim,
+            head_size=head_dim,
+            rotary_dim=head_dim,
         )
 
     def __call__(
