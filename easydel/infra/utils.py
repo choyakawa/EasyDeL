@@ -732,20 +732,34 @@ def auto_remat(
     elif not callable(policy):
         raise ValueError(f"Invalid policy type: {type(policy)}")
 
+    def _make_remat_call(_fn, _policy, _prevent_cse):
+        """Create a jax.checkpoint wrapper for a module __call__.
+
+        Uses jax.checkpoint directly instead of nn.remat to avoid
+        TraceContextError when modules are reconstructed inside
+        jax.value_and_grad (e.g. via EasyDeLState.merge).
+        nn.remat performs NNX graph splitting/merging around
+        jax.checkpoint, which creates trace-level conflicts.
+        """
+
+        @functools.wraps(_fn)
+        def wrapper(self, *args, **kwargs):
+            @functools.partial(
+                jax.checkpoint,
+                prevent_cse=_prevent_cse,
+                policy=_policy,
+            )
+            def compute(*a, **kw):
+                return _fn(self, *a, **kw)
+
+            return compute(*args, **kwargs)
+
+        return wrapper
+
     outs = ()
     for module in modules:
         assert issubclass(module, nn.Module)
-        static_argnums = extract_static_parameters(module=module)
-        if static_argnums is None:
-            static_argnums = ()
-
-        module.__call__ = nn.remat(
-            f=module.__call__,
-            prevent_cse=prevent_cse,
-            static_argnums=static_argnums,
-            policy=policy,
-        )
-
+        module.__call__ = _make_remat_call(module.__call__, policy, prevent_cse)
         outs += (module,)
 
     if len(outs) == 1:
