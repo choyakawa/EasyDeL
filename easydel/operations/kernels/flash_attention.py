@@ -275,7 +275,7 @@ class FlashAttn(OperationImpl):
             logits_soft_cap=logits_soft_cap,
             normalize_output=normalize_output,
             precision=precision,
-            logits_dtype=jnp.bfloat16,
+            # logits_dtype=jnp.bfloat16,
             cfg=self.metadata.get_operation_config("flash_attn2"),
             mesh=self.metadata.mesh,
             in_specs=(
