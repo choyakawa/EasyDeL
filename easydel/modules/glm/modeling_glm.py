@@ -171,15 +171,11 @@ class GlmAttention(UnifiedAttention):
         )
 
     def _create_rotary(self, config, dtype):
-        """Override to use GPT-J style (non-NeoX) rotation for GLM.
-
-        GLM uses interleaved even/odd rotation (is_neox_style=False) and
-        partial_rotary_factor=0.5 (applied automatically by get_basic_rope).
-        """
         return config.get_basic_rope(
-            dtype,
+            dtype=dtype,
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
+            base=getattr(config, "rope_theta", 100000000.0),
             is_neox_style=False,
         )
 
