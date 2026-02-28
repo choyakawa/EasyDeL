@@ -55,6 +55,7 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
+import functools
 from functools import lru_cache, partial
 
 import jax
@@ -732,20 +733,94 @@ def auto_remat(
     elif not callable(policy):
         raise ValueError(f"Invalid policy type: {type(policy)}")
 
+    def _is_jax_type(x):
+        """Check if a value can be passed through jax.checkpoint."""
+        if isinstance(x, (jax.Array, jnp.ndarray, np.ndarray)):
+            return True
+        if isinstance(x, (str, bool, int, float, type(None), type)):
+            return False
+        # For containers, assume they might hold arrays
+        if isinstance(x, (list, tuple, dict)):
+            return True
+        # nn.Module, dataclass-like objects, etc. → treat as static
+        if hasattr(x, "__jax_array__"):
+            return True
+        return False
+
+    def _make_remat_call(_fn, _policy, _prevent_cse):
+        """Create a jax.checkpoint wrapper for a module __call__.
+
+        Uses jax.checkpoint directly instead of nn.remat to avoid
+        TraceContextError when modules are reconstructed inside
+        jax.value_and_grad (e.g. via EasyDeLState.merge).
+        nn.remat performs NNX graph splitting/merging around
+        jax.checkpoint, which creates trace-level conflicts.
+
+        Non-JAX arguments (strings, bools, None, etc.) are captured
+        by closure so only valid JAX types pass through checkpoint.
+        """
+
+        @functools.wraps(_fn)
+        def wrapper(self, *args, **kwargs):
+            # Partition positional args into dynamic (JAX) and static
+            dynamic_indices = []
+            static_entries = {}  # index -> value
+            dynamic_args = []
+            for i, a in enumerate(args):
+                if _is_jax_type(a):
+                    dynamic_indices.append(i)
+                    dynamic_args.append(a)
+                else:
+                    static_entries[i] = a
+
+            # Partition kwargs
+            dynamic_kwargs_keys = []
+            static_kwargs = {}
+            dynamic_kwargs_vals = []
+            for k, v in kwargs.items():
+                if _is_jax_type(v):
+                    dynamic_kwargs_keys.append(k)
+                    dynamic_kwargs_vals.append(v)
+                else:
+                    static_kwargs[k] = v
+
+            # Freeze partition info so closures are safe
+            _dynamic_indices = tuple(dynamic_indices)
+            _n_args = len(args)
+            _static_entries = static_entries
+            _dynamic_kw_keys = tuple(dynamic_kwargs_keys)
+            _static_kw = static_kwargs
+
+            @partial(
+                jax.checkpoint,
+                prevent_cse=_prevent_cse,
+                policy=_policy,
+            )
+            def compute(*flat_dynamic):
+                # Reconstruct positional args
+                n_dyn_pos = len(_dynamic_indices)
+                rebuilt_args = [None] * _n_args
+                for slot, val in zip(_dynamic_indices, flat_dynamic[:n_dyn_pos]):
+                    rebuilt_args[slot] = val
+                for slot, val in _static_entries.items():
+                    rebuilt_args[slot] = val
+
+                # Reconstruct kwargs
+                rebuilt_kwargs = dict(_static_kw)
+                for key, val in zip(_dynamic_kw_keys, flat_dynamic[n_dyn_pos:]):
+                    rebuilt_kwargs[key] = val
+
+                return _fn(self, *rebuilt_args, **rebuilt_kwargs)
+
+            flat_dynamic = tuple(dynamic_args) + tuple(dynamic_kwargs_vals)
+            return compute(*flat_dynamic)
+
+        return wrapper
+
     outs = ()
     for module in modules:
         assert issubclass(module, nn.Module)
-        static_argnums = extract_static_parameters(module=module)
-        if static_argnums is None:
-            static_argnums = ()
-
-        module.__call__ = nn.remat(
-            f=module.__call__,
-            prevent_cse=prevent_cse,
-            static_argnums=static_argnums,
-            policy=policy,
-        )
-
+        module.__call__ = _make_remat_call(module.__call__, policy, prevent_cse)
         outs += (module,)
 
     if len(outs) == 1:
