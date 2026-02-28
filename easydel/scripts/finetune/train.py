@@ -15,6 +15,8 @@ from easydel.infra.factory import registry
 from easydel.modules import *  # noqa # init
 from easydel.utils.parameters_transformation import StateDictConverter
 
+jax.distributed.initialize()
+
 VALID_TRAINING_MODES = ("full", "lora", "lora_embed_head")
 
 
