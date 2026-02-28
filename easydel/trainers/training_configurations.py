@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,18 +22,18 @@ import traceback
 import typing as tp
 import warnings
 from copy import deepcopy
-from dataclasses import field
+from dataclasses import InitVar, dataclass, field, fields
 
+import flax.nnx
 import jax
-import jax.experimental
-import jax.experimental.multihost_utils
 import jax.numpy as jnp
 import numpy as np
 from eformer.loggings import get_logger
 from eformer.optimizers import OptimizerFactory, SchedulerConfig
 from eformer.paths import ePath, ePathLike
-from eformer.pytree import auto_pytree
+from eformer.serialization import Checkpointer
 from jax.sharding import PartitionSpec
+from optax import GradientTransformation  # pyright: ignore[reportMissingTypeStubs]
 
 from easydel.infra.errors import EasyDeLTimerError
 from easydel.infra.etils import (
@@ -51,20 +51,39 @@ from .metrics import MetricsHistogram, compute_weight_stats
 from .utils import JaxDistributedConfig
 
 try:
-    import wandb  # type: ignore
+    import wandb
 except ImportError:
     wandb = None
 
 if tp.TYPE_CHECKING:
-    from flax.metrics.tensorboard import SummaryWriter  # type:ignore
-    from jax import Array  # type:ignore
-    from torch import Tensor  # type:ignore
+    from flax.metrics.tensorboard import SummaryWriter
+    from jax import Array
+    from torch import Tensor
 else:
     Array, Tensor = [tp.Any] * 2
 
 
-MetricsType = dict[str, float | list | tuple | np.ndarray | Array | Tensor]
+MetricsType = dict[str, float | list | tuple | np.ndarray | Array | Tensor | None]
 logger = get_logger(__name__)
+
+QuantizationMode = tp.Literal[
+    "nf4",
+    "affine",
+    "mxfp8",
+    "nvfp8",
+    "mxfp4",
+    "nvfp4",
+]
+STE_QAT_QUANTIZATION_MODES: tuple[QuantizationMode, ...] = tp.get_args(QuantizationMode)
+STE_QAT_QUANTIZATION_MODES_DOC = ", ".join(f"'{mode}'" for mode in STE_QAT_QUANTIZATION_MODES)
+AFFINE_SUPPORTED_BITS = frozenset({2, 3, 4, 5, 6, 7, 8})
+FIXED_QUANTIZATION_BITS_BY_MODE: dict[QuantizationMode, int] = {
+    "nf4": 4,
+    "mxfp4": 4,
+    "nvfp4": 4,
+    "mxfp8": 8,
+    "nvfp8": 8,
+}
 
 
 def get_safe_arr(xs):
@@ -80,7 +99,7 @@ AVAILABLE_BACKENDS: list[str] = ["cpu", "gpu", "tpu", None]
 
 
 @Registry.register("trainer-arguments", "base")
-@auto_pytree
+@dataclass
 class TrainingArguments:
     """
     Comprehensive configuration class for training and evaluation.
@@ -157,7 +176,7 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Run evaluation every X steps."},
     )
-    extra_optimizer_kwargs: dict = field(
+    extra_optimizer_kwargs: dict | None = field(
         default_factory=dict,
         metadata={"help": "Additional keyword arguments to pass to the optimizer."},
     )
@@ -221,6 +240,57 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Configuration for the loss function."},
     )
+    quantization_mode: QuantizationMode | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Quantization mode for quantization-aware training (QAT). "
+                f"Supported values: {STE_QAT_QUANTIZATION_MODES_DOC}. "
+                "When set (or when a straight-through callable is provided), trainers can apply a straight-through "
+                "estimator (STE) transform to `state.graphstate` for the forward pass without permanently modifying "
+                "the stored parameters."
+            )
+        },
+    )
+    quantization_group_size: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Quantization group size for group-wise quantizers (e.g. NF4/AFFINE/MXFP*/NVFP*). "
+                "If None, the default group size for the selected quantization mode is used."
+            )
+        },
+    )
+    quantization_bits: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Quantization bit-width for QAT/STE quantizers. For `affine`, supported bits are 2..8. "
+                "For fixed-width formats (`nf4`, `mxfp4`, `nvfp4`, `mxfp8`, `nvfp8`), when provided it must "
+                "match the format width."
+            )
+        },
+    )
+    tensor_straight_through: tp.Callable[[jax.Array], jax.Array] | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Per-tensor straight-through transform used for QAT (e.g. tensor -> quantize(mode) -> dequantize "
+                "with identity gradients). If `straight_through_emulator` is not provided, this callable can be "
+                "mapped over `state.graphstate` via `jax.tree_util.tree_map`."
+            )
+        },
+    )
+    straight_through_emulator: tp.Callable[[flax.nnx.GraphState], flax.nnx.GraphState] | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Callable that maps a graphstate pytree -> new graphstate pytree for the forward pass. "
+                "If None, and quantization is enabled, trainers can default to applying "
+                "`jax.tree_util.tree_map(tensor_straight_through, graphstate)`."
+            )
+        },
+    )
     low_mem_usage: bool = field(
         default=True,
         metadata={"help": "Whether to try to minimize memory usage."},
@@ -229,10 +299,12 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Maximum number of evaluation steps."},
     )
-    max_sequence_length: int | None = field(
-        default=4096,
+    max_length: int | None = field(
+        default=None,
         metadata={"help": "The maximum sequence length."},
     )
+    max_sequence_length: InitVar[int | None] = None
+    quantization_block: InitVar[int | None] = None
     max_training_steps: int | None = field(
         default=None,
         metadata={"help": "The maximum number of training steps."},
@@ -256,6 +328,126 @@ class TrainingArguments:
     metrics_to_show_in_rich_pbar: list[str] | None = field(
         default=None,
         metadata={"help": "Metrics to display in the rich progress bar."},
+    )
+    generation_top_p: float | None = field(
+        default=None,
+        metadata={"help": "Default nucleus sampling threshold used for preview generations."},
+    )
+    generation_top_k: int | None = field(
+        default=None,
+        metadata={"help": "Default top-k sampling threshold used for preview generations."},
+    )
+    generation_temperature: float | None = field(
+        default=None,
+        metadata={"help": "Default sampling temperature for preview generations."},
+    )
+    generation_do_sample: bool | None = field(
+        default=None,
+        metadata={"help": "Whether to enable sampling when generating previews (auto-inferred when None)."},
+    )
+    generation_num_return_sequences: int | None = field(
+        default=None,
+        metadata={"help": "Number of completions to sample per prompt for preview generations."},
+    )
+    generation_max_new_tokens: int | None = field(
+        default=None,
+        metadata={"help": "Maximum number of newly generated tokens for previews."},
+    )
+    generation_shard_inputs: bool = field(
+        default=True,
+        metadata={"help": "Whether generation previews should reuse the model's sharding plan."},
+    )
+    generation_interval: int | None = field(
+        default=None,
+        metadata={"help": "Run preview generation every X training steps (disabled when None)."},
+    )
+    generation_prompts: list[str | dict[str, tp.Any]] = field(
+        default_factory=list,
+        metadata={"help": "Static prompts (text or tokenized dicts) to sample during preview generation."},
+    )
+    generation_use_train_prompts: bool = field(
+        default=False,
+        metadata={"help": "When True, sample additional prompts from the training dataset for previews."},
+    )
+    generation_num_prompts: int | None = field(
+        default=1,
+        metadata={"help": "Number of prompts to use per preview generation call."},
+    )
+    generation_dataset_prompt_field: str | None = field(
+        default="prompt",
+        metadata={"help": "Dataset field to treat as prompt text when sampling from the training set."},
+    )
+    generation_extra_kwargs: dict[str, tp.Any] | None = field(
+        default=None,
+        metadata={"help": "Additional kwargs forwarded to `model.generate` for previews."},
+    )
+    generation_config_overrides: dict[str, tp.Any] | None = field(
+        default=None,
+        metadata={"help": "Attribute overrides applied to the copied generation config for previews."},
+    )
+    generation_seed: int | None = field(
+        default=None,
+        metadata={"help": "Seed for preview prompt sampling (None uses a random seed)."},
+    )
+    generation_preview_print: bool = field(
+        default=False,
+        metadata={"help": "Whether to print preview generations to Terminal."},
+    )
+    generation_log_to_wandb: bool = field(
+        default=True,
+        metadata={"help": "Whether to log preview generations to WandB when available."},
+    )
+    use_esurge_generation: bool = field(
+        default=True,
+        metadata={"help": "Whether to use eSurge engine for preview generation instead of compiled functions."},
+    )
+    esurge_use_tqdm: bool = field(
+        default=True,
+        metadata={"help": "Whether to use tqdm progress bars for eSurge generations."},
+    )
+    esurge_hbm_utilization: float | None = field(
+        default=0.45,
+        metadata={"help": "HBM memory utilization target for eSurge engine (0.0-1.0). None uses eSurge default."},
+    )
+    esurge_max_num_seqs: int | None = field(
+        default=None,
+        metadata={
+            "help": "Maximum number of concurrent sequences for eSurge batch processing. None uses eSurge default."
+        },
+    )
+    esurge_max_num_seq_buckets: list[int] | None = field(
+        default=None,
+        metadata={
+            "help": "Optional explicit sequence-capacity buckets for eSurge runner compilation."
+        },
+    )
+    esurge_min_input_pad: int | None = field(
+        default=None,
+        metadata={"help": "Minimum input padding for eSurge sequences. None uses eSurge default."},
+    )
+    esurge_page_size: int | None = field(
+        default=32,
+        metadata={"help": "Page size for eSurge KV cache management. None uses eSurge default."},
+    )
+    esurge_silent_mode: bool = field(
+        default=True,
+        metadata={"help": "Silence eSurge info logs (engine start/stop/resume, cache events)."},
+    )
+    esurge_runner_verbose: bool = field(
+        default=False,
+        metadata={"help": "Enable verbose eSurge runner performance logs (including `[perf]` lines)."},
+    )
+    esurge_max_num_batched_tokens: int | None = field(
+        default=None,
+        metadata={"help": "Maximum number of tokens to batch together for eSurge generation. None uses eSurge default."},
+    )
+    esurge_enable_prefix_caching: bool | None = field(
+        default=None,
+        metadata={"help": "Enable/disable eSurge prefix caching. None keeps engine default behavior."},
+    )
+    esurge_data_parallelism_axis: str | None = field(
+        default=None,
+        metadata={"help": "Mesh axis name used by eSurge as the data-parallel KV-page axis (e.g. 'dp')."},
     )
     num_train_epochs: int = field(
         default=10,
@@ -305,7 +497,11 @@ class TrainingArguments:
         default=5,
         metadata={"help": "Report metrics every X steps."},
     )
-    save_directory: str = field(
+    save_interval_minutes: float | None = field(
+        default=None,
+        metadata={"help": "Interval Minutes to save the checkpoint for state."},
+    )
+    save_directory: str | None = field(
         default="EasyDeL-Checkpoints",
         metadata={"help": "The directory to save checkpoints to."},
     )
@@ -319,7 +515,12 @@ class TrainingArguments:
     )
     save_total_limit: int | None = field(
         default=None,
-        metadata={"help": "The maximum number of checkpoints to keep."},
+        metadata={
+            "help": (
+                "Maximum number of permanent checkpoints to keep. Older checkpoints are deleted. "
+                "Note: Temporary checkpoints (time-based) are managed separately by Checkpointer."
+            )
+        },
     )
     scheduler: AVAILABLE_SCHEDULERS = field(
         default=EasyDeLSchedulers.NONE,
@@ -427,6 +628,7 @@ class TrainingArguments:
     )
 
     _can_log_metrics: bool | None = None
+    _im_a_hidden_checkpoint_manager: Checkpointer | None = None
 
     @property
     def can_log_metrics(self):
@@ -445,7 +647,7 @@ class TrainingArguments:
         return jax.devices(self.offload_device_type)[self.offload_device_index]
 
     @property
-    def training_time_seconds(self) -> int:
+    def training_time_seconds(self) -> int | None:
         if self.training_time_limit is None:
             return None
         return self._time_to_seconds(self.training_time_limit)
@@ -454,7 +656,60 @@ class TrainingArguments:
     def is_process_zero(self):
         return jax.process_index() == 0
 
-    def __post_init__(self):
+    def _handle_deprecated_max_sequence_length(self, max_sequence_length: int | None) -> None:
+        if max_sequence_length is None:
+            return
+        warnings.warn(
+            "`max_sequence_length` is deprecated; use `max_length` instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        if self.max_length is None:
+            self.max_length = max_sequence_length
+            return
+        if self.max_length == max_sequence_length:
+            return
+
+        # If `max_length` is still at the class default, treat the deprecated alias as the user's intent.
+        max_length_default = None
+        for field_obj in fields(self):
+            if field_obj.name == "max_length":
+                max_length_default = field_obj.default
+                break
+
+        if self.max_length == max_length_default:
+            self.max_length = max_sequence_length
+            return
+
+        warnings.warn(
+            f"Both `max_length` ({self.max_length}) and `max_sequence_length` ({max_sequence_length}) are set; "
+            "ignoring `max_sequence_length`.",
+            FutureWarning,
+            stacklevel=2,
+        )
+
+    def _handle_deprecated_quantization_block(self, quantization_block: int | None) -> None:
+        if quantization_block is None:
+            return
+        warnings.warn(
+            "`quantization_block` is deprecated; use `quantization_group_size` instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        if self.quantization_group_size is None:
+            self.quantization_group_size = quantization_block
+            return
+        if self.quantization_group_size == quantization_block:
+            return
+
+        warnings.warn(
+            f"Both `quantization_group_size` ({self.quantization_group_size}) and "
+            f"`quantization_block` ({quantization_block}) are set; ignoring `quantization_block`.",
+            FutureWarning,
+            stacklevel=2,
+        )
+
+    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
         """
         Post-initialization setup and validation.
 
@@ -470,11 +725,15 @@ class TrainingArguments:
             ValueError: If configuration validation fails
             AssertionError: If required conditions are not met
         """
+        self._handle_deprecated_max_sequence_length(max_sequence_length)
+        self._handle_deprecated_quantization_block(quantization_block)
+        if self.max_length is None:
+            self.max_length = 4096
+        self._ensure_variables()
         self._validate_config()
         self._setup_distributed()
         self._setup_optimizer()
         self._setup_logging()
-        self._ensure_variables()
 
     def _validate_config(self):
         """
@@ -493,6 +752,23 @@ class TrainingArguments:
 
         if self.backend not in AVAILABLE_BACKENDS:
             raise ValueError(f"Backend {self.backend} is not recognized. Available backends: {AVAILABLE_BACKENDS}")
+        if self.quantization_group_size is not None and self.quantization_group_size <= 0:
+            raise ValueError("`quantization_group_size` must be > 0 when specified.")
+        if self.quantization_bits is not None and self.quantization_bits <= 0:
+            raise ValueError("`quantization_bits` must be > 0 when specified.")
+        if self.quantization_mode == "affine" and self.quantization_bits is not None:
+            if self.quantization_bits not in AFFINE_SUPPORTED_BITS:
+                bits_values = ", ".join(str(v) for v in sorted(AFFINE_SUPPORTED_BITS))
+                raise ValueError(
+                    f"`quantization_bits` for `affine` must be one of {{{bits_values}}}, got {self.quantization_bits}."
+                )
+        if self.quantization_mode in FIXED_QUANTIZATION_BITS_BY_MODE and self.quantization_bits is not None:
+            expected_bits = FIXED_QUANTIZATION_BITS_BY_MODE[self.quantization_mode]
+            if self.quantization_bits != expected_bits:
+                raise ValueError(
+                    f"`quantization_bits` for `{self.quantization_mode}` must be {expected_bits}, "
+                    f"got {self.quantization_bits}."
+                )
 
     def _setup_distributed(self):
         """
@@ -568,6 +844,103 @@ class TrainingArguments:
 
         This ensures the configuration is ready for use by the trainer.
         """
+
+        def _coerce_float(value: tp.Any) -> tp.Any:
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (float, int, np.floating, np.integer)):
+                return float(value)
+            if isinstance(value, str):
+                stripped = value.strip()
+                if not stripped:
+                    return value
+                try:
+                    return float(stripped)
+                except ValueError:
+                    return value
+            return value
+
+        def _coerce_int(value: tp.Any) -> tp.Any:
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, np.integer)):
+                return int(value)
+            if isinstance(value, float) and value.is_integer():
+                return int(value)
+            if isinstance(value, str):
+                stripped = value.strip()
+                if not stripped:
+                    return value
+                try:
+                    return int(stripped)
+                except ValueError:
+                    try:
+                        casted = float(stripped)
+                    except ValueError:
+                        return value
+                    return int(casted) if casted.is_integer() else value
+            return value
+
+        self.learning_rate = _coerce_float(self.learning_rate)
+        self.learning_rate_end = _coerce_float(self.learning_rate_end)
+        self.weight_decay = _coerce_float(self.weight_decay)
+        self.clip_grad = _coerce_float(self.clip_grad)
+        self.warmup_steps = _coerce_int(self.warmup_steps)
+        self.gradient_accumulation_steps = _coerce_int(self.gradient_accumulation_steps)
+        self.quantization_group_size = _coerce_int(self.quantization_group_size)
+        self.quantization_bits = _coerce_int(self.quantization_bits)
+
+        for name in ("learning_rate", "weight_decay"):
+            value = getattr(self, name, None)
+            if not isinstance(value, (float, int, np.floating, np.integer)):
+                raise TypeError(f"`{name}` must be a number, got {type(value).__name__}: {value!r}")
+
+        if self.learning_rate_end is not None and not isinstance(
+            self.learning_rate_end, (float, int, np.floating, np.integer)
+        ):
+            raise TypeError(
+                "`learning_rate_end` must be a number when provided, got "
+                f"{type(self.learning_rate_end).__name__}: {self.learning_rate_end!r}"
+            )
+
+        if self.clip_grad is not None and not isinstance(self.clip_grad, (float, int, np.floating, np.integer)):
+            raise TypeError(
+                f"`clip_grad` must be a number when provided, got {type(self.clip_grad).__name__}: {self.clip_grad!r}"
+            )
+
+        if not isinstance(self.warmup_steps, (int, np.integer)):
+            raise TypeError(
+                f"`warmup_steps` must be an int, got {type(self.warmup_steps).__name__}: {self.warmup_steps!r}"
+            )
+
+        if not isinstance(self.gradient_accumulation_steps, (int, np.integer)):
+            raise TypeError(
+                "`gradient_accumulation_steps` must be an int, got "
+                f"{type(self.gradient_accumulation_steps).__name__}: {self.gradient_accumulation_steps!r}"
+            )
+        if self.quantization_group_size is not None and not isinstance(self.quantization_group_size, (int, np.integer)):
+            raise TypeError(
+                "`quantization_group_size` must be an int when provided, got "
+                f"{type(self.quantization_group_size).__name__}: {self.quantization_group_size!r}"
+            )
+        if self.quantization_bits is not None and not isinstance(self.quantization_bits, (int, np.integer)):
+            raise TypeError(
+                "`quantization_bits` must be an int when provided, got "
+                f"{type(self.quantization_bits).__name__}: {self.quantization_bits!r}"
+            )
+
+        if isinstance(self.quantization_mode, str):
+            quantization_mode = self.quantization_mode.strip().lower()
+            self.quantization_mode = tp.cast(QuantizationMode | None, quantization_mode or None)
+        if self.quantization_mode is not None and self.quantization_mode not in STE_QAT_QUANTIZATION_MODES:
+            raise ValueError(
+                f"`quantization_mode` must be one of {STE_QAT_QUANTIZATION_MODES_DOC}, got {self.quantization_mode!r}."
+            )
+
         if isinstance(self.step_partition_spec, str):
             self.step_partition_spec = eval(self.step_partition_spec)
         elif not isinstance(self.step_partition_spec, PartitionSpec):
@@ -579,6 +952,44 @@ class TrainingArguments:
             self.loss_config = LossConfig()
         if isinstance(self.loss_config, dict):
             self.loss_config = LossConfig(**self.loss_config)
+        if self.generation_interval is not None and self.generation_interval <= 0:
+            logger.warning("`generation_interval` must be positive; disabling preview generation.")
+            self.generation_interval = None
+        if self.generation_num_prompts is not None:
+            self.generation_num_prompts = max(1, int(self.generation_num_prompts))
+        if self.esurge_max_num_seq_buckets is not None:
+            self.esurge_max_num_seq_buckets = [int(v) for v in self.esurge_max_num_seq_buckets]
+        if self.esurge_data_parallelism_axis is not None:
+            self.esurge_data_parallelism_axis = str(self.esurge_data_parallelism_axis).strip()
+            if not self.esurge_data_parallelism_axis:
+                raise ValueError("`esurge_data_parallelism_axis` must be a non-empty string when provided.")
+
+        def _inherit_generation_attr(attr, fallback_name):
+            current = getattr(self, attr, None)
+            if current is None and hasattr(self, fallback_name):
+                fallback_value = getattr(self, fallback_name)
+                if fallback_value is not None and fallback_value is not False:
+                    setattr(self, attr, fallback_value)
+
+        _inherit_generation_attr("generation_num_return_sequences", "num_return_sequences")
+        _inherit_generation_attr("generation_max_new_tokens", "max_completion_length")
+
+        if self.generation_num_return_sequences is not None:
+            try:
+                self.generation_num_return_sequences = int(self.generation_num_return_sequences)
+            except (TypeError, ValueError):  # pragma: no cover - keep original value if conversion fails
+                ...
+
+        if self.generation_do_sample is None:
+            if any(
+                getattr(self, name, None) is not None
+                for name in ("generation_top_p", "generation_top_k", "generation_temperature")
+            ):
+                self.generation_do_sample = True
+        if self.generation_do_sample is None and hasattr(self, "do_sample"):
+            do_sample = getattr(self, "do_sample", None)
+            if do_sample is not None:
+                self.generation_do_sample = do_sample
 
     @staticmethod
     def _time_to_seconds(time_str: str) -> int:
@@ -631,7 +1042,7 @@ class TrainingArguments:
         Note:
             Creates a model-specific subdirectory within the main save directory.
         """
-        return ePath(self.save_directory) / self.model_name
+        return ePath(self.save_directory) / self.model_name  # pyright: ignore[reportReturnType]
 
     def ensure_checkpoint_path(self):
         """Create the checkpoint directory if it doesn't exist.
@@ -644,6 +1055,11 @@ class TrainingArguments:
         """
         path = self.get_path()
         path.mkdir(parents=True, exist_ok=True)
+
+    def get_tx_template(self, possible_max: int | None = None) -> GradientTransformation:
+        if possible_max is None:
+            possible_max = 2**63 - 1
+        return self.get_optimizer_and_scheduler(possible_max)[0]
 
     def get_optimizer_and_scheduler(self, steps: int | None = None):
         """
@@ -707,10 +1123,49 @@ class TrainingArguments:
             The AsyncCheckpointManager allows non-blocking checkpoint
             saves during training, improving training efficiency.
         """
+        if self._im_a_hidden_checkpoint_manager is not None:
+            return self._im_a_hidden_checkpoint_manager
 
-        from eformer.serialization import AsyncCheckpointManager
+        self._im_a_hidden_checkpoint_manager = Checkpointer(
+            base_path=str(self._get_save_directory()),
+            save_interval=self.get_save_interval_timedelta(),
+            step_policies=self.get_checkpoint_policies(),
+        )
 
-        return AsyncCheckpointManager()
+        return self._im_a_hidden_checkpoint_manager
+
+    def get_checkpoint_policies(self):
+        """Convert save_steps configuration to CheckpointInterval policies.
+
+        Returns:
+            list[CheckpointInterval]: List of checkpoint interval policies.
+                Returns empty list if save_steps is None.
+
+        Example:
+            >>> args = TrainingArguments(save_steps=1000)
+            >>> policies = args.get_checkpoint_policies()
+            >>> # Returns: [CheckpointInterval(every=1000, until=None)]
+        """
+        from eformer.serialization.checkpointer import CheckpointInterval
+
+        if self.save_steps is None:
+            return []
+        return [CheckpointInterval(every=self.save_steps, until=None)]
+
+    def get_save_interval_timedelta(self):
+        """Get time-based checkpoint save interval as timedelta.
+
+        Returns:
+            timedelta | None: Time interval for temporary checkpoints,
+                or None if no time-based saving is configured.
+
+        Note:
+            Currently returns None. Can be extended to support
+            time-based checkpoint saving via new TrainingArguments field.
+        """
+        if self.save_interval_minutes is not None:
+            return datetime.timedelta(minutes=self.save_interval_minutes)
+        return None
 
     @functools.cached_property
     def _tensorboard(self):
@@ -726,7 +1181,7 @@ class TrainingArguments:
             Cached property to avoid multiple initializations.
             TensorBoard doesn't support cloud storage paths directly.
         """
-        from flax.metrics.tensorboard import SummaryWriter  # type:ignore
+        from flax.metrics.tensorboard import SummaryWriter
 
         path = self._get_save_directory(create=True)
         if path is None:
@@ -786,12 +1241,14 @@ class TrainingArguments:
                 prefix = ""
             else:
                 prefix = "-" + prefix
+            resolved_model_name = self.model_name if isinstance(self.model_name, str) and self.model_name else "model"
+            safe_model_name = resolved_model_name.lower().replace("/", "-")
             if wandb_name is None:
                 _time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-                wandb_name = f"{self.model_name.lower()}-{_time}"
+                wandb_name = f"{safe_model_name}-{_time}"
 
             return wandb.init(
-                project=f"EasyDeL{prefix}-{self.model_name}",
+                project=f"EasyDeL{prefix}-{safe_model_name}",
                 config=self.to_dict(),
                 save_code=True,
                 name=wandb_name,
@@ -876,33 +1333,37 @@ class TrainingArguments:
             - Computes statistics across all processes in distributed training
             - Logs both histograms and scalar statistics for each parameter
         """
-        if self.weight_distribution_log_steps > 0 and ((step % self.weight_distribution_log_steps) == 0):
-            stats = compute_weight_stats(state.graphstate, self.weight_distribution_pattern)
+        try:
+            if self.weight_distribution_log_steps > 0 and ((step % self.weight_distribution_log_steps) == 0):
+                stats = compute_weight_stats(state.graphstate, self.weight_distribution_pattern)
+                stats = jax.device_get(stats)
 
-            stats = jax.experimental.multihost_utils.process_allgather(stats)
+                metrics = {}
+                for key, histogram in stats.items():
+                    try:
+                        if isinstance(histogram, MetricsHistogram):
+                            path = key.replace("/", ".")
+                            metrics[f"weights-histogram/{path}"] = (
+                                histogram.bin_counts.tolist(),
+                                histogram.bin_edges.tolist(),
+                            )
 
-            metrics = {}
-            for key, histogram in stats.items():
-                try:
-                    if isinstance(histogram, MetricsHistogram):
-                        path = key.replace("/", ".")
-                        metrics[f"weights-histogram/{path}"] = (
-                            histogram.bin_counts.tolist(),
-                            histogram.bin_edges.tolist(),
-                        )
+                            base_path = path.replace("/histogram", "")
+                            metrics[f"weights-information/{base_path}/mean"] = float(histogram.mean)
+                            metrics[f"weights-information/{base_path}/std"] = histogram.std.item()
+                            metrics[f"weights-information/{base_path}/min"] = histogram.min.item()
+                            metrics[f"weights-information/{base_path}/max"] = histogram.max.item()
+                        else:
+                            path = key.replace("/", ".")
+                            metrics[f"weights-information/{path}"] = histogram
+                    except Exception as e:
+                        traceback.print_exc()
+                        raise e
 
-                        base_path = path.replace("/histogram", "")
-                        metrics[f"weights-information/{base_path}/mean"] = float(histogram.mean)
-                        metrics[f"weights-information/{base_path}/std"] = histogram.std.item()
-                        metrics[f"weights-information/{base_path}/min"] = histogram.min.item()
-                        metrics[f"weights-information/{base_path}/max"] = histogram.max.item()
-                    else:
-                        path = key.replace("/", ".")
-                        metrics[f"weights-information/{path}"] = histogram
-                except Exception as e:
-                    traceback.print_exc()
-                    raise e
-            self.log_metrics(metrics, step)
+                self.log_metrics(metrics, step)
+
+        except Exception as e:
+            logger.warn(f"Failed to log weight distribution {e}...")
 
     def _log_to_wandb(
         self,
@@ -1029,6 +1490,73 @@ class TrainingArguments:
     def _dict_from_json_file(cls, json_file: str | os.PathLike):
         return json.loads(ePath(json_file).read_text())
 
+    def to_dict(self) -> dict[str, tp.Any]:
+        """Serializes this instance to a dictionary.
+
+        Returns:
+            dict[str, tp.Any]: A dictionary containing all serializable fields.
+        """
+        result = {}
+        for field_obj in fields(self):
+            value = getattr(self, field_obj.name)
+            if value is Ellipsis:
+                continue
+            if field_obj.name.startswith("_"):
+                continue
+            if isinstance(value, tuple):
+                result[field_obj.name] = list(value)
+            elif value is None:
+                result[field_obj.name] = None
+            elif hasattr(value, "to_dict") and callable(value.to_dict):
+                result[field_obj.name] = value.to_dict()
+            else:
+                try:
+                    json.dumps(value)
+                    result[field_obj.name] = value
+                except (TypeError, OverflowError):
+                    result[field_obj.name] = str(value)
+        return result
+
+    @classmethod
+    def from_dict(cls, data: dict[str, tp.Any]):
+        """Deserializes a dictionary into a TrainingArguments instance.
+
+        Args:
+            data: Dictionary containing field names and values.
+
+        Returns:
+            TrainingArguments: A new instance created from the dictionary.
+        """
+        data = dict(data)
+        if "quantization_block" in data:
+            if "quantization_group_size" not in data:
+                data["quantization_group_size"] = data["quantization_block"]
+            # Drop deprecated alias for constructor calls built from dictionaries.
+            data.pop("quantization_block", None)
+
+        processed_data = {}
+        type_hints = tp.get_type_hints(cls)
+
+        for field_obj in fields(cls):
+            field_name = field_obj.name
+            if field_name not in data:
+                continue
+
+            value = data[field_name]
+            field_type = type_hints.get(field_name)
+
+            if (
+                value is not None
+                and isinstance(value, list)
+                and field_type is not None
+                and tp.get_origin(field_type) is tuple
+            ):
+                processed_data[field_name] = tuple(value)
+            else:
+                processed_data[field_name] = value
+
+        return cls(**processed_data)
+
     def to_json_string(self) -> str:
         """
         Serializes this instance to a JSON string.
@@ -1066,6 +1594,12 @@ class TrainingArguments:
 
     @classmethod
     def load_from_json(cls, config_dict):
+        config_dict = dict(config_dict)
+        if "quantization_block" in config_dict:
+            if "quantization_group_size" not in config_dict:
+                config_dict["quantization_group_size"] = config_dict["quantization_block"]
+            # Drop deprecated alias for constructor calls built from JSON payloads.
+            config_dict.pop("quantization_block", None)
         if "trainer_config_class" in config_dict.keys():
             import easydel as ed
 
@@ -1091,7 +1625,7 @@ class TrainingArguments:
         """
         ePath(json_file_path).write_text(self.to_json_string())
 
-    def _get_save_directory(self, create: bool = True) -> ePathLike:
+    def _get_save_directory(self, create: bool = True) -> ePathLike | None:
         if create:
             self.ensure_checkpoint_path()
         return self.get_path()
@@ -1100,10 +1634,50 @@ class TrainingArguments:
         directory_name = f"run-{step}"
         savedir = self._get_save_directory(create=create)
         if savedir is None:
-            return ePath("/dev/null")
+            return ePath("/dev/null")  # pyright: ignore[reportReturnType]
         save_directory = savedir / directory_name
         if create:
             save_directory.mkdir(exist_ok=True, parents=True)
         return save_directory
 
     __hash__ = hash_fn
+
+
+def _get_max_sequence_length(self: TrainingArguments) -> int | None:
+    return self.max_length
+
+
+def _set_max_sequence_length(self: TrainingArguments, value: int | None) -> None:
+    warnings.warn(
+        "`max_sequence_length` is deprecated; use `max_length` instead.",
+        FutureWarning,
+        stacklevel=2,
+    )
+    self.max_length = value
+
+
+TrainingArguments.max_sequence_length = property(
+    _get_max_sequence_length,
+    _set_max_sequence_length,
+    doc="Deprecated alias for `max_length`.",
+)
+
+
+def _get_quantization_block(self: TrainingArguments) -> int | None:
+    return self.quantization_group_size
+
+
+def _set_quantization_block(self: TrainingArguments, value: int | None) -> None:
+    warnings.warn(
+        "`quantization_block` is deprecated; use `quantization_group_size` instead.",
+        FutureWarning,
+        stacklevel=2,
+    )
+    self.quantization_group_size = value
+
+
+TrainingArguments.quantization_block = property(
+    _get_quantization_block,
+    _set_quantization_block,
+    doc="Deprecated alias for `quantization_group_size`.",
+)

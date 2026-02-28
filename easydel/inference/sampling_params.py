@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,12 +20,12 @@ It provides both host-side Python configurations and JAX-compatible versions
 for efficient on-device processing.
 
 Classes:
-    SamplingType: Enum for sampling strategies (greedy vs random)
-    RequestOutputKind: Enum for output formats (cumulative, delta, final)
-    GuidedDecodingParams: Parameters for constrained generation
-    JitableSamplingParams: JAX-compatible sampling parameters
-    SamplingParams: High-level sampling configuration
-    BeamSearchParams: Parameters for beam search decoding
+    SamplingType: Enum for sampling strategies (greedy vs random).
+    RequestOutputKind: Enum for output formats (cumulative, delta, final).
+    GuidedDecodingParams: Parameters for constrained generation.
+    JitableSamplingParams: JAX-compatible sampling parameters.
+    SamplingParams: High-level sampling configuration.
+    BeamSearchParams: Parameters for beam search decoding.
 
 Example:
     >>> from easydel.inference import SamplingParams
@@ -33,7 +33,7 @@ Example:
     ...     temperature=0.8,
     ...     top_p=0.95,
     ...     max_tokens=100,
-    ...     stop=["\n", "END"]
+    ...     stop=["\\n", "END"]
     ... )
     >>> # Convert to JAX-compatible format
     >>> jit_params = params.make_jitable()
@@ -52,6 +52,7 @@ import jax
 from eformer.escale import with_sharding_constraint
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
+from eformer.pytree import field as pytree_field
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from transformers import AutoTokenizer
@@ -71,11 +72,13 @@ logger = get_logger(__name__)
 
 
 class SamplingType(IntEnum):
-    """Defines the sampling strategy.
+    """Defines the sampling strategy for token selection.
 
     Attributes:
-        GREEDY: Deterministic selection of highest probability token
-        RANDOM: Probabilistic sampling from the distribution
+        GREEDY: Deterministic selection of the highest probability token.
+            Always selects the most likely next token.
+        RANDOM: Probabilistic sampling from the probability distribution.
+            Uses temperature, top-k, top-p to control randomness.
     """
 
     GREEDY = 0
@@ -83,12 +86,15 @@ class SamplingType(IntEnum):
 
 
 class RequestOutputKind(Enum):
-    """Defines the kind of output for a request.
+    """Defines the kind of output format for a generation request.
 
     Attributes:
-        CUMULATIVE: Return the full generated text so far
-        DELTA: Return only newly generated tokens
-        FINAL_ONLY: Return only the final complete output
+        CUMULATIVE: Return the full generated text accumulated so far.
+            Each output contains all previously generated tokens.
+        DELTA: Return only newly generated tokens since last output.
+            Useful for streaming where you only need incremental updates.
+        FINAL_ONLY: Return only the final complete output.
+            No intermediate outputs are provided.
     """
 
     CUMULATIVE = 0
@@ -98,47 +104,52 @@ class RequestOutputKind(Enum):
 
 @auto_pytree
 class GuidedDecodingParams:
-    """Parameters for guided decoding.
+    """Parameters for guided (constrained) decoding.
 
     Enables constrained generation to match specific formats or patterns.
     Only one guided decoding mode can be active at a time.
 
     Attributes:
-        json: JSON schema or object for structured output
-        regex: Regular expression pattern to match
-        choice: List of allowed string choices
-        grammar: Context-free grammar specification
-        json_object: Force output to be valid JSON object
-        backend: Decoding backend to use
-        backend_was_auto: Whether backend was auto-selected
-        disable_fallback: Disable fallback to unconstrained generation
-        disable_any_whitespace: Disable whitespace in structured output
-        disable_additional_properties: Restrict JSON to defined properties only
-        whitespace_pattern: Custom whitespace pattern
-        structural_tag: Tag for structural elements
+        json: JSON schema or object for structured output generation.
+        regex: Regular expression pattern to match during generation.
+        choice: List of allowed string choices for the output.
+        grammar: Context-free grammar specification for the output.
+        json_object: Force output to be a valid JSON object.
+        backend: Specific decoding backend to use.
+        backend_was_auto: Whether the backend was automatically selected.
+        disable_fallback: Disable fallback to unconstrained generation.
+        disable_any_whitespace: Disable whitespace in structured output.
+        disable_additional_properties: Restrict JSON to defined properties only.
+        whitespace_pattern: Custom pattern for whitespace handling.
+        structural_tag: Tag for identifying structural elements.
 
     Raises:
-        ValueError: If multiple guided decoding modes are specified
+        ValueError: If multiple guided decoding modes are specified.
+
+    Example:
+        >>> params = GuidedDecodingParams(
+        ...     json={"type": "object", "properties": {"name": {"type": "string"}}}
+        ... )
     """
 
-    json: str | dict | None = None
-    regex: str | None = None
-    choice: list[str] | None = None
-    grammar: str | None = None
-    json_object: bool | None = None
-    backend: str | None = None
-    backend_was_auto: bool = False
-    disable_fallback: bool = False
-    disable_any_whitespace: bool = False
-    disable_additional_properties: bool = False
-    whitespace_pattern: str | None = None
-    structural_tag: str | None = None
+    json: str | dict | None = pytree_field(pytree_node=False, default=None)
+    regex: str | None = pytree_field(pytree_node=False, default=None)
+    choice: list[str] | None = pytree_field(pytree_node=False, default=None)
+    grammar: str | None = pytree_field(pytree_node=False, default=None)
+    json_object: bool | None = pytree_field(pytree_node=False, default=None)
+    backend: str | None = pytree_field(pytree_node=False, default=None)
+    backend_was_auto: bool = pytree_field(pytree_node=False, default=False)
+    disable_fallback: bool = pytree_field(pytree_node=False, default=False)
+    disable_any_whitespace: bool = pytree_field(pytree_node=False, default=False)
+    disable_additional_properties: bool = pytree_field(pytree_node=False, default=False)
+    whitespace_pattern: str | None = pytree_field(pytree_node=False, default=None)
+    structural_tag: str | None = pytree_field(pytree_node=False, default=None)
 
     def __post_init__(self):
-        """Validates that only one guided decoding mode is specified.
+        """Validate that only one guided decoding mode is specified.
 
         Raises:
-            ValueError: If more than one guided decoding mode is active
+            ValueError: If more than one guided decoding mode is active.
         """
         guide_count = sum(
             (
@@ -157,12 +168,27 @@ class GuidedDecodingParams:
 
 @auto_pytree(frozen=True)
 class JitableSamplingParams:
-    """
-    A JAX-native, device-ready version of sampling parameters.
+    """A JAX-native, device-ready version of sampling parameters.
 
     This class contains only JAX arrays and static information, making it
     suitable for passing into jit-compiled functions. All Python-specific
     types like strings and lists have been converted or removed.
+
+    Attributes:
+        random_sampling: Boolean array indicating random vs greedy sampling.
+        temperature: Temperature for logits scaling.
+        top_k: Number of top tokens to consider for sampling.
+        top_p: Cumulative probability threshold for nucleus sampling.
+        min_p: Minimum probability threshold relative to top token.
+        repetition_penalty: Multiplicative penalty for repeated tokens.
+        frequency_penalty: Additive penalty based on token frequency.
+        presence_penalty: Additive penalty for token presence.
+        max_tokens: Maximum number of tokens to generate.
+        min_tokens: Minimum number of tokens to generate.
+        all_stop_token_ids: Array of token IDs that stop generation.
+        bad_words_token_ids: Padded array of bad word token sequences.
+        bad_words_lengths: True lengths of each bad word sequence.
+        allowed_token_ids: Optional whitelist of allowed token IDs.
     """
 
     random_sampling: jax.Array  # [1] bool
@@ -184,6 +210,17 @@ class JitableSamplingParams:
     allowed_token_ids: jax.Array | None = None
 
     def insert(self, second_sample: JitableSamplingParams, slot: int) -> JitableSamplingParams:
+        """Insert another sample's parameters at the specified slot index.
+
+        Used for batching multiple requests with different sampling parameters.
+
+        Args:
+            second_sample: The sampling parameters to insert.
+            slot: Index position where parameters should be inserted.
+
+        Returns:
+            New JitableSamplingParams with the second sample inserted at slot.
+        """
         self = self.view_1d()
 
         def update_idx1d(x, y):
@@ -208,6 +245,11 @@ class JitableSamplingParams:
         )
 
     def view_1d(self) -> JitableSamplingParams:
+        """Reshape all parameter arrays to 1D (batch_size,).
+
+        Returns:
+            New JitableSamplingParams with all arrays reshaped to 1D.
+        """
         return JitableSamplingParams(
             random_sampling=self.random_sampling.reshape(-1),
             temperature=self.temperature.reshape(-1),
@@ -226,6 +268,11 @@ class JitableSamplingParams:
         )
 
     def view_2d(self) -> JitableSamplingParams:
+        """Reshape all parameter arrays to 2D (batch_size, 1).
+
+        Returns:
+            New JitableSamplingParams with all arrays reshaped to 2D.
+        """
         return JitableSamplingParams(
             random_sampling=self.random_sampling.reshape(-1, 1),
             temperature=self.temperature.reshape(-1, 1),
@@ -245,6 +292,14 @@ class JitableSamplingParams:
 
     @classmethod
     def init_empty(cls, batch_size: int):
+        """Create an empty JitableSamplingParams with default values.
+
+        Args:
+            batch_size: Number of samples in the batch.
+
+        Returns:
+            JitableSamplingParams initialized with zeros for the given batch size.
+        """
         return cls(
             random_sampling=jnp.zeros([batch_size], dtype="b1"),
             temperature=jnp.zeros([batch_size], dtype="f4"),
@@ -263,7 +318,14 @@ class JitableSamplingParams:
 
     @classmethod
     def from_host_params(cls, params: SamplingParams) -> JitableSamplingParams:
-        """Converts the host-side SamplingParams to a JIT-compatible version."""
+        """Convert host-side SamplingParams to a JIT-compatible version.
+
+        Args:
+            params: The host-side SamplingParams to convert.
+
+        Returns:
+            JitableSamplingParams with all values converted to JAX arrays.
+        """
         if params._bad_words_token_ids:
             max_len = max(len(ids) for ids in params._bad_words_token_ids)
             lengths = jnp.array([len(ids) for ids in params._bad_words_token_ids], dtype=jnp.int32)
@@ -295,15 +357,15 @@ class JitableSamplingParams:
         )
 
     def get_logits_warper(self):
-        """
-        Constructs a `LogitsProcessorList` containing the configured logits warpers.
+        """Construct a LogitsProcessorList containing configured logits warpers.
 
-        Logits warpers modify the probability distribution derived from logits, typically
-        used for techniques like temperature scaling, top-k, top-p, and min-p sampling.
+        Logits warpers modify the probability distribution derived from logits,
+        typically used for techniques like temperature scaling, top-k, top-p,
+        and min-p sampling.
 
         Returns:
-            A `LogitsProcessorList` containing the enabled logits warpers based on the
-            sampling parameters.
+            LogitsProcessorList containing the enabled logits warpers based
+            on the sampling parameters.
         """
         warpers = LogitsProcessorList()
         warpers.append(TemperatureLogitsWarper(temperature=self.temperature))
@@ -313,15 +375,14 @@ class JitableSamplingParams:
         return warpers
 
     def get_logits_processor(self):
-        """
-        Constructs a `LogitsProcessorList` containing the configured logits processors.
+        """Construct a LogitsProcessorList containing configured logits processors.
 
-        Logits processors modify the logits directly, often used for applying penalties
-        (presence, frequency, repetition) or suppressing specific tokens.
+        Logits processors modify the logits directly, often used for applying
+        penalties (presence, frequency, repetition) or suppressing specific tokens.
 
         Returns:
-            A `LogitsProcessorList` containing the enabled logits processors based on the
-            sampling parameters.
+            LogitsProcessorList containing the enabled logits processors based
+            on the sampling parameters.
         """
         processors = LogitsProcessorList()
         processors.append(PresencePenaltyLogitsProcessor(self.presence_penalty))
@@ -331,13 +392,28 @@ class JitableSamplingParams:
 
     @cached_property
     def logits_processor(self):
+        """Cached logits processor list.
+
+        Returns:
+            LogitsProcessorList containing penalty processors.
+        """
         return self.get_logits_processor()
 
     @cached_property
     def logits_warper(self):
+        """Cached logits warper list.
+
+        Returns:
+            LogitsProcessorList containing sampling warpers.
+        """
         return self.get_logits_warper()
 
     def make_jitable(self):
+        """Return self since this is already a JIT-compatible class.
+
+        Returns:
+            Self (JitableSamplingParams instance).
+        """
         return self
 
 
@@ -349,41 +425,48 @@ class SamplingParams:
     Supports both OpenAI-compatible parameters and EasyDeL-specific extensions.
 
     Attributes:
-        n: Number of sequences to generate
-        best_of: Sample n sequences and return the best one
-        presence_penalty: Penalty for tokens based on presence (-2.0 to 2.0)
-        frequency_penalty: Penalty for tokens based on frequency (-2.0 to 2.0)
-        repetition_penalty: Multiplicative penalty for repeated tokens
-        temperature: Controls randomness (0.0 = deterministic, higher = more random)
-        top_p: Nucleus sampling threshold (0.0 to 1.0)
-        min_p: Minimum probability threshold relative to top token
-        top_k: Number of highest probability tokens to consider
-        seed: Random seed for reproducibility
-        stop: List of stop strings
-        stop_token_ids: List of stop token IDs
-        bad_words: List of strings to avoid generating
-        ignore_eos: Whether to ignore end-of-sequence token
-        max_tokens: Maximum number of tokens to generate
-        min_tokens: Minimum number of tokens to generate
-        logprobs: Number of log probabilities to return
-        prompt_logprobs: Number of prompt log probabilities to return
-        detokenize: Whether to convert tokens to text
-        skip_special_tokens: Whether to skip special tokens in output
-        spaces_between_special_tokens: Add spaces between special tokens
-        include_stop_str_in_output: Include stop string in output
-        output_kind: Type of output to return
-        truncate_prompt_tokens: Truncate prompt to this many tokens
-        guided_decoding: Parameters for constrained generation
-        logit_bias: Bias to apply to specific token logits
-        allowed_token_ids: Whitelist of allowed token IDs
-        extra_args: Additional custom arguments
+        n: Number of sequences to generate per prompt.
+        best_of: Generate this many sequences and return the best one.
+        presence_penalty: Penalty for tokens based on presence (-2.0 to 2.0).
+            Positive values discourage token reuse.
+        frequency_penalty: Penalty for tokens based on frequency (-2.0 to 2.0).
+            Positive values discourage frequently used tokens.
+        repetition_penalty: Multiplicative penalty for repeated tokens.
+            1.0 means no penalty, >1.0 penalizes repetition.
+        temperature: Controls randomness in sampling.
+            0.0 = deterministic (greedy), higher = more random.
+        top_p: Nucleus sampling threshold (0.0 to 1.0).
+            Only tokens with cumulative probability < top_p are considered.
+        min_p: Minimum probability threshold relative to top token.
+        top_k: Number of highest probability tokens to consider.
+            0 disables top-k filtering.
+        seed: Random seed for reproducible generation.
+        stop: List of stop strings that end generation.
+        stop_token_ids: List of token IDs that end generation.
+        stop_pattern: Regex pattern string for stopping generation.
+        bad_words: List of strings to avoid generating.
+        ignore_eos: Whether to ignore end-of-sequence token.
+        max_tokens: Maximum number of tokens to generate.
+        min_tokens: Minimum number of tokens to generate before allowing stop.
+        logprobs: Number of log probabilities to return per token.
+        prompt_logprobs: Number of prompt log probabilities to return.
+        detokenize: Whether to convert tokens to text in output.
+        skip_special_tokens: Whether to skip special tokens in output.
+        spaces_between_special_tokens: Add spaces between special tokens.
+        include_stop_str_in_output: Include stop string in final output.
+        output_kind: Type of output to return (cumulative, delta, final).
+        truncate_prompt_tokens: Truncate prompt to this many tokens.
+        guided_decoding: Parameters for constrained generation.
+        logit_bias: Bias to apply to specific token logits.
+        allowed_token_ids: Whitelist of allowed token IDs.
+        extra_args: Additional custom arguments for extensions.
 
     Example:
         >>> params = SamplingParams(
         ...     temperature=0.7,
         ...     top_p=0.9,
         ...     max_tokens=100,
-        ...     stop=["\n\n"]
+        ...     stop=["\\n\\n"]
         ... )
     """
 
@@ -392,7 +475,7 @@ class SamplingParams:
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0
-    temperature: float = 1.0
+    temperature: float | None = 1.0
     top_p: float = 1.0
     min_p: float = 0.0
     top_k: int = 0
@@ -401,6 +484,7 @@ class SamplingParams:
     # Stopping Conditions
     stop: list[str] = field(default_factory=list)
     stop_token_ids: list[int] = field(default_factory=list)
+    stop_pattern: str | None = None  # Regex pattern for stopping generation
     bad_words: list[str] = field(default_factory=list)
     ignore_eos: bool = False
     max_tokens: int | None = 16
@@ -410,7 +494,7 @@ class SamplingParams:
     logprobs: int | None = None
     prompt_logprobs: int | None = None
     detokenize: bool = True
-    skip_special_tokens: bool = True
+    skip_special_tokens: bool = False
     spaces_between_special_tokens: bool = True
     include_stop_str_in_output: bool = False
     output_kind: RequestOutputKind = RequestOutputKind.CUMULATIVE
@@ -420,7 +504,7 @@ class SamplingParams:
     guided_decoding: GuidedDecodingParams | None = None
     logit_bias: dict[int, float] | None = None
     allowed_token_ids: list[int] | None = None
-    extra_args: dict[str, Any] = field(default_factory=dict)
+    extra_args: dict[str, Any] | None = field(default_factory=dict)
 
     # Internal fields computed during initialization or via update methods.
     # They are not part of the constructor (`init=False`).
@@ -430,8 +514,12 @@ class SamplingParams:
     _bad_words_token_ids: list[list[int]] | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
-        """
-        Initializes and validates parameters.
+        """Initialize and validate parameters after construction.
+
+        Performs validation checks and computes derived values.
+
+        Raises:
+            ValueError: If parameter values are invalid.
         """
         if self.best_of is not None:
             if self.best_of < self.n:
@@ -449,6 +537,10 @@ class SamplingParams:
             self.temperature = 1e-2
         if self.seed == -1:
             self.seed = None
+
+        if self.max_tokens is not None and self.max_tokens < 0:
+            logger.debug("Received negative max_tokens (%s); treating as auto-infer.", self.max_tokens)
+            self.max_tokens = None
 
         if isinstance(self.stop, str):
             self.stop = [self.stop]
@@ -473,11 +565,16 @@ class SamplingParams:
         self._all_stop_token_ids = set(self.stop_token_ids)
 
     def _verify_args(self) -> None:
-        """Performs detailed validation of parameter values."""
+        """Perform detailed validation of parameter values.
+
+        Raises:
+            ValueError: If any parameter value is out of valid range.
+        """
         if self.n < 1:
             raise ValueError(f"n must be at least 1, got {self.n}.")
         if not -2.0 <= self.presence_penalty <= 2.0:
             raise ValueError(f"presence_penalty must be in [-2, 2], got {self.presence_penalty}.")
+        assert self.temperature is not None, "temperature must be set before validation"
         if self.temperature < 0.0:
             raise ValueError(f"temperature must be non-negative, got {self.temperature}.")
         if not 0.0 < self.top_p <= 1.0:
@@ -488,7 +585,11 @@ class SamplingParams:
             raise ValueError("stop strings require detokenize=True.")
 
     def _verify_greedy_sampling(self) -> None:
-        """Validates parameters for greedy sampling."""
+        """Validate parameters are compatible with greedy sampling.
+
+        Raises:
+            ValueError: If n > 1 with greedy sampling (temperature near 0).
+        """
         if self.n > 1:
             raise ValueError(f"n must be 1 for greedy sampling, got {self.n}.")
 
@@ -497,9 +598,16 @@ class SamplingParams:
         generation_config: dict[str, Any],
         model_eos_token_id: int | None = None,
     ) -> SamplingParams:
-        """
-        Creates a new `SamplingParams` instance updated with a model's generation_config.
-        Returns a new instance to maintain immutability.
+        """Update sampling parameters with model's generation config.
+
+        Incorporates EOS token IDs from the model's configuration.
+
+        Args:
+            generation_config: Dictionary containing model generation settings.
+            model_eos_token_id: Primary EOS token ID from the model.
+
+        Returns:
+            Self with updated stop token IDs.
         """
         all_stop_ids = self._all_stop_token_ids.copy()
         if model_eos_token_id is not None:
@@ -519,9 +627,18 @@ class SamplingParams:
         return self
 
     def update_with_tokenizer(self, tokenizer: AutoTokenizer) -> SamplingParams:
-        """
-        Creates a new `SamplingParams` instance with bad_words encoded into token IDs.
-        Returns a new instance to maintain immutability.
+        """Update sampling parameters with tokenized bad words.
+
+        Encodes bad_words strings into token ID sequences for use during generation.
+
+        Args:
+            tokenizer: The tokenizer to use for encoding bad words.
+
+        Returns:
+            Self with _bad_words_token_ids populated.
+
+        Raises:
+            ValueError: If bad words result in invalid token IDs.
         """
         if not self.bad_words:
             return self
@@ -549,34 +666,55 @@ class SamplingParams:
 
     @cached_property
     def sampling_type(self) -> SamplingType:
-        """Determines the sampling type based on parameters."""
-        if self.temperature < 1e-5:
+        """Determine the sampling type based on temperature.
+
+        Returns:
+            SamplingType.GREEDY if temperature < 1e-5, else SamplingType.RANDOM.
+        """
+        if self.temperature is None or self.temperature < 1e-5:
             return SamplingType.GREEDY
         return SamplingType.RANDOM
 
     @property
     def all_stop_token_ids(self) -> set[int]:
-        """Returns all stop token IDs, including EOS."""
+        """Get all stop token IDs including EOS.
+
+        Returns:
+            Set of all token IDs that should stop generation.
+        """
         return self._all_stop_token_ids
 
     @property
     def bad_words_token_ids(self) -> list[list[int]] | None:
-        """Returns the tokenized versions of bad_words."""
+        """Get the tokenized versions of bad_words.
+
+        Returns:
+            List of token ID sequences for bad words, or None if not set.
+        """
         return self._bad_words_token_ids
 
     def make_jitable(self) -> JitableSamplingParams:
-        """
-        Converts this host-side configuration into a JAX-jittable object.
+        """Convert to a JAX-jittable JitableSamplingParams object.
 
         This method should be called after all pre-processing (like tokenization)
         is complete.
+
+        Returns:
+            JitableSamplingParams ready for use in JIT-compiled functions.
+
+        Raises:
+            RuntimeError: If bad_words is set but update_with_tokenizer() was not called.
         """
         if self.bad_words and self._bad_words_token_ids is None:
             raise RuntimeError("Must call `with_tokenizer()` before `make_jitable()` when `bad_words` is set.")
         return JitableSamplingParams.from_host_params(self)
 
     def clone(self) -> SamplingParams:
-        """Creates a deep copy of the instance."""
+        """Create a deep copy of this instance.
+
+        Returns:
+            New SamplingParams instance with copied values.
+        """
         return copy.deepcopy(self)
 
 
@@ -586,19 +724,27 @@ class BeamSearchParams:
 
     Configuration for beam search decoding, which maintains multiple
     candidate sequences and selects the best ones based on cumulative probability.
-    This class is immutable (`frozen=True`) for JAX compatibility.
 
     Attributes:
-        beam_width: Number of beams to maintain
-        max_tokens: Maximum tokens to generate
-        ignore_eos: Whether to ignore end-of-sequence token
-        temperature: Temperature for beam search (0.0 = greedy)
-        length_penalty: Penalty factor for sequence length
-        include_stop_str_in_output: Include stop string in output
+        beam_width: Number of beams (candidate sequences) to maintain.
+        max_tokens: Maximum number of tokens to generate.
+        ignore_eos: Whether to ignore end-of-sequence token.
+        temperature: Temperature for beam search (0.0 = standard beam search).
+        length_penalty: Penalty factor for sequence length.
+            Values > 1.0 favor longer sequences, < 1.0 favor shorter.
+        include_stop_str_in_output: Whether to include stop string in output.
 
     Note:
         Beam search is typically used when deterministic, high-quality
-        output is desired, at the cost of increased computation.
+        output is desired, at the cost of increased computation compared
+        to sampling-based methods.
+
+    Example:
+        >>> params = BeamSearchParams(
+        ...     beam_width=4,
+        ...     max_tokens=100,
+        ...     length_penalty=1.2
+        ... )
     """
 
     beam_width: int

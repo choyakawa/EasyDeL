@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -46,18 +46,19 @@ Example:
 
 from __future__ import annotations
 
-import functools
 import inspect
 import re
 import types
 import typing as tp
 import warnings
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from functools import lru_cache, partial
 
 import jax
+import jax.extend
 import jax.tree_util
 import numpy as np
 from eformer.escale import with_sharding_constraint
@@ -65,14 +66,17 @@ from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from einops import rearrange
 from flax import nnx as nn
+from jax import numpy as jnp
+from jax.sharding import Mesh, PartitionSpec
+from jaxtyping import Array, DTypeLike, PRNGKeyArray
 from tqdm.auto import tqdm
 
-from easydel.layers.linear import ParallelLinear
+from easydel.layers import EasyQuantizer, ParallelLinear, QuantizationConfig
+from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
-from .base_config import EasyMethod
 from .errors import EasyDeLBlockWiseFFNError
-from .etils import AVAILABLE_SPARSE_MODULE_TYPES, EasyDeLGradientCheckPointers, EasyDeLQuantizationMethods
+from .etils import AVAILABLE_SPARSE_MODULE_TYPES, EasyDeLGradientCheckPointers
 
 warnings.filterwarnings(
     "ignore",
@@ -116,7 +120,7 @@ Maps activation function names to their implementations.
 Supports common activations used in neural networks.
 """
 
-ROPE_TYPES = tp.Optional[tp.Literal["none", "linear", "dynamic", "yarn", "su", "llama3", "longrope"]]  # noqa
+ROPE_TYPES = tp.Literal["none", "linear", "dynamic", "yarn", "su", "llama3", "longrope"] | None
 
 
 with_sharding_constraint = with_sharding_constraint
@@ -307,49 +311,6 @@ def add_start_docstrings(*docstr):
     return docstring_decorator
 
 
-def get_dot_general_by_bits(
-    bits: int | None = None,
-    mode: tp.Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
-) -> dict:
-    """The get_general_dot function is a helper function that returns a q_flax.QDotGeneral object
-    with the specified number of bits for forward and backward passes. If no bits are specified,
-    the function returns None.
-
-    Args:
-        bits: tp.Optional[int]: Specify the number of bits for quantization
-        mode: EasyMethod: Specify the use of model to init the QDot
-            Method for (e.q TRAIN,SERVE,...)
-
-    Returns:
-        A dict that contain dot_general_cls
-    """
-    if bits is not None:
-        try:
-            from aqt.jax.v2 import config as q_config  # type: ignore
-            from aqt.jax.v2.flax import aqt_flax as q_flax  # type: ignore
-        except ModuleNotFoundError as e:
-            raise ModuleNotFoundError(
-                "No module named `aqt` has been found, please install aqt before using bits option in EasyDeL"
-            ) from e
-        if mode == EasyMethod.TRAIN:
-            rhs_quant_mode = q_flax.QuantMode.TRAIN
-        elif mode == EasyMethod.EVAL or mode == EasyMethod.SERVE:
-            rhs_quant_mode = q_flax.QuantMode.SERVE
-        elif mode == EasyMethod.CONVERT:
-            rhs_quant_mode = q_flax.QuantMode.CONVERT
-        else:
-            raise ValueError("Unknown Quant Method for EasyMethod")
-
-            return {
-                "dot_general_cls": functools.partial(
-                    q_flax.AqtDotGeneral,
-                    cfg=q_config.fully_quantized(fwd_bits=bits, bwd_bits=bits),
-                    rhs_quant_mode=rhs_quant_mode,
-                )
-            }
-    return {}  # empty just in case of not getting any error
-
-
 def block_wise_ffn(remat_ffn: tp.Callable, inputs: jax.Array, chunk_size: int) -> jax.Array:
     """Apply a feed-forward network block-wise to reduce memory usage.
 
@@ -385,16 +346,14 @@ def block_wise_ffn(remat_ffn: tp.Callable, inputs: jax.Array, chunk_size: int) -
         if generating:
             return remat_ffn(inputs)
         else:
-            return rearrange(
-                jax.lax.scan(
-                    f=lambda carry, idx: (carry.at[:, idx].set(remat_ffn(carry[:, idx])), None),
-                    init=rearrange(inputs, "b (c n) d -> b c n d", c=chunk_size),
-                    xs=jax.numpy.arange(chunk_size),
-                    length=chunk_size,
-                    unroll=True,
-                )[0],
-                "b c n d -> b (c n) d",
+            inputs_chunked = rearrange(inputs, "b (c n) d -> c b n d", n=chunk_size)
+            _, outputs = jax.lax.scan(
+                f=lambda carry, x: (carry, remat_ffn(x)),
+                init=jnp.array(0, dtype=jnp.int32),
+                xs=inputs_chunked,
+                unroll=True,
             )
+            return rearrange(outputs, "c b n d -> b (c n) d")
     except Exception as e:
         raise EasyDeLBlockWiseFFNError(
             "You Are using BlockWise FFN from near-infinite-context length paper and you might be passing "
@@ -424,9 +383,7 @@ def quantize_linear_layers(
     model: nn.Module,
     /,
     *,
-    method: EasyDeLQuantizationMethods | None = None,
-    block_size: int = 256,
-    quantization_pattern: str | None = None,
+    quantization_config: QuantizationConfig | None = None,
     verbose: bool = True,
 ) -> nn.Module:
     """
@@ -434,56 +391,17 @@ def quantize_linear_layers(
 
     Args:
         model: The model to quantize.
-        method (EasyDeLQuantizationMethods): quantization method for params.
-        quantization_pattern (str): re pattern for layers to be quantized.
-        verbose (bool): whenever to use tqdm for logging stuff.
+        quantization_config: Quantization config specifying dtype, group_size, and pattern.
+        verbose: Whether to use tqdm for logging.
 
     Returns:
         Quantized parameters in the same structure as the input.
     """
-    if method == EasyDeLQuantizationMethods.NONE or method is None:
+    if quantization_config is None:
         return model
 
-    from easydel.layers.quantization import Linear8bit, LinearNF4
-    from easydel.utils.traversals import get_module_from_path, iter_module_search, set_module_from_path
-
-    quantizer: Linear8bit = {
-        EasyDeLQuantizationMethods.NF4: LinearNF4,
-        EasyDeLQuantizationMethods.A8BIT: Linear8bit,
-        EasyDeLQuantizationMethods.A4Q: LinearNF4,
-        EasyDeLQuantizationMethods.A8Q: Linear8bit,
-    }.get(method, None)
-    if quantizer is None:
-        raise NotImplementedError("Requested Quantizer is not Supported")
-    if quantization_pattern is None:
-        quantization_pattern = ".*"
-
-    if hasattr(model, "config"):
-        model.config.quantization_method = method
-        model.config.quantization_block_size = block_size
-        model.config.quantization_pattern = quantization_pattern
-
-    pattern = re.compile(quantization_pattern)
-
-    with tqdm(
-        total=len([p[0] for p in iter_module_search(model, ParallelLinear)]),
-        desc=f"Quantizing to {method}",
-        disable=not verbose,
-    ) as pbar:
-        for path, _ in iter_module_search(model, ParallelLinear):
-            if pattern.search(".".join([str(p) for p in path])):
-                set_module_from_path(
-                    model=model,
-                    path=path,
-                    new_value=quantizer.from_linear(
-                        linear=get_module_from_path(model=model, path=path),
-                        rngs=None,
-                        block_size=block_size,
-                    ),
-                )
-            pbar.update(1)
-
-    return model
+    quantizer = EasyQuantizer(quantization_config=quantization_config)
+    return quantizer.apply_quantization(model, verbose=verbose)
 
 
 def apply_lora_to_layers(
@@ -545,7 +463,7 @@ def apply_lora_to_layers(
     return model
 
 
-def split_lora_params(model: nn.Module) -> nn.Module:
+def split_lora_params(model: nn.Module) -> tp.Any:
     """
     get LoRA (Low-Rank Adaptation) from layers within a model.
 
@@ -644,8 +562,21 @@ def apply_sparsity_to_params(
     }.get(sparsify_module, None)
     assert sparser is not None, f"unkown type of sparser {sparsify_module}"
 
+    def _path_to_str(path):
+        path_keys = []
+        for key in path:
+            if hasattr(key, "key"):
+                path_keys.append(str(key.key))
+            elif hasattr(key, "name"):
+                path_keys.append(str(key.name))
+            elif hasattr(key, "idx"):
+                path_keys.append(str(key.idx))
+            else:
+                path_keys.append(str(key))
+        return ".".join(path_keys)
+
     def filter_params(path, array):
-        layer_name = ".".join(path[0].key)
+        layer_name = _path_to_str(path)
         if layer_name.endswith("kernel") and 4 > array.ndim > 1:
             array = sparser.fromdense(array)
         return array
@@ -658,7 +589,7 @@ def apply_sparsity_to_params(
     ) as pbar:
 
         def _with_progress(path, array):
-            pbar.set_postfix_str(".".join(path[0].key))
+            pbar.set_postfix_str(_path_to_str(path))
             result = filter_params(path, array)
             pbar.update(1)
             return result
@@ -691,7 +622,7 @@ def extract_static_parameters(module):
         "mode",
     ]
     obj = getattr(module, "__call__", None)  # noqa
-    if isinstance(obj, types.FunctionType | types.MethodType):
+    if isinstance(obj, (types.FunctionType, types.MethodType)):
         static_args = ()
         signature = inspect.signature(obj)
         for idx, (param_name, _param) in enumerate(signature.parameters.items()):
@@ -705,7 +636,7 @@ M = tp.TypeVar("M", bound=nn.Module)
 
 
 @tp.overload
-def auto_remat(
+def auto_remat(  # pyright: ignore[reportOverlappingOverload]
     module: type[M],
     /,
     *,
@@ -792,11 +723,11 @@ def auto_remat(
         ... )
         >>> model = auto_remat(model, policy=policy)
     """
-    if policy == EasyDeLGradientCheckPointers.NONE or policy == "":
+    if policy == EasyDeLGradientCheckPointers.NONE or policy in ["", "none"]:
         if len(modules) == 1:
             return modules[0]
         return modules
-    if isinstance(policy, str | EasyDeLGradientCheckPointers):
+    if isinstance(policy, (str, EasyDeLGradientCheckPointers)):
         policy = get_gradient_checkpoint_policy(policy, save_names, exclude_names)
     elif not callable(policy):
         raise ValueError(f"Invalid policy type: {type(policy)}")
@@ -864,7 +795,7 @@ def count_flop_jaxpr(jaxpr) -> int:
         out_size = batch_size * np.prod(lhs_remaining) * np.prod(rhs_remaining)
 
         # Each output element requires 2*contracting_size - 1 operations
-        return out_size * (2 * contracting_size - 1)
+        return int(out_size * (2 * contracting_size - 1))
 
     def compute_conv_flops(eqn) -> int:
         """Compute FLOPs for convolution operation."""
@@ -875,7 +806,7 @@ def count_flop_jaxpr(jaxpr) -> int:
         if not dimension_numbers:
             return 0
 
-        lhs_spec, rhs_spec, out_spec = dimension_numbers
+        lhs_spec, rhs_spec, _out_spec = dimension_numbers
 
         batch_size = lhs_shape[lhs_spec.index("N")]
         in_channels = lhs_shape[lhs_spec.index("C")]
@@ -904,7 +835,7 @@ def count_flop_jaxpr(jaxpr) -> int:
         remaining_shape = [s for i, s in enumerate(shape) if i not in reduced_axes]
         remaining_size = np.prod(remaining_shape) if remaining_shape else 1
 
-        return remaining_size * (reduced_size - 1)
+        return int(remaining_size * (reduced_size - 1))
 
     def compute_attention_flops(eqn) -> int:
         """Compute FLOPs for attention operation."""
@@ -1253,9 +1184,9 @@ class CompilationTracker:
     @contextmanager
     def trace_compilation(self):
         if self.first_time:
-            before = set(jax.lib.xla_bridge.get_backend().live_executables())
+            before = set(jax.extend.backend.get_backend().live_executables())
             yield
-            after = set(jax.lib.xla_bridge.get_backend().live_executables())
+            after = set(jax.extend.backend.get_backend().live_executables())
             new = after - before
             if new:
                 cmpf = list(new)
@@ -1270,7 +1201,7 @@ class CompilationTracker:
             yield
 
 
-class ActivationType(str, Enum):
+class ActivationType(StrEnum):
     GELU = "gelu"
     RELU = "relu"
     SILU = "silu"
@@ -1308,18 +1239,18 @@ def flop_activation(activation_type: ActivationType, dim: int) -> float:
     return flops_per_element.get(activation_type, 1) * dim
 
 
-class AttnMaskType(str, Enum):
+class AttnMaskType(StrEnum):
     FULL = "ATTN_MASK_FULL"
     SLIDING = "ATTN_MASK_SLIDING"
     CHUNK = "ATTN_MASK_CHUNK"
 
     @classmethod
-    def from_hf(cls, hf_type: tp.Literal["sliding_attention", "full_attention", "chunk_attention"]):
+    def from_hf(cls, hf_type: tp.Literal["sliding_attention", "full_attention", "chunk_attention", "chunked_attention"]):
         if hf_type == "sliding_attention":
             return AttnMaskType.SLIDING
         elif hf_type == "full_attention":
             return AttnMaskType.FULL
-        elif hf_type == "chunk_attention":
+        elif hf_type in ["chunk_attention", "chunked_attention"]:
             return AttnMaskType.CHUNK
         else:
             raise ValueError(f"`hf_type` {hf_type} is not available")
@@ -1354,7 +1285,7 @@ class AttnMaskDetail:
     bricks: int | None = None
 
 
-class TaskType(str, Enum):
+class TaskType(StrEnum):
     CAUSAL_LM = "causal-language-model"
     VISION_LM = "vision-language-model"
     DIFFUSION_LM = "diffusion-language-model"
@@ -1367,6 +1298,7 @@ class TaskType(str, Enum):
     SEQUENCE_CLASSIFICATION = "sequence-classification"
     AUDIO_CLASSIFICATION = "audio-classification"
     IMAGE_CLASSIFICATION = "image-classification"
+    ANY_TO_ANY = "any-to-any"
     AUTO_BIND = "auto-bind"
 
 
@@ -1461,7 +1393,7 @@ def flop_attention(
     hidden_dim: int,
     num_heads: int,
     num_kv_heads: int,
-    head_dim: int,
+    head_dim: int | None,
     seq_len: int,
 ) -> float:
     if head_dim is None:
@@ -1663,12 +1595,12 @@ def flops_per_token(cfg: FlopCalcConfig) -> float:
 @contextmanager
 def trace_functions():
     tracer = FunctionTracer()
-    tracer._before = set(jax.lib.xla_bridge.get_backend().live_executables())
+    tracer._before = set(jax.extend.backend.get_backend().live_executables())
 
     try:
         yield tracer
     finally:
-        after = set(jax.lib.xla_bridge.get_backend().live_executables())
+        after = set(jax.extend.backend.get_backend().live_executables())
         new = after - tracer._before
         tracer.new_executables = [TraceResult(exe) for exe in new]
 
@@ -1691,16 +1623,215 @@ class OverWriteWithGradient(nn.Param):
     """
 
 
+class hashable_dict(dict):
+    __hash__ = hash_fn
+
+
+class ArrayParam(nn.Param):
+    """Parameterized array with serializable initialization.
+
+    A parameter container that stores initialization metadata (method name
+    and kwargs) as strings/dicts instead of functions, making it pickleable
+    and serializable. This is particularly useful for checkpointing and
+    distributed training.
+
+    Attributes:
+        shape: The shape of the parameter array.
+        dtype: The data type of the parameter array.
+        init_method: Name of the JAX initializer (e.g., "normal", "zeros", "ones").
+        init_kwargs: Optional kwargs passed to the initializer.
+    """
+
+    shape: Sequence[int]
+    dtype: DTypeLike
+    init_method: str = "normal"
+    init_kwargs: hashable_dict | None = None
+
+    @classmethod
+    def bound(
+        cls,
+        shape: Sequence[int],
+        dtype: DTypeLike,
+        init_method: str,
+        init_kwargs: hashable_dict | None = None,
+        *,
+        key: PRNGKeyArray | None = None,
+        value: Array | None = None,
+        use_ref: bool | None = None,
+        **metadata,
+    ):
+        """Create an ArrayParam with initialized value.
+
+        Args:
+            shape: Shape of the parameter array.
+            dtype: Data type for the parameter.
+            init_method: Name of JAX initializer (e.g., "normal", "zeros", "kaiming_uniform").
+            init_kwargs: Optional keyword arguments for the initializer.
+            key: PRNG key for random initialization. Required if value is None.
+            value: Pre-computed value. If provided, skips initialization.
+            use_ref: Whether to use reference semantics.
+            **metadata: Additional metadata to store with the parameter.
+
+        Returns:
+            ArrayParam: An initialized ArrayParam instance.
+        """
+        if init_kwargs is None:
+            init_kwargs = {}
+        init_kwargs = hashable_dict(init_kwargs)
+        # Some JAX initializers (zeros, ones) are direct functions that take (key, shape, dtype),
+        # while others (normal, uniform, etc.) are factory functions that return an initializer.
+        # We need to handle both cases.
+        direct_initializers = {"zeros", "ones"}
+        if init_method in direct_initializers:
+            init_fn = getattr(jax.nn.initializers, init_method)
+        else:
+            init_fn = getattr(jax.nn.initializers, init_method, jax.nn.initializers.normal)(**init_kwargs)
+        if value is None:
+            value = init_fn(key, shape, dtype)
+        return cls(
+            shape=shape,
+            dtype=dtype,
+            init_method=init_method,
+            init_kwargs=init_kwargs,
+            value=value,
+            use_ref=use_ref,
+            **metadata,
+        )
+
+    def resure(self, key: PRNGKeyArray, shard_fn: tp.Callable[[Array], Array] | None = None) -> None:
+        """Reinitialize the parameter value with a new random key.
+
+        Regenerates the parameter value using the stored initialization method
+        and optional sharding function. Useful for resetting parameters or
+        applying sharding after initialization.
+
+        Args:
+            key: PRNG key for random initialization.
+            shard_fn: Optional function to apply sharding to the reinitialized value.
+        """
+        init_kwargs = self.init_kwargs
+        if init_kwargs is None:
+            init_kwargs = {}
+        # Some JAX initializers (zeros, ones) are direct functions that take (key, shape, dtype),
+        # while others (normal, uniform, etc.) are factory functions that return an initializer.
+        direct_initializers = {"zeros", "ones"}
+        if self.init_method in direct_initializers:
+            init_fn = getattr(jax.nn.initializers, self.init_method)
+        else:
+            init_fn = getattr(jax.nn.initializers, self.init_method, jax.nn.initializers.normal)(**init_kwargs)
+        val = init_fn(key, self.shape, self.dtype)
+
+        if shard_fn is not None:
+            val = shard_fn(val)
+
+        self.value = val
+        self.raw_value = val
+
+
 if tp.TYPE_CHECKING:
     from transformers import BaseImageProcessor, FeatureExtractionMixin, PreTrainedTokenizerBase, ProcessorMixin
 
-    ProcessingClassType = tp.Optional[  # noqa
-        tp.Union[  # noqa
-            PreTrainedTokenizerBase,
-            BaseImageProcessor,
-            FeatureExtractionMixin,
-            ProcessorMixin,
-        ]
-    ]
+    ProcessingClassType = PreTrainedTokenizerBase | BaseImageProcessor | FeatureExtractionMixin | ProcessorMixin | None
 else:
     ProcessingClassType = tp.Any
+
+
+def mesh_partition_product(mesh: Mesh, axis_spec: object) -> int:
+    """Return shard multiplicity implied by a PartitionSpec entry."""
+    if axis_spec is None:
+        return 1
+    if isinstance(axis_spec, (tuple, list)):
+        product = 1
+        for axis_name in axis_spec:
+            if axis_name is None:
+                continue
+            try:
+                product *= int(mesh.shape[str(axis_name)])
+            except Exception:
+                product *= 1
+        return int(product)
+    try:
+        return int(mesh.shape[str(axis_spec)])
+    except Exception:
+        return 1
+
+
+def sanitize_partition_spec_for_shape(
+    spec: PartitionSpec,
+    shape: tuple[int, ...],
+    mesh: Mesh,
+) -> PartitionSpec:
+    """Drop non-divisible sharding axes for a concrete tensor shape."""
+    axes = list(tuple(spec))
+    changed = False
+    ndim = len(shape)
+
+    if len(axes) > ndim:
+        axes = axes[:ndim]
+        changed = True
+
+    for dim_index, axis_spec in enumerate(axes):
+        if axis_spec is None:
+            continue
+        shard_factor = mesh_partition_product(mesh, axis_spec)
+        if shard_factor > 1 and int(shape[dim_index]) % shard_factor != 0:
+            axes[dim_index] = None
+            changed = True
+
+    if not changed:
+        return spec
+    return PartitionSpec(*axes)
+
+
+def sanitize_partition_specs_for_shape_tree(
+    partition_specs: tp.Any,
+    shape_tree: tp.Any,
+    mesh: Mesh,
+) -> tuple[tp.Any, int]:
+    """Sanitize a partition-spec tree against concrete parameter shapes."""
+    flat_specs = flatten_dict(partition_specs)
+    flat_shapes = flatten_dict(shape_tree)
+    adjusted = 0
+
+    for key, spec in flat_specs.items():
+        if not isinstance(spec, PartitionSpec):
+            continue
+        shape_obj = flat_shapes.get(key)
+        shape = tuple(getattr(shape_obj, "shape", ()))
+        if not shape:
+            continue
+        safe_spec = sanitize_partition_spec_for_shape(spec=spec, shape=shape, mesh=mesh)
+        if safe_spec != spec:
+            flat_specs[key] = safe_spec
+            adjusted += 1
+
+    if adjusted == 0:
+        return partition_specs, adjusted
+    return unflatten_dict(flat_specs), adjusted
+
+
+def materialize_meta_leaves(tree: tp.Any, *, seed: int = 0) -> tp.Any:
+    """Replace ShapeDtypeStruct placeholder leaves with concrete values."""
+    flat_tree = flatten_dict(tree)
+    changed = False
+    rng = jax.random.PRNGKey(seed)
+    count = 0
+
+    for leaf in flat_tree.values():
+        value = getattr(leaf, "value", None)
+        if not isinstance(value, jax.ShapeDtypeStruct):
+            continue
+        leaf_type = type(leaf)
+        if issubclass(leaf_type, nn.RngCount):
+            leaf.value = jnp.asarray(count, dtype=value.dtype)
+            count += 1
+        elif issubclass(leaf_type, nn.RngKey):
+            leaf.value = rng
+            rng, _ = jax.random.split(rng)
+        else:
+            leaf.value = jnp.zeros(value.shape, dtype=value.dtype)
+        changed = True
+
+    if not changed:
+        return tree
+    return unflatten_dict(flat_tree)

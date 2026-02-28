@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,7 +33,6 @@ All functions are JIT-compilable for optimal performance on TPU/GPU hardware.
 
 import typing as tp
 
-import chex
 import flax
 import flax.nnx
 import jax
@@ -42,12 +41,20 @@ from jax import numpy as jnp
 from jax.nn import log_sigmoid as logsigmoid
 from jax.nn import relu, sigmoid
 from jax.sharding import PartitionSpec
+from jaxtyping import Array
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
-from ..training_utils import make_assertions_and_get_sizes, minibatch_call, update_metrics, update_state_respectfully
+from ..training_utils import (
+    filter_kwargs_for_callable,
+    make_assertions_and_get_sizes,
+    minibatch_call,
+    sanitize_model_call_kwargs,
+    update_metrics,
+    update_state_respectfully,
+)
 from ..utils import pad_to_length
 
 # Define allowed loss function variants.
@@ -68,9 +75,9 @@ LOSS_FN_VARIENTS = tp.Literal[
 
 
 def concatenated_inputs(
-    batch: dict[str, list | chex.Array],
+    batch: dict[str, list | Array],
     padding_value: int,
-) -> dict[str, chex.Array]:
+) -> dict[str, Array]:
     """
     Concatenates chosen and rejected examples from the batch, and pads the inputs to a uniform length.
 
@@ -80,7 +87,7 @@ def concatenated_inputs(
     are padded to the length of the longest completion among the chosen and rejected examples.
 
     Args:
-        batch (tp.Dict[str, tp.Union[tp.List, chex.Array]]):
+        batch (tp.Dict[str, tp.Union[tp.List, Array]]):
             A dictionary containing the batch of data. Expected keys include:
             - "prompt_input_ids", "prompt_attention_mask"
             - "chosen_input_ids", "rejected_input_ids"
@@ -89,7 +96,7 @@ def concatenated_inputs(
         padding_value (int): The padding value to use when padding completion inputs.
 
     Returns:
-        tp.Dict[str, chex.Array]: A dictionary with concatenated arrays under keys such as:
+        tp.Dict[str, Array]: A dictionary with concatenated arrays under keys such as:
             - "prompt_input_ids", "prompt_attention_mask"
             - "completion_input_ids", "completion_attention_mask"
             and optionally image-related keys.
@@ -182,24 +189,24 @@ def get_loss_function(
     """
 
     def _base_dpo_loss(
-        chosen_logps: chex.Array,
-        rejected_logps: chex.Array,
-        ref_chosen_logps: chex.Array,
-        ref_rejected_logps: chex.Array,
+        chosen_logps: Array,
+        rejected_logps: Array,
+        ref_chosen_logps: Array,
+        ref_rejected_logps: Array,
         beta: float,
         label_smoothing: float,
         **kwargs,
-    ) -> tuple[chex.Array, chex.Array, chex.Array]:
+    ) -> tuple[Array, Array, Array]:
         """
         Base computation for DPO loss.
 
         Computes the log ratios between chosen and rejected log probabilities, and similarly for reference values.
 
         Args:
-            chosen_logps (chex.Array): Log probabilities for chosen examples.
-            rejected_logps (chex.Array): Log probabilities for rejected examples.
-            ref_chosen_logps (chex.Array): Reference log probabilities for chosen examples.
-            ref_rejected_logps (chex.Array): Reference log probabilities for rejected examples.
+            chosen_logps (Array): Log probabilities for chosen examples.
+            rejected_logps (Array): Log probabilities for rejected examples.
+            ref_chosen_logps (Array): Reference log probabilities for chosen examples.
+            ref_rejected_logps (Array): Reference log probabilities for rejected examples.
             beta (float): Scaling factor.
             label_smoothing (float): Label smoothing factor.
             **kwargs: Additional arguments (ignored).
@@ -214,19 +221,19 @@ def get_loss_function(
         return logits, logratios, ref_logratios
 
     def _sigmoid_dpo_loss(
-        chosen_logps: chex.Array,
-        rejected_logps: chex.Array,
-        ref_chosen_logps: chex.Array,
-        ref_rejected_logps: chex.Array,
+        chosen_logps: Array,
+        rejected_logps: Array,
+        ref_chosen_logps: Array,
+        ref_rejected_logps: Array,
         beta: float,
         label_smoothing: float,
         **kwargs,
-    ) -> chex.Array:
+    ) -> Array:
         """
         Computes the DPO loss using a sigmoid-based formulation.
 
         Args:
-            chosen_logps, rejected_logps, ref_chosen_logps, ref_rejected_logps (chex.Array):
+            chosen_logps, rejected_logps, ref_chosen_logps, ref_rejected_logps (Array):
                 Log probabilities for chosen/rejected examples and their reference values.
             beta (float): Scaling factor.
             label_smoothing (float): Label smoothing factor.
@@ -249,14 +256,14 @@ def get_loss_function(
         )
 
     def _nca_pair_dpo_loss(
-        chosen_logps: chex.Array,
-        rejected_logps: chex.Array,
-        ref_chosen_logps: chex.Array,
-        ref_rejected_logps: chex.Array,
+        chosen_logps: Array,
+        rejected_logps: Array,
+        ref_chosen_logps: Array,
+        ref_rejected_logps: Array,
         beta: float,
         label_smoothing: float,
         **kwargs,
-    ) -> chex.Array:
+    ) -> Array:
         """
         Computes the DPO loss using an NCA pair formulation.
 
@@ -275,14 +282,14 @@ def get_loss_function(
         )
 
     def _aot_dpo_loss(
-        chosen_logps: chex.Array,
-        rejected_logps: chex.Array,
-        ref_chosen_logps: chex.Array,
-        ref_rejected_logps: chex.Array,
+        chosen_logps: Array,
+        rejected_logps: Array,
+        ref_chosen_logps: Array,
+        ref_rejected_logps: Array,
         beta: float,
         label_smoothing: float,
         **kwargs,
-    ) -> chex.Array:
+    ) -> Array:
         """
         Computes the DPO loss using the AOT (All Ordered Terms) loss formulation.
 
@@ -305,15 +312,15 @@ def get_loss_function(
         )
 
     def _discopop_dpo_loss(
-        chosen_logps: chex.Array,
-        rejected_logps: chex.Array,
-        ref_chosen_logps: chex.Array,
-        ref_rejected_logps: chex.Array,
+        chosen_logps: Array,
+        rejected_logps: Array,
+        ref_chosen_logps: Array,
+        ref_rejected_logps: Array,
         beta: float,
         label_smoothing: float,
         discopop_tau: float = 1.0,
         **kwargs,
-    ) -> chex.Array:
+    ) -> Array:
         """
         Computes the DPO loss using a Discopo-based modulation.
 
@@ -339,13 +346,13 @@ def get_loss_function(
         return logistic_component * (1 - log_ratio_modulation) + exp_component * log_ratio_modulation
 
     def _hinge_dpo_loss(
-        chosen_logps: chex.Array,
-        rejected_logps: chex.Array,
-        ref_chosen_logps: chex.Array,
-        ref_rejected_logps: chex.Array,
+        chosen_logps: Array,
+        rejected_logps: Array,
+        ref_chosen_logps: Array,
+        ref_rejected_logps: Array,
         beta: float,
         label_smoothing: float,
-    ) -> chex.Array:
+    ) -> Array:
         """
         Computes the hinge loss version of the DPO loss.
 
@@ -359,13 +366,13 @@ def get_loss_function(
         return relu(1 - beta * logits)
 
     def _ipo_dpo_loss(
-        chosen_logps: chex.Array,
-        rejected_logps: chex.Array,
-        ref_chosen_logps: chex.Array,
-        ref_rejected_logps: chex.Array,
+        chosen_logps: Array,
+        rejected_logps: Array,
+        ref_chosen_logps: Array,
+        ref_rejected_logps: Array,
         beta: float,
         label_smoothing: float,
-    ) -> chex.Array:
+    ) -> Array:
         """
         Computes the IPO loss variant of the DPO loss.
 
@@ -379,13 +386,13 @@ def get_loss_function(
         return (logits - 1 / (2 * beta)) ** 2
 
     def _kto_pair_dpo_loss(
-        chosen_logps: chex.Array,
-        rejected_logps: chex.Array,
-        ref_chosen_logps: chex.Array,
-        ref_rejected_logps: chex.Array,
+        chosen_logps: Array,
+        rejected_logps: Array,
+        ref_chosen_logps: Array,
+        ref_rejected_logps: Array,
         beta: float,
         label_smoothing: float,
-    ) -> chex.Array:
+    ) -> Array:
         """
         Computes the KTO pair loss variant.
 
@@ -399,13 +406,13 @@ def get_loss_function(
         return -logsigmoid(beta * logits) * (1 - label_smoothing) - logsigmoid(-beta * logits) * label_smoothing
 
     def _robust_dpo_loss(
-        chosen_logps: chex.Array,
-        rejected_logps: chex.Array,
-        ref_chosen_logps: chex.Array,
-        ref_rejected_logps: chex.Array,
+        chosen_logps: Array,
+        rejected_logps: Array,
+        ref_chosen_logps: Array,
+        ref_rejected_logps: Array,
         beta: float,
         label_smoothing: float,
-    ) -> chex.Array:
+    ) -> Array:
         """
         Computes a robust variant of the DPO loss.
 
@@ -421,13 +428,13 @@ def get_loss_function(
         )
 
     def _exo_pair_dpo_loss(
-        chosen_logps: chex.Array,
-        rejected_logps: chex.Array,
-        ref_chosen_logps: chex.Array,
-        ref_rejected_logps: chex.Array,
+        chosen_logps: Array,
+        rejected_logps: Array,
+        ref_chosen_logps: Array,
+        ref_rejected_logps: Array,
         beta: float,
         label_smoothing: float,
-    ) -> chex.Array:
+    ) -> Array:
         """
         Computes the exo-pair variant of the DPO loss.
 
@@ -446,13 +453,13 @@ def get_loss_function(
         ) * (logsigmoid(-beta * logits) - math.log(label_smoothing))
 
     def _bco_pair_dpo_loss(
-        chosen_logps: chex.Array,
-        rejected_logps: chex.Array,
-        ref_chosen_logps: chex.Array,
-        ref_rejected_logps: chex.Array,
+        chosen_logps: Array,
+        rejected_logps: Array,
+        ref_chosen_logps: Array,
+        ref_rejected_logps: Array,
         beta: float,
         label_smoothing: float,
-    ) -> chex.Array:
+    ) -> Array:
         """
         Computes the BCO pair variant of the DPO loss.
 
@@ -470,13 +477,13 @@ def get_loss_function(
         return -logsigmoid((beta * chosen_logratios) - delta) - logsigmoid(-(beta * rejected_logratios - delta))
 
     def _sppo_hard_dpo_loss(
-        chosen_logps: chex.Array,
-        rejected_logps: chex.Array,
-        ref_chosen_logps: chex.Array,
-        ref_rejected_logps: chex.Array,
+        chosen_logps: Array,
+        rejected_logps: Array,
+        ref_chosen_logps: Array,
+        ref_rejected_logps: Array,
         beta: float,
         label_smoothing: float,
-    ) -> chex.Array:
+    ) -> Array:
         """
         Computes the SPO PPO hard variant of the DPO loss.
 
@@ -491,13 +498,13 @@ def get_loss_function(
         return (a - 0.5 / beta) ** 2 + (b + 0.5 / beta) ** 2
 
     def _aot_pair_dpo_loss(
-        chosen_logps: chex.Array,
-        rejected_logps: chex.Array,
-        ref_chosen_logps: chex.Array,
-        ref_rejected_logps: chex.Array,
+        chosen_logps: Array,
+        rejected_logps: Array,
+        ref_chosen_logps: Array,
+        ref_rejected_logps: Array,
         beta: float,
         label_smoothing: float,
-    ) -> chex.Array:
+    ) -> Array:
         """
         Computes the AOT pair variant of the DPO loss.
 
@@ -515,13 +522,13 @@ def get_loss_function(
         return -logsigmoid(beta * delta) * (1 - label_smoothing) - logsigmoid(-beta * delta) * label_smoothing
 
     def _aot_dpo_loss(
-        chosen_logps: chex.Array,
-        rejected_logps: chex.Array,
-        ref_chosen_logps: chex.Array,
-        ref_rejected_logps: chex.Array,
+        chosen_logps: Array,
+        rejected_logps: Array,
+        ref_chosen_logps: Array,
+        ref_rejected_logps: Array,
         beta: float,
         label_smoothing: float,
-    ) -> chex.Array:
+    ) -> Array:
         """
         Computes the AOT variant of the DPO loss.
 
@@ -541,13 +548,13 @@ def get_loss_function(
         return -logsigmoid(beta * delta) * (1 - label_smoothing) - logsigmoid(-beta * delta) * label_smoothing
 
     def _apo_zero_dpo_loss(
-        chosen_logps: chex.Array,
-        rejected_logps: chex.Array,
-        ref_chosen_logps: chex.Array,
-        ref_rejected_logps: chex.Array,
+        chosen_logps: Array,
+        rejected_logps: Array,
+        ref_chosen_logps: Array,
+        ref_rejected_logps: Array,
         beta: float,
         label_smoothing: float,
-    ) -> chex.Array:
+    ) -> Array:
         """
         Computes the APO zero variant of the DPO loss.
 
@@ -564,13 +571,13 @@ def get_loss_function(
         return losses_chosen + losses_rejected
 
     def _apo_down_dpo_loss(
-        chosen_logps: chex.Array,
-        rejected_logps: chex.Array,
-        ref_chosen_logps: chex.Array,
-        ref_rejected_logps: chex.Array,
+        chosen_logps: Array,
+        rejected_logps: Array,
+        ref_chosen_logps: Array,
+        ref_rejected_logps: Array,
         beta: float,
         label_smoothing: float,
-    ) -> chex.Array:
+    ) -> Array:
         """
         Computes the APO down variant of the DPO loss.
 
@@ -609,7 +616,7 @@ def get_loss_function(
 
 def concatenated_forward(
     model: EasyDeLBaseModule,
-    batch: dict[str, list | chex.Array],
+    batch: dict[str, list | Array],
     is_encoder_decoder: bool,
     label_pad_token_id: int,
     padding_value: int,
@@ -617,7 +624,7 @@ def concatenated_forward(
     truncation_mode: str = "keep_end",
     aux_loss_enabled: bool = False,
     loss_type: str = "sigmoid",
-) -> dict[str, chex.Array]:
+) -> dict[str, Array]:
     """
     Runs the model on concatenated chosen/rejected inputs for efficiency.
 
@@ -627,7 +634,7 @@ def concatenated_forward(
 
     Args:
         model (EasyDeLBaseModule): The model to run.
-        batch (tp.Dict[str, tp.Union[tp.List, chex.Array]]): The input batch of data.
+        batch (tp.Dict[str, tp.Union[tp.List, Array]]): The input batch of data.
         is_encoder_decoder (bool): Flag indicating whether the model is an encoder-decoder.
         label_pad_token_id (int): Token id used to mark padded tokens in the labels.
         padding_value (int): Padding value for inputs.
@@ -637,7 +644,7 @@ def concatenated_forward(
         loss_type (str, optional): The type of loss function to be used. Defaults to "sigmoid".
 
     Returns:
-        tp.Dict[str, chex.Array]: A dictionary containing:
+        tp.Dict[str, Array]: A dictionary containing:
             - "chosen_logps": Log probabilities for chosen examples.
             - "rejected_logps": Log probabilities for rejected examples.
             - "mean_chosen_logits": Mean logits over tokens for chosen examples.
@@ -673,12 +680,15 @@ def concatenated_forward(
             label_pad_token_id,
             completion_input_ids,
         )
-        outputs = model(
-            input_ids=prompt_input_ids,
-            attention_mask=prompt_attention_mask,
-            labels=labels,
+        call_kwargs = {
+            "input_ids": prompt_input_ids,
+            "attention_mask": prompt_attention_mask,
+            "labels": labels,
             **model_kwargs,
-        )
+        }
+        call_kwargs = filter_kwargs_for_callable(model.__call__, call_kwargs)
+        call_kwargs = sanitize_model_call_kwargs(call_kwargs)
+        outputs = model(**call_kwargs)
         logits = outputs.logits
         loss_mask = completion_attention_mask.astype(bool)
     else:
@@ -711,9 +721,14 @@ def concatenated_forward(
                 raise ValueError(
                     f"Unknown truncation mode: '{truncation_mode}'. Should be one of ['keep_end', 'keep_start']."
                 )
-        model_kwargs["input_ids"] = input_ids
-        model_kwargs["attention_mask"] = attention_mask
-        outputs = model(**model_kwargs)
+        call_kwargs = {
+            **model_kwargs,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+        call_kwargs = filter_kwargs_for_callable(model.__call__, call_kwargs)
+        call_kwargs = sanitize_model_call_kwargs(call_kwargs)
+        outputs = model(**call_kwargs)
         logits = outputs.logits
         labels = jnp.roll(input_ids, shift=-1, axis=1)
         loss_mask = jnp.roll(loss_mask, shift=-1, axis=1).astype("bool")
@@ -779,6 +794,7 @@ def training_step(
     loss_config: LossConfig | None = None,
     partition_spec: PartitionSpec | None = None,
     gradient_accumulation_steps: int = 1,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics]:
     """
     Performs a single training step.
@@ -806,7 +822,7 @@ def training_step(
     Returns:
         tp.Tuple[EasyDeLState, LossMetrics]: A tuple containing the updated model state and the loss metrics.
     """
-    batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+    _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
         batch=batch,
         gradient_accumulation_steps=gradient_accumulation_steps,
         batch_partition_spec=partition_spec,
@@ -819,6 +835,15 @@ def training_step(
         label_smoothing=label_smoothing,
     )
 
+    # Pre-compute reference logps outside jax.value_and_grad to avoid
+    # nn.remat trace-level conflicts when the reference model uses
+    # gradient checkpointing inside the grad trace.
+    if "ref_chosen_logps" not in batch or "ref_rejected_logps" not in batch:
+        rfm = reference_state.model
+        rfm.eval()
+        ref_out = jax.lax.stop_gradient(concatenated_forward(rfm, batch))
+        batch = {**batch, "ref_chosen_logps": ref_out["chosen_logps"], "ref_rejected_logps": ref_out["rejected_logps"]}
+
     def calculate_loss(tree: flax.nnx.GraphState, call_batch):
         """
         Inner function to compute loss and metrics for a given minibatch.
@@ -830,17 +855,14 @@ def training_step(
         Returns:
             A tuple (loss, metrics) where loss is a scalar and metrics is a LossMetrics instance.
         """
-        model_output = concatenated_forward(state.merge(tree=tree), call_batch)
+        if straight_through_emulator is not None:
+            tree = straight_through_emulator(tree)
+        module = state.merge(tree=tree)
 
-        if "ref_chosen_logps" in call_batch and "ref_rejected_logps" in call_batch:
-            ref_chosen_logps = jax.lax.stop_gradient(call_batch["ref_chosen_logps"])
-            ref_rejected_logps = jax.lax.stop_gradient(call_batch["ref_rejected_logps"])
-        else:
-            rfm = reference_state.model
-            rfm.eval()
-            out = jax.lax.stop_gradient(concatenated_forward(rfm, call_batch))
-            ref_chosen_logps = out["chosen_logps"]
-            ref_rejected_logps = out["rejected_logps"]
+        model_output = concatenated_forward(module, call_batch)
+
+        ref_chosen_logps = jax.lax.stop_gradient(call_batch["ref_chosen_logps"])
+        ref_rejected_logps = jax.lax.stop_gradient(call_batch["ref_rejected_logps"])
 
         chosen_logps = model_output["chosen_logps"]
         rejected_logps = model_output["rejected_logps"]
@@ -890,7 +912,7 @@ def training_step(
 def evaluation_step(
     state: EasyDeLState,
     batch: dict,
-    reference_state: EasyDeLState,
+    reference_state: EasyDeLState | None,
     concatenated_forward: tp.Callable,
     beta: float = 0.1,
     label_smoothing: float = 0,

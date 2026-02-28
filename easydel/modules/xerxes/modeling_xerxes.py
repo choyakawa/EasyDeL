@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,30 +15,31 @@
 
 import functools
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
-from easydel.infra.utils import auto_remat, block_wise_ffn, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheMetaData,
-    PagesCacheView,
+from easydel.caching import (
+    HybridCache,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput, DecoderLayerOutput
+from easydel.infra.utils import auto_remat, block_wise_ffn
+from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.modules._base import BaseCausalLMModule
 
 from .xerxes_configuration import XerxesConfig as XerxesConfig
 
@@ -46,18 +47,54 @@ logger = get_logger(__name__)
 
 
 class Identity(nn.Module):
+    """No-op module used as a placeholder when optional layers are disabled.
+
+    This module returns its input unchanged, serving as a pass-through
+    when certain normalization or processing layers are conditionally disabled.
+    """
+
     def __init__(self): ...
+
     def __call__(self, x):
+        """Pass through input unchanged.
+
+        Args:
+            x: Input tensor of any shape.
+
+        Returns:
+            The input tensor unchanged.
+        """
         return x
 
 
 class PostCross(nn.Module):
+    """Applies a bounded tanh transform after cross attention.
+
+    Implements a soft clipping function that bounds outputs to approximately [-30, 30]
+    while preserving gradient flow for most values.
+    """
+
     def __init__(self): ...
+
     def __call__(self, x):
+        """Apply bounded tanh transformation.
+
+        Args:
+            x: Input tensor of any shape.
+
+        Returns:
+            Transformed tensor with values bounded to approximately [-30, 30].
+        """
         return jax.nn.tanh(x / 30.0) * 30.0
 
 
 class XerxesMLP(nn.Module):
+    """Multi-Layer Perceptron module for Xerxes models.
+
+    Implements the feedforward network with SwiGLU or GELU activation function
+    for enhanced representation learning in Xerxes architecture.
+    """
+
     def __init__(
         self,
         config: XerxesConfig,
@@ -67,6 +104,16 @@ class XerxesMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Xerxes MLP block.
+
+        Args:
+            config (XerxesConfig): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -83,7 +130,6 @@ class XerxesMLP(nn.Module):
             precision=precision,
             kernel_init=kernel_init,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         row_parallel_linear = functools.partial(
             RowParallelLinear,
@@ -93,7 +139,6 @@ class XerxesMLP(nn.Module):
             precision=precision,
             kernel_init=kernel_init,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.gate_proj = column_parallel_linear(
             self.config.hidden_size,
@@ -111,7 +156,17 @@ class XerxesMLP(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states):
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply gated feedforward transformation.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
+
+        Returns:
+            Transformed hidden states [batch, seq_len, hidden_dim]
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -128,7 +183,18 @@ class XerxesMLP(nn.Module):
         return hidden_states
 
 
-class XerxesAttention(AttentionModule):
+class XerxesAttention(UnifiedAttention):
+    """Multi-head attention layer with conditional Q/K normalization for Xerxes models.
+
+    Implements attention with optional Q/K normalization and layer-specific sliding window
+    patterns for efficient long-context processing.
+
+    Features:
+        - Conditional Q/K normalization via xe_kvnorm flag
+        - Layer-specific sliding window (different patterns based on layer_idx or window_pattern)
+        - Grouped-query attention support
+    """
+
     def __init__(
         self,
         config: XerxesConfig,
@@ -141,211 +207,93 @@ class XerxesAttention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(config)
-        self.config = config
+        """Initialize Xerxes attention layer with conditional Q/K normalization.
+
+        Args:
+            config (XerxesConfig): Model configuration with attention parameters.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
+            causal (bool, optional): Whether to use causal attention. Defaults to True.
+            is_cross_attention (bool, optional): Whether this is cross-attention. Defaults to False.
+            rngs (nn.Rngs): Random number generator state.
+        """
+        # Set sliding window BEFORE super().__init__()
+        self.is_local_attn = False
+        sliding_window = None
+        if not config.xe_kvnorm:
+            sliding_window = 4096 if bool((layer_idx % 2) == 0) else None
+        if config.window_pattern is not None:
+            self.is_local_attn = bool((layer_idx + 1) % config.window_pattern)
+            sliding_window = config.sliding_window if self.is_local_attn else None
+
+        self.xe_kvnorm = config.xe_kvnorm
+
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+            attention_type="standard",
+            causal=True,
+            sliding_window=sliding_window,
+            use_qk_norm=True,
+        )
+
         self.layer_idx = layer_idx
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.causal = causal
         self.is_cross_attention = is_cross_attention
-        self.rngs = rngs
-
-        self.embed_dim = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = config.head_dim
+        self.causal = causal
         self.attention_softmax_in_fp32 = self.dtype is not jnp.float32
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
 
-        kernel = jax.nn.initializers.normal(config.initializer_range)
-
-        column_parallel_linear = functools.partial(
-            ColumnParallelLinear,
+    def _create_q_norm(self, config, dtype, param_dtype, rngs):
+        """Override to conditionally create Q norm based on xe_kvnorm flag."""
+        if not self.xe_kvnorm:
+            return None
+        return RMSNorm(
+            dim=self.head_dim,
+            eps=config.rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
-            precision=precision,
-            use_bias=False,
-            kernel_init=kernel,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        row_parallel_linear = functools.partial(
-            RowParallelLinear,
+
+    def _create_k_norm(self, config, dtype, param_dtype, rngs):
+        """Override to conditionally create K norm based on xe_kvnorm flag."""
+        if not self.xe_kvnorm:
+            return None
+        return RMSNorm(
+            dim=self.head_dim,
+            eps=config.rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
-            precision=precision,
-            use_bias=False,
-            kernel_init=kernel,
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-
-        self.q_proj = column_parallel_linear(
-            self.embed_dim,
-            self.num_heads * self.head_dim,
-            rngs=rngs,
-        )
-        self.k_proj = column_parallel_linear(
-            self.embed_dim,
-            self.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-        )
-        self.v_proj = column_parallel_linear(
-            self.embed_dim,
-            self.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-        )
-        self.o_proj = row_parallel_linear(
-            self.num_heads * self.head_dim,
-            self.embed_dim,
             rngs=rngs,
         )
 
-        if config.xe_kvnorm:
-            self.q_norm = RMSNorm(
-                dim=self.head_dim,
-                eps=config.rms_norm_eps,
-                dtype=dtype,
-                param_dtype=param_dtype,
-            )
-            self.k_norm = RMSNorm(
-                dim=self.head_dim,
-                eps=config.rms_norm_eps,
-                dtype=dtype,
-                param_dtype=param_dtype,
-            )
-
-        self.attention_performer = FlexibleAttentionModule(
+    def _create_attention_performer(self, config, rngs):
+        """Override to set dropout_prob to 0.0 for Xerxes."""
+        return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=0.0,
         )
 
-        self.rotary = self.config.get_basic_rope(self.dtype, self.head_dim, self.head_dim, True)
-        self.is_local_attn = False
-        self.sliding_window = None
-        if not config.xe_kvnorm:
-            self.sliding_window = 4096 if bool((self.layer_idx % 2) == 0) else None
-        if config.window_pattern is not None:
-            self.is_local_attn = bool((layer_idx + 1) % config.window_pattern)
-            self.sliding_window = config.sliding_window if self.is_local_attn else None
-
-    def _merge_heads(self, hidden_states):
-        """
-        Merges the attention heads into a single hidden state tensor.
-
-        Args:
-            hidden_states (chex.Array): The hidden states with separate head dimensions.
-
-        Returns:
-            chex.Array: The hidden states with merged head dimensions.
-        """
-        return hidden_states.reshape((*hidden_states.shape[:2], self.num_heads * self.head_dim))
-
-    def _split_heads(self, hidden_states, num_heads):
-        return hidden_states.reshape((*hidden_states.shape[:2], num_heads, self.head_dim))
-
-    def __call__(
-        self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesCacheMetaData | None = None,
-        segment_ids: chex.Array | None = None,
-        output_attentions: bool = False,
-        fcm_mask: chex.Array | None = None,
-        frequencies: chex.Array | None = None,
-    ):
-        """
-        Forward pass of the attention module.
-
-        Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            deterministic (bool): If True, disables dropout for deterministic behavior.
-            init_cache (bool): If True, initializes cache for caching keys and values.
-            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
-        Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
-        """
-        batch_size, sequence_length = hidden_states.shape[:2]
-        query_states, key_states, value_states = (
-            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
-            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
-            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
-        )
-
-        query_states = query_states.reshape(batch_size, sequence_length, self.num_heads, self.head_dim)
-        key_states = key_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
-        value_states = value_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
-
-        if self.config.xe_kvnorm:
-            query_states = self.q_norm(query_states)
-            key_states = self.k_norm(key_states)
-
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
-
-        (
-            key_states,
-            value_states,
-            attention_mask,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            fcm_mask=fcm_mask,
-            sliding_window=self.sliding_window,
-        )
-
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
-            causal=True,
-            sliding_window=self.sliding_window,
-        )
-
-        attn_output = self._merge_heads(attentions.attention_outputs)
-        attn_output = self.shard_attention_prod(attn_output)
-        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
-        )
+    def _postprocess_qkv(self, query_states, key_states, value_states):
+        if not self.xe_kvnorm:
+            return query_states, key_states, value_states
+        return self.query_normalization(query_states), self.key_normalization(key_states), value_states
 
 
 class XerxesSparseMoeBlock(nn.Module):
+    """Sparse Mixture-of-Experts block for Xerxes models.
+
+    Implements a top-k routing mechanism where each token is processed by
+    a subset of expert MLPs, enabling parameter-efficient scaling.
+    """
+
     def __init__(
         self,
         config: XerxesConfig,
@@ -355,6 +303,20 @@ class XerxesSparseMoeBlock(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Xerxes Sparse MoE block.
+
+        Args:
+            config (XerxesConfig): Model configuration with MoE parameters including
+                num_local_experts and num_experts_per_tok.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.Precision | None, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+
+        Raises:
+            AssertionError: If config.swish_run is True (incompatible with MoE).
+        """
         assert config.swish_run is False
 
         self.config = config
@@ -372,18 +334,30 @@ class XerxesSparseMoeBlock(nn.Module):
             kernel_init=nn.initializers.normal(config.initializer_range),
             rngs=rngs,
         )
-        self.experts = [
-            XerxesMLP(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for _ in range(self.config.num_local_experts)
-        ]
+        self.experts = nn.List(
+            [
+                XerxesMLP(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for _ in range(self.config.num_local_experts)
+            ]
+        )
 
-    def __call__(self, hidden_states: chex.Array) -> tuple[chex.Array, chex.Array]:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
+        """Apply sparse MoE transformation with top-k expert routing.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
+
+        Returns:
+            tuple: A tuple containing:
+                - final_hidden_state: Transformed hidden states [batch, seq_len, hidden_dim]
+                - router_logits: Router logits for load balancing loss [batch, seq_len, num_experts]
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -397,12 +371,12 @@ class XerxesSparseMoeBlock(nn.Module):
         for index in range(self.config.num_local_experts):
             expert_layer_output = (
                 block_wise_ffn(
-                    self.layers[index],
+                    self.experts[index],
                     hidden_states,
                     self.config.scan_mlp_chunk_size,
                 )
                 if self.config.use_scan_mlp
-                else self.layers[index](hidden_states)
+                else self.experts[index](hidden_states)
             )
             expert_layer_output_exp = (
                 jnp.sum(jnp.multiply(selected_experts == index, routing_weights), axis=-1)[:, :, None]
@@ -413,6 +387,13 @@ class XerxesSparseMoeBlock(nn.Module):
 
 
 class XerxesDecoderLayer(nn.Module):
+    """Single decoder layer for Xerxes models.
+
+    Combines multi-head attention and feedforward networks (or MoE) with
+    RMS normalization and residual connections. Supports optional cross-attention
+    and conditional normalization patterns.
+    """
+
     def __init__(
         self,
         config: XerxesConfig,
@@ -423,6 +404,16 @@ class XerxesDecoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Xerxes decoder layer.
+
+        Args:
+            config (XerxesConfig): Model configuration.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.layer_idx = layer_idx
         self.dtype = dtype
@@ -473,47 +464,46 @@ class XerxesDecoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo,
+        position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesCacheMetaData | None = None,
-        segment_ids: chex.Array | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesCacheView | None = None,
         output_attentions: bool = False,
-        fcm_mask: chex.Array | None = None,
-        frequencies: chex.Array | None = None,
-        default_frequencies: chex.Array | None = None,
-    ):
-        """
-        Forward pass of the module block.
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+        default_frequencies: Float[Array, "seq_len head_dim"] | None = None,
+    ) -> DecoderLayerOutput:
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture with optional identity bypass for certain
+        configurations. Supports both standard MLP and MoE feedforward.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            deterministic (bool): If True, disables dropout for deterministic behavior.
-            init_cache (bool): If True, initializes cache for caching keys and values.
-            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
-        Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
-        """
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view
+                for key-value caching during generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesCacheView | None, optional):
+                Cache metadata for cache management. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+            default_frequencies (Array | None, optional): Default RoPE frequencies for local attention.
+                Defaults to None.
 
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, router logits, and cache view.
+        """
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
-            attention_mask,
+            mask_info,
             position_ids,
-            causal_mask,
             mode,
             cache_view,
             cache_metadata,
-            segment_ids,
             output_attentions,
-            fcm_mask,
             default_frequencies if self.self_attn.is_local_attn else frequencies,
         )
         if self.identity:
@@ -536,6 +526,10 @@ class XerxesDecoderLayer(nn.Module):
         else:
             feed_forward_hidden_states = self.mlp(feed_forward_input)
 
+        router_logits = None
+        if isinstance(feed_forward_hidden_states, tuple):
+            feed_forward_hidden_states, router_logits = feed_forward_hidden_states
+
         hidden_states = self.post_feedforward_layernorm(feed_forward_hidden_states)
         hidden_states = residual + hidden_states
         hidden_states = apply_logical_sharding(
@@ -546,12 +540,26 @@ class XerxesDecoderLayer(nn.Module):
         return DecoderLayerOutput(
             hidden_states=hidden_states,
             attention_weight=attn_outputs.attention_weight,
+            router_logits=router_logits,
             cache_view=attn_outputs.cache_view,
         )
 
 
 @register_module(TaskType.BASE_MODULE, config=XerxesConfig, model_type="xerxes")
 class XerxesModel(EasyDeLBaseModule):
+    """Xerxes model implementation.
+
+    This implements the Xerxes language model architecture, utilizing transformer blocks
+    with RMSNorm, rotary position embeddings, conditional Q/K normalization, and optional
+    mixture-of-experts layers.
+
+    Attributes:
+        config (XerxesConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
+
     def __init__(
         self,
         config: XerxesConfig,
@@ -561,6 +569,15 @@ class XerxesModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Xerxes base model.
+
+        Args:
+            config (XerxesConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -570,13 +587,7 @@ class XerxesModel(EasyDeLBaseModule):
         )
         self.hidden_size = self.config.hidden_size
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             self.config.vocab_size,
             self.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -584,17 +595,19 @@ class XerxesModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = [
-            XerxesDecoderLayer(
-                self.config,
-                layer_idx=i,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(self.config.num_hidden_layers)
-        ]
+        self.layers = nn.List(
+            [
+                XerxesDecoderLayer(
+                    self.config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(self.config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
@@ -606,7 +619,7 @@ class XerxesModel(EasyDeLBaseModule):
     @functools.cached_property
     def default_frequencies(self):
         from easydel.infra.utils import ModuleCaches
-        from easydel.layers.rotary_embedding import get_frequencies
+        from easydel.layers import get_frequencies
 
         frequencies = get_frequencies(
             head_size=self.config.head_dim,
@@ -614,39 +627,57 @@ class XerxesModel(EasyDeLBaseModule):
             max_position=self.config.granted_freq_max_position_embedding,
             base=10000,
             rope_scaling=None,
-        )
+        ).astype(jnp.bfloat16)
 
         return ModuleCaches(frequencies)
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesCacheView | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesCacheMetaData | None = None,
     ) -> BaseModelOutput:
-        """
-        Forward pass through the Xerxes module.
+        """Forward pass through the Xerxes base model.
+
+        Processes input tokens through embedding, all decoder layers with RoPE and RMSNorm,
+        and final normalization. Supports conditional Q/K normalization and MoE layers.
 
         Args:
-            input_ids (chex.Array): Input tensor containing token IDs.
-            attention_mask (chex.Array): Mask for attention.
-            position_ids (chex.Array): Positional indices.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
-            inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
-            output_attentions (tp.Optional[bool]): If True, output attention weights.
-            output_hidden_states (tp.Optional[bool]): If True, output hidden states.
-            init_cache (bool): If True, initialize cache for decoding.
-            deterministic (bool): If True, disable dropout.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesCacheView | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-            BaseModelOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
+            BaseModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                and updated past_key_values.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
         """
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -656,26 +687,22 @@ class XerxesModel(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
         inputs_embeds = inputs_embeds * self.embedding_scale
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
 
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-        else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
 
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-                (batch_size, sequence_length),
-            )
-        if attention_mask.ndim == 2:
-            attention_mask = jnp.expand_dims(attention_mask, (1, 2))
+            position_ids = mask_info.q_position_ids
 
         if mode is None:
             mode = (
@@ -692,20 +719,19 @@ class XerxesModel(EasyDeLBaseModule):
             partition_manager=self.config.partition_manager,
         )
 
+        outputs = None
         for idx, block in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
             outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
-                causal_mask=self.causal_mask,
                 output_attentions=output_attentions,
-                segment_ids=segment_ids,
                 frequencies=self.frequencies,
                 default_frequencies=self.default_frequencies,
             )
@@ -723,10 +749,10 @@ class XerxesModel(EasyDeLBaseModule):
 
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:
-            all_hidden_states = outputs[1] + (hidden_states,)
-            outputs = (hidden_states, all_hidden_states, *outputs[2:])
+            all_hidden_states = outputs[1] + (hidden_states,)  # pyright: ignore[reportOptionalSubscript]
+            outputs = (hidden_states, all_hidden_states, *outputs[2:])  # pyright: ignore[reportOptionalSubscript]
         else:
-            outputs = (hidden_states, *outputs[1:])
+            outputs = (hidden_states, *outputs[1:])  # pyright: ignore[reportOptionalSubscript]
 
         return BaseModelOutput(
             last_hidden_state=hidden_states,
@@ -763,7 +789,24 @@ class XerxesModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=XerxesConfig, model_type="xerxes")
-class XerxesForCausalLM(EasyDeLBaseModule):
+class XerxesForCausalLM(BaseCausalLMModule[XerxesModel, XerxesConfig]):  # type: ignore
+    """Xerxes model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation. Supports conditional
+    Q/K normalization, mixture-of-experts, and bounded output transformation.
+
+    Attributes:
+        config (XerxesConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "xerxes"
+    _config_class = XerxesConfig
+
     def __init__(
         self,
         config: XerxesConfig,
@@ -773,76 +816,78 @@ class XerxesForCausalLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Xerxes model for causal language modeling.
+
+        Args:
+            config (XerxesConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
+            base_model_class=XerxesModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = XerxesModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            self.config.hidden_size,
-            self.config.vocab_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            lm_head_bias=False,
         )
         identity = config.xe_kvnorm and not config.xe_moe
         self.post_pross = Identity() if identity else PostCross()
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesCacheView | None = None,
+        apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesCacheMetaData | None = None,
-        apply_lm_head: bool = True,
     ) -> CausalLMOutput:
-        """
-        Forward pass through the Xerxes module.
+        """Forward pass through the Xerxes causal language model.
+
+        Processes input through the base model and applies the language modeling head
+        with optional bounded tanh transformation.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input tensor containing token IDs.
-            attention_mask (tp.Optional[chex.Array]): Mask for attention.
-            position_ids (tp.Optional[chex.Array]): Positional indices.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
-            inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
-            output_attentions (tp.Optional[bool]): If True, output attention weights.
-            output_hidden_states (tp.Optional[bool]): If True, output hidden states.
-            init_cache (bool): If True, initialize cache for decoding.
-            deterministic (bool): If True, disable dropout.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesCacheView | None, optional):
+                Metadata for cache management. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the language modeling head. Defaults to True.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-            CausalLMOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
+            CausalLMOutput: Contains logits, hidden_states, last_hidden_state, attentions,
+                and past_key_values.
         """
-
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -850,7 +895,6 @@ class XerxesForCausalLM(EasyDeLBaseModule):
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
             inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
         )
         hidden_states = outputs.last_hidden_state
 

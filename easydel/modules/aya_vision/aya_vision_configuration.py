@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 import typing
 
 from eformer.loggings import get_logger
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config, registry
@@ -56,31 +57,20 @@ class AyaVisionConfig(EasyDeLBaseConfig):
     """
 
     model_type = "aya_vision"
+    attribute_map: typing.ClassVar = {"image_token_id": "image_token_index"}
     sub_configs: typing.ClassVar = {"text_config": AutoEasyDeLConfig, "vision_config": AutoEasyDeLConfig}
 
     def __init__(
         self,
-        vision_config=None,
-        text_config=None,
-        vision_feature_select_strategy="full",
-        vision_feature_layer=-1,
-        downsample_factor=2,
-        adapter_layer_norm_eps=1e-6,
-        image_token_index=255036,
+        vision_config: dict | EasyDeLBaseConfig | None = None,
+        text_config: dict | EasyDeLBaseConfig | None = None,
+        vision_feature_select_strategy: str = "full",
+        vision_feature_layer: int = -1,
+        downsample_factor: int = 2,
+        adapter_layer_norm_eps: float = 1e-6,
+        image_token_index: int = 255036,
         **kwargs,
     ):
-        """Initializes the AyaVisionConfig instance.
-
-        Args:
-            vision_config (Optional[Union[dict, EasyDeLBaseConfig]]): Configuration for the vision model.
-            text_config (Optional[Union[dict, EasyDeLBaseConfig]]): Configuration for the text model.
-            vision_feature_select_strategy (str): Strategy for selecting vision features ("default" or "full").
-            vision_feature_layer (int): Layer index for vision feature selection.
-            downsample_factor (int): Factor to downsample vision features.
-            adapter_layer_norm_eps (float): Epsilon for adapter layer normalization.
-            image_token_index (int): Index of the image token.
-            **kwargs: Additional keyword arguments passed to the parent class.
-        """
         self.image_token_index = image_token_index
         self.downsample_factor = downsample_factor
         self.adapter_layer_norm_eps = adapter_layer_norm_eps
@@ -125,16 +115,15 @@ class AyaVisionConfig(EasyDeLBaseConfig):
 
         super().__init__(**kwargs)
 
-    def get_partition_rules(self, *args, **kwargs):
-        """Retrieves the combined partition rules from the text and vision configurations.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
 
-        Args:
-            *args: Positional arguments passed to the underlying config partition rule methods.
-            **kwargs: Keyword arguments passed to the underlying config partition rule methods.
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
 
         Returns:
-            Tuple: Combined partition rules from both text and vision models.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        tp = self.text_config.get_partition_rules(*args, **kwargs)
-        vp = self.vision_config.get_partition_rules(*args, **kwargs)
-        return tp + vp
+        return None

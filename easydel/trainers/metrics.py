@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -101,7 +101,7 @@ class StepMetrics:
         learning_rate: float,
         mode: tp.Literal["eval", "train"] | None = None,
         **extras,
-    ) -> dict[str, float]:
+    ) -> dict[str, tp.Any]:
         """Calculate comprehensive metrics for the training step.
 
         Computes performance metrics, loss statistics, and optional detailed
@@ -129,10 +129,13 @@ class StepMetrics:
         Note:
             In performance mode, detailed metrics are skipped for efficiency.
         """
+
         step_time = time.time() - self.step_start_time
         total_time = time.time() - self.start_time
-
-        execution_time = metrics.execution_time
+        preprocessing_time = 0
+        if metrics.other_metrics is not None:
+            preprocessing_time = metrics.other_metrics.get("preprocessing_time", 0)
+        execution_time = metrics.execution_time - preprocessing_time
         flops = flops_per_token * seq_length
         total_flops = flops * batch_size
 
@@ -143,7 +146,7 @@ class StepMetrics:
         total_tokens = batch_size * seq_length
         visited_tokens = total_tokens * current_step
         throughput = total_tokens / execution_time
-        perf_key = mode + "-mlperf"
+        perf_key = (mode or "step") + "-mlperf"
         mlperf_metrics = {
             f"{perf_key}/execution_time": float(execution_time),
             f"{perf_key}/flops": float(flops),
@@ -624,11 +627,8 @@ class MetricsHistogram:
         return jnp.sqrt(self.variance).reshape(-1)
 
 
-@ejit(static_argnums=(1,))
-def compute_weight_stats(
-    params: dict[str, tp.Any],
-    repattern: str,
-) -> dict[str, MetricsHistogram]:
+@ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
+def compute_weight_stats(params: dict[str, tp.Any], repattern: str) -> dict[str, MetricsHistogram]:
     """Compute statistics for model weights in a JIT-compatible way.
 
     Analyzes model parameters matching the given pattern and computes

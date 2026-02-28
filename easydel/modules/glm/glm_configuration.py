@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
 
 
 from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -90,26 +91,27 @@ class GlmConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vocab_size=151552,
-        hidden_size=4096,
-        intermediate_size=13696,
-        num_hidden_layers=40,
-        num_attention_heads=32,
-        num_key_value_heads=2,
-        partial_rotary_factor=0.5,
-        head_dim=128,
-        hidden_act="silu",
-        attention_dropout=0.0,
-        max_position_embeddings=131072,
-        initializer_range=0.02,
-        rms_norm_eps=0.00000015625,
-        use_cache=True,
-        tie_word_embeddings=False,
-        rope_theta=10000.0,
-        pad_token_id=151329,
-        eos_token_id=None,
-        bos_token_id=None,
-        attention_bias=True,
+        vocab_size: int = 151552,
+        hidden_size: int = 4096,
+        intermediate_size: int = 13696,
+        num_hidden_layers: int = 40,
+        num_attention_heads: int = 32,
+        num_key_value_heads: int = 2,
+        partial_rotary_factor: float = 0.5,
+        head_dim: int = 128,
+        hidden_act: str = "silu",
+        attention_dropout: float = 0.0,
+        max_position_embeddings: int = 131072,
+        initializer_range: float = 0.02,
+        rms_norm_eps: float = 0.00000015625,
+        use_cache: bool = True,
+        tie_word_embeddings: bool = False,
+        rope_theta: float = 10000.0,
+        pad_token_id: int = 151329,
+        eos_token_id: int | list[int] | None = None,
+        bos_token_id: int | None = None,
+        attention_bias: bool = True,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         if eos_token_id is None:
@@ -130,6 +132,9 @@ class GlmConfig(EasyDeLBaseConfig):
         self.rope_theta = rope_theta
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -139,11 +144,16 @@ class GlmConfig(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the Llama model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
         pmag = self.partition_manager
         return (
@@ -151,27 +161,27 @@ class GlmConfig(EasyDeLBaseConfig):
             (r".*attn/.*(q_proj|k_proj|v_proj)/(?:base_module/)?kernel", pmag.resolve(ColumnWise)),
             (r".*attn/.*(q_proj|k_proj|v_proj)/lora_b", pmag.resolve(ColumnWise)),
             (r".*attn/.*(q_proj|k_proj|v_proj)/lora_a", pmag.resolve(Replicated)),
-            # QKV Projections
+            # MLP Up-Projections (split gate_proj/up_proj)
             (r".*mlp/(gate_proj|up_proj)/(?:base_module/)?kernel", pmag.resolve(ColumnWise)),
             (r".*mlp/(gate_proj|up_proj)/lora_b", pmag.resolve(ColumnWise)),
             (r".*mlp/(gate_proj|up_proj)/lora_a", pmag.resolve(Replicated)),
-            # MLP Up-Projections
-            (r".*embed_tokens/embedding", pmag.resolve(ColumnWise)),  # Token Embeddings
-            (r".*embed_vision/embedding", pmag.resolve(ColumnWise)),  # Vision Embeddings
-            (r".*lm_head/kernel", pmag.resolve(ColumnWise)),  # Language Model Head
-            (r".*vision_head/kernel", pmag.resolve(ColumnWise)),  # Vision Model Head
+            # Embeddings
+            (r".*embed_tokens/embedding", pmag.resolve(ColumnWise)),
+            (r".*embed_vision/embedding", pmag.resolve(ColumnWise)),
+            (r".*lm_head/kernel", pmag.resolve(ColumnWise)),
+            (r".*vision_head/kernel", pmag.resolve(ColumnWise)),
             # Row-wise Sharding (split input dimensions)
-            (r".*attn/o_proj/(?:base_module/)?kernel", pmag.resolve(RowWise)),  # Attention Output
+            (r".*attn/o_proj/(?:base_module/)?kernel", pmag.resolve(RowWise)),
             (r".*attn/o_proj/lora_a", pmag.resolve(RowWise)),
             (r".*attn/o_proj/lora_b", pmag.resolve(Replicated)),
-            (r".*mlp/down_proj/(?:base_module/)?kernel", pmag.resolve(RowWise)),  # MLP Down-Projection
+            (r".*mlp/down_proj/(?:base_module/)?kernel", pmag.resolve(RowWise)),
             (r".*mlp/down_proj/lora_a", pmag.resolve(RowWise)),
             (r".*mlp/down_proj/lora_b", pmag.resolve(Replicated)),
-            (r".*score/kernel", pmag.resolve(RowWise)),  # Sequence Classifier Head
+            (r".*score/kernel", pmag.resolve(RowWise)),
             # Replicated Parameters
-            (r".*bias", pmag.resolve(Replicated)),  # All biases
-            (r".*layernorm/scale", pmag.resolve(Replicated)),  # LayerNorm scales
-            (r".*rms_norm/scale", pmag.resolve(Replicated)),  # RMSNorm scales
-            (r".*norm/scale", pmag.resolve(Replicated)),  # Final LayerNorm scale
+            (r".*bias", pmag.resolve(Replicated)),
+            (r".*layernorm/scale", pmag.resolve(Replicated)),
+            (r".*rms_norm/scale", pmag.resolve(Replicated)),
+            (r".*norm/scale", pmag.resolve(Replicated)),
             (r".*", pmag.resolve(Replicated)),
         )

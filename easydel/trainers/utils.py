@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,7 +23,9 @@ This module provides essential utilities for training, including:
 - Training state management utilities
 """
 
+import collections.abc
 import logging
+import os
 import random
 import typing as tp
 import warnings
@@ -31,17 +33,17 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import current_thread
 
-import chex
 import jax
 import numpy as np
-from datasets import Dataset, IterableDataset
-from datasets.distributed import split_dataset_by_node
+from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
+from datasets.distributed import split_dataset_by_node  # pyright: ignore[reportMissingTypeStubs]
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
-from grain import python as pygrain
+from grain import python as pygrain  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
-from ml_collections import ConfigDict
-from ml_collections.config_dict import placeholder
+from jaxtyping import Array
+from ml_collections import ConfigDict  # pyright: ignore[reportMissingTypeStubs]
+from ml_collections.config_dict import placeholder  # pyright: ignore[reportMissingTypeStubs]
 
 from easydel.infra.utils import ProcessingClassType
 
@@ -187,7 +189,7 @@ def create_constant_length_dataset(
     shuffle: bool = True,
     append_concat_token: bool = True,
     add_special_tokens: bool = True,
-) -> tp.Callable[[], tp.Iterator[dict[str, jnp.ndarray]]]:
+) -> tp.Callable[[], collections.abc.Iterator[dict[str, jnp.ndarray]]]:
     """
     Creates a generator function that yields constant length chunks of tokens from a stream of text files.
 
@@ -240,7 +242,7 @@ def create_constant_length_dataset(
     else:
         raise ValueError("Either `dataset_text_field` or `formatting_func` should be provided.")
 
-    def constant_length_generator() -> tp.Iterator[dict[str, jnp.ndarray]]:
+    def constant_length_generator() -> collections.abc.Iterator[dict[str, jnp.ndarray]]:
         iterator = iter(dataset)
         more_examples = True
 
@@ -521,7 +523,9 @@ class DataCollatorForCompletionOnlyLM:
         labels[~masked_indices] = -100
         indices_replaced = np.random.binomial(1, 0.8, size=labels.shape).astype(bool) & masked_indices  # noqa
         inputs[indices_replaced] = self.processing_class.mask_token_id
-        indices_random = np.random.binomial(1, 0.5, size=labels.shape).astype(bool) & masked_indices & ~indices_replaced  # noqa
+        indices_random = (
+            np.random.binomial(1, 0.5, size=labels.shape).astype(bool) & masked_indices & ~indices_replaced  # noqa
+        )
         random_words = np.random.randint(  # noqa
             low=0,
             high=len(self.processing_class),
@@ -532,7 +536,7 @@ class DataCollatorForCompletionOnlyLM:
         return inputs, labels
 
     def jax_call(self, examples: list[list[int] | tp.Any | dict[str, tp.Any]]) -> dict[str, tp.Any]:
-        if isinstance(examples[0], tp.Mapping):
+        if isinstance(examples[0], collections.abc.Mapping):
             input_ids = [e["input_ids"] for e in examples]
         else:
             input_ids = examples
@@ -612,6 +616,7 @@ class DataCollatorForCompletionOnlyLM:
                     batch["labels"][i, :] = self.ignore_index
 
                 human_token_ids = self.instruction_token_ids
+                assert human_token_ids is not None
                 for human_idx in jnp.where(batch["labels"][i] == human_token_ids[0])[0]:
                     if human_token_ids == batch["labels"][i][human_idx : human_idx + len(human_token_ids)].tolist():
                         human_token_ids_idxs.append(human_idx)
@@ -686,57 +691,70 @@ class RewardDataCollatorWithPaddingTFDS:
         Raises:
             ValueError: If required keys are missing from features.
         """
-        features_chosen = []
-        features_rejected = []
-        margin = []
+        if not features:
+            return {}
+
         has_margin = "margin" in features[0]
+        required = {
+            "input_ids_chosen",
+            "attention_mask_chosen",
+            "input_ids_rejected",
+            "attention_mask_rejected",
+        }
         for feature in features:
-            if (
-                "input_ids_chosen" not in feature
-                or "input_ids_rejected" not in feature
-                or "attention_mask_chosen" not in feature
-                or "attention_mask_rejected" not in feature
-            ):
+            missing = required.difference(feature.keys())
+            if missing:
                 raise ValueError(
                     "The features should include `input_ids_chosen`, `attention_mask_chosen`, "
                     "`input_ids_rejected` and `attention_mask_rejected`"
                 )
 
-            features_chosen.append(
-                {
-                    "input_ids": feature["input_ids_chosen"],
-                    "attention_mask": feature["attention_mask_chosen"],
-                }
-            )
-            features_rejected.append(
-                {
-                    "input_ids": feature["input_ids_rejected"],
-                    "attention_mask": feature["attention_mask_rejected"],
-                }
-            )
-            if has_margin:
-                margin.append(feature["margin"])
-        batch_chosen = self.tokenizer.pad(
-            features_chosen,
-            padding=self.padding,
-            max_length=self.max_length,
-            return_tensors="jax",
-        )
-        batch_rejected = self.tokenizer.pad(
-            features_rejected,
-            padding=self.padding,
-            max_length=self.max_length,
-            return_tensors="jax",
-        )
-        batch = {
-            "input_ids_chosen": batch_chosen["input_ids"],
-            "attention_mask_chosen": batch_chosen["attention_mask"],
-            "input_ids_rejected": batch_rejected["input_ids"],
-            "attention_mask_rejected": batch_rejected["attention_mask"],
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(getattr(self.tokenizer, "tokenizer", None), "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        if self.padding == "max_length":
+            target_len = self.max_length
+        elif self.padding:
+            target_len = None
+        else:
+            target_len = None
+
+        def _pad_right(arr: jnp.ndarray, pad_value: int) -> jnp.ndarray:
+            if target_len is None:
+                return arr
+            if arr.shape[-1] > target_len:
+                if self.truncation_mode == "keep_end":
+                    arr = arr[..., -target_len:]
+                else:
+                    arr = arr[..., :target_len]
+            if arr.shape[-1] < target_len:
+                pad_amount = target_len - arr.shape[-1]
+                arr = jnp.pad(arr, [(0, 0)] * (arr.ndim - 1) + [(0, pad_amount)], constant_values=pad_value)
+            return arr
+
+        chosen_ids = [_pad_right(jnp.asarray(f["input_ids_chosen"]), pad_token_id) for f in features]
+        chosen_mask = [_pad_right(jnp.asarray(f["attention_mask_chosen"]), 0) for f in features]
+        rejected_ids = [_pad_right(jnp.asarray(f["input_ids_rejected"]), pad_token_id) for f in features]
+        rejected_mask = [_pad_right(jnp.asarray(f["attention_mask_rejected"]), 0) for f in features]
+
+        if target_len is None:
+            target_len = max(x.shape[-1] for x in chosen_ids + rejected_ids)
+            chosen_ids = [_pad_right(x, pad_token_id) for x in chosen_ids]
+            chosen_mask = [_pad_right(x, 0) for x in chosen_mask]
+            rejected_ids = [_pad_right(x, pad_token_id) for x in rejected_ids]
+            rejected_mask = [_pad_right(x, 0) for x in rejected_mask]
+
+        batch: dict[str, tp.Any] = {
+            "input_ids_chosen": jnp.stack(chosen_ids, axis=0).astype(jnp.int32),
+            "attention_mask_chosen": jnp.stack(chosen_mask, axis=0).astype(jnp.int32),
+            "input_ids_rejected": jnp.stack(rejected_ids, axis=0).astype(jnp.int32),
+            "attention_mask_rejected": jnp.stack(rejected_mask, axis=0).astype(jnp.int32),
         }
         if has_margin:
-            margin = jnp.array(margin, dtype="f4")
-            batch["margin"] = margin
+            batch["margin"] = jnp.asarray([f["margin"] for f in features], dtype=jnp.float32)
         return batch
 
 
@@ -781,57 +799,51 @@ class RewardDataCollatorWithPaddingGrain:
         Raises:
             ValueError: If required keys are missing from features.
         """
-        features_chosen = []
-        features_rejected = []
-        margin = []
-        has_margin = "margin" in features.keys()
-
-        if (
-            "input_ids_chosen" not in features.keys()
-            or "input_ids_rejected" not in features.keys()
-            or "attention_mask_chosen" not in features.keys()
-            or "attention_mask_rejected" not in features.keys()
-        ):
+        required = {
+            "input_ids_chosen",
+            "attention_mask_chosen",
+            "input_ids_rejected",
+            "attention_mask_rejected",
+        }
+        missing = required.difference(features.keys())
+        if missing:
             raise ValueError(
                 "The features should include `input_ids_chosen`, `attention_mask_chosen`, "
                 "`input_ids_rejected` and `attention_mask_rejected`"
             )
 
-        features_chosen.append(
-            {
-                "input_ids": features["input_ids_chosen"],
-                "attention_mask": features["attention_mask_chosen"],
-            }
-        )
-        features_rejected.append(
-            {
-                "input_ids": features["input_ids_rejected"],
-                "attention_mask": features["attention_mask_rejected"],
-            }
-        )
-        if has_margin:
-            margin.append(features["margin"])
-        batch_chosen = self.tokenizer.pad(
-            features_chosen,
-            padding=self.padding,
-            max_length=self.max_length,
-            return_tensors="np",
-        )
-        batch_rejected = self.tokenizer.pad(
-            features_rejected,
-            padding=self.padding,
-            max_length=self.max_length,
-            return_tensors="np",
-        )
-        batch = {
-            "input_ids_chosen": batch_chosen["input_ids"],
-            "attention_mask_chosen": batch_chosen["attention_mask"],
-            "input_ids_rejected": batch_rejected["input_ids"],
-            "attention_mask_rejected": batch_rejected["attention_mask"],
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(getattr(self.tokenizer, "tokenizer", None), "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        def _pad_right(arr: np.ndarray, pad_value: int) -> np.ndarray:
+            if self.max_length is None or not self.padding:
+                return arr
+            if arr.shape[-1] > self.max_length:
+                if self.truncation_mode == "keep_end":
+                    arr = arr[..., -self.max_length :]
+                else:
+                    arr = arr[..., : self.max_length]
+            if arr.shape[-1] < self.max_length:
+                pad_amount = self.max_length - arr.shape[-1]
+                arr = np.pad(arr, [(0, 0)] * (arr.ndim - 1) + [(0, pad_amount)], constant_values=pad_value)
+            return arr
+
+        chosen_ids = _pad_right(np.asarray(features["input_ids_chosen"]), pad_token_id).astype(np.int32)
+        chosen_mask = _pad_right(np.asarray(features["attention_mask_chosen"]), 0).astype(np.int32)
+        rejected_ids = _pad_right(np.asarray(features["input_ids_rejected"]), pad_token_id).astype(np.int32)
+        rejected_mask = _pad_right(np.asarray(features["attention_mask_rejected"]), 0).astype(np.int32)
+
+        batch: dict[str, tp.Any] = {
+            "input_ids_chosen": chosen_ids,
+            "attention_mask_chosen": chosen_mask,
+            "input_ids_rejected": rejected_ids,
+            "attention_mask_rejected": rejected_mask,
         }
-        if has_margin:
-            margin = np.array(margin, dtype="f4")
-            batch["margin"] = margin
+        if "margin" in features:
+            batch["margin"] = np.asarray(features["margin"], dtype=np.float32)
         return batch
 
 
@@ -1038,6 +1050,153 @@ class DataCollatorForPreferenceGrain:
         return output
 
 
+@dataclass
+class _BCODataCollatorMixin:
+    max_prompt_length: int
+    max_completion_length: int
+    pad_token_id: int
+    label_pad_token_id: int
+    is_encoder_decoder: bool
+
+    @property
+    def max_length(self) -> int:
+        """Return max sequence length (prompt + completion)."""
+        return self.max_prompt_length + self.max_completion_length
+
+    def _pad_prompt(self, arrays: list[np.ndarray], padding_value: int, side: str = "left") -> jnp.ndarray:
+        return pad(arrays, self.max_prompt_length, padding_value=padding_value, padding_side=side)
+
+    def _pad_completion(self, arrays: list[np.ndarray], padding_value: int) -> jnp.ndarray:
+        return pad(arrays, self.max_completion_length, padding_value=padding_value, padding_side="right")
+
+    def _pad_full_sequence(self, arrays: list[np.ndarray], padding_value: int, side: str = "right") -> jnp.ndarray:
+        """Pad full sequence (prompt + completion) to max_length."""
+        return pad(arrays, self.max_length, padding_value=padding_value, padding_side=side)
+
+    def _pad_optional(self, arrays: list[np.ndarray], max_length: int, padding_value: int, side: str) -> jnp.ndarray:
+        return pad(arrays, max_length, padding_value=padding_value, padding_side=side)
+
+
+class BCODataCollatorTFDS(_BCODataCollatorMixin):
+    """Data collator for BCO training with TFDS backends."""
+
+    def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, jnp.ndarray]:
+        prompt_input_ids = [np.asarray(f["prompt_input_ids"], dtype=np.int32) for f in features]
+        prompt_attention_mask = [np.asarray(f["prompt_attention_mask"], dtype=np.int32) for f in features]
+        completion_input_ids = [np.asarray(f["completion_input_ids"], dtype=np.int32) for f in features]
+        completion_attention_mask = [np.asarray(f["completion_attention_mask"], dtype=np.int32) for f in features]
+        completion_labels = [np.asarray(f["completion_labels"], dtype=np.int32) for f in features]
+        labels = np.asarray([bool(f["label"]) for f in features])
+
+        batch: dict[str, jnp.ndarray] = {}
+        batch["prompt_input_ids"] = self._pad_prompt(prompt_input_ids, self.pad_token_id)
+        batch["prompt_attention_mask"] = self._pad_prompt(prompt_attention_mask, 0)
+        # completion_input_ids contains full sequence (prompt + completion), pad to max_length
+        batch["completion_input_ids"] = self._pad_full_sequence(completion_input_ids, self.pad_token_id)
+        batch["completion_attention_mask"] = self._pad_full_sequence(completion_attention_mask, 0)
+        batch["completion_labels"] = self._pad_full_sequence(completion_labels, self.label_pad_token_id)
+        batch["label"] = jnp.asarray(labels, dtype=jnp.bool_)
+
+        if "embedding_input_ids" in features[0]:
+            embedding_input_ids = [np.asarray(f["embedding_input_ids"], dtype=np.int32) for f in features]
+            embedding_attention_mask = [np.asarray(f["embedding_attention_mask"], dtype=np.int32) for f in features]
+            batch["embedding_input_ids"] = pad(embedding_input_ids, None, padding_value=self.pad_token_id)
+            batch["embedding_attention_mask"] = pad(embedding_attention_mask, None, padding_value=0)
+
+        if "reference_logps" in features[0]:
+            reference_logps = np.asarray([f["reference_logps"] for f in features], dtype=np.float32)
+            batch["reference_logps"] = jnp.asarray(reference_logps)
+
+        return batch
+
+
+class BCODataCollatorGrain(_BCODataCollatorMixin):
+    """Grain-compatible BCO data collator."""
+
+    def __call__(self, feature: dict[str, tp.Any]) -> dict[str, np.ndarray]:
+        prompt_input_ids = np.asarray(feature["prompt_input_ids"], dtype=np.int32)
+        prompt_attention_mask = np.asarray(feature["prompt_attention_mask"], dtype=np.int32)
+        completion_input_ids = np.asarray(feature["completion_input_ids"], dtype=np.int32)
+        completion_attention_mask = np.asarray(feature["completion_attention_mask"], dtype=np.int32)
+        completion_labels = np.asarray(feature["completion_labels"], dtype=np.int32)
+
+        batch: dict[str, np.ndarray] = {}
+        batch["prompt_input_ids"] = pad_single(
+            prompt_input_ids,
+            self.max_prompt_length,
+            padding_value=self.pad_token_id,
+            padding_side="left",
+        )
+        batch["prompt_attention_mask"] = pad_single(
+            prompt_attention_mask,
+            self.max_prompt_length,
+            padding_value=0,
+            padding_side="left",
+        )
+        # completion_input_ids contains full sequence (prompt + completion), pad to max_length
+        batch["completion_input_ids"] = pad_single(
+            completion_input_ids,
+            self.max_length,
+            padding_value=self.pad_token_id,
+        )
+        batch["completion_attention_mask"] = pad_single(
+            completion_attention_mask,
+            self.max_length,
+            padding_value=0,
+        )
+        batch["completion_labels"] = pad_single(
+            completion_labels,
+            self.max_length,
+            padding_value=self.label_pad_token_id,
+        )
+        batch["label"] = np.asarray([feature["label"]], dtype=np.bool_)
+
+        if "embedding_input_ids" in feature:
+            batch["embedding_input_ids"] = np.asarray(feature["embedding_input_ids"], dtype=np.int32)
+            batch["embedding_attention_mask"] = np.asarray(feature["embedding_attention_mask"], dtype=np.int32)
+        if "reference_logps" in feature:
+            batch["reference_logps"] = np.asarray([feature["reference_logps"]], dtype=np.float32)
+
+        return batch
+
+
+@auto_pytree
+class GRPODataCollatorTFDS:
+    """Data collator for GRPO training with TFDS backends.
+
+    GRPO only needs prompts since completions are generated online.
+    """
+
+    max_prompt_length: int
+    pad_token_id: int = 0
+
+    def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, jnp.ndarray]:
+        input_ids = [np.asarray(f["input_ids"], dtype=np.int32) for f in features]
+        attention_mask = [np.asarray(f["attention_mask"], dtype=np.int32) for f in features]
+
+        return {
+            "input_ids": pad(input_ids, self.max_prompt_length, self.pad_token_id, "left"),
+            "attention_mask": pad(attention_mask, self.max_prompt_length, 0, "left"),
+        }
+
+
+@auto_pytree
+class GRPODataCollatorGrain:
+    """Grain-compatible GRPO data collator."""
+
+    max_prompt_length: int
+    pad_token_id: int = 0
+
+    def __call__(self, feature: dict[str, tp.Any]) -> dict[str, np.ndarray]:
+        input_ids = np.asarray(feature["input_ids"], dtype=np.int32)
+        attention_mask = np.asarray(feature["attention_mask"], dtype=np.int32)
+
+        return {
+            "input_ids": pad_single(input_ids, self.max_prompt_length, self.pad_token_id, "left"),
+            "attention_mask": pad_single(attention_mask, self.max_prompt_length, 0, "left"),
+        }
+
+
 @auto_pytree
 class DPODataCollatorWithPaddingTFDS:
     """Advanced data collator for DPO training with TFDS.
@@ -1058,7 +1217,7 @@ class DPODataCollatorWithPaddingTFDS:
 
     max_prompt_length: int
     max_completion_length: int
-    pad_token_id: int = 0
+    pad_token_id: int | None = 0
     label_pad_token_id: int = -100
     is_encoder_decoder: bool | None = False
     output_arrays_only: bool = True
@@ -1178,7 +1337,7 @@ class DPODataCollatorWithPaddingGrain:
 
     max_prompt_length: int
     max_completion_length: int
-    pad_token_id: int = 0
+    pad_token_id: int | None = 0
     label_pad_token_id: int = -100
     is_encoder_decoder: bool | None = False
     output_arrays_only: bool = True
@@ -1373,6 +1532,10 @@ class HFDataSource(pygrain.RandomAccessDataSource):
         try:
             return next(self.data_iters[worker_idx])
         except StopIteration as e:
+            if os.getenv("HFDATASOURCE_NONSTOP", "1") == "1":
+                self.data_iters = [iter(ds) for ds in self.datasets]
+                logger.info("reseting data-iters index to rebatch point.")
+            return next(self.data_iters[worker_idx])
             raise IndexError(f"Iterator for worker {worker_idx} is exhausted.") from e
 
 
@@ -1482,6 +1645,7 @@ def pad(
     current_max = tensors[0].shape[-1]
     if max_lenght is None:
         max_lenght = current_max
+    assert isinstance(max_lenght, int)
     x_lenght = max(current_max, max_lenght)
     output_shape += (x_lenght,)
     output = jnp.full((len(tensors), *output_shape), padding_value, dtype=tensors[0].dtype)
@@ -1579,6 +1743,7 @@ def np_pad(
     current_max = tensors[0].shape[-1]
     if max_lenght is None:
         max_lenght = current_max
+    assert isinstance(max_lenght, int)
     x_lenght = max(current_max, max_lenght)
     output_shape += (x_lenght,)
     output = np.full((len(tensors), *output_shape), padding_value, dtype=tensors[0].dtype)
@@ -1603,11 +1768,11 @@ def np_pad(
 
 
 def pad_to_length(
-    tensor: chex.Array,
+    tensor: Array,
     length: int,
     pad_value: int | float,
     axis: int = -1,
-) -> chex.Array:
+) -> Array:
     """Pad or truncate a tensor to a specific length along an axis.
 
     Args:
@@ -1617,7 +1782,7 @@ def pad_to_length(
         axis: Axis along which to pad/truncate (default -1).
 
     Returns:
-        chex.Array: Tensor padded or truncated to the specified length.
+        Array: Tensor padded or truncated to the specified length.
 
     Note:
         If tensor is already longer than length, it will be truncated.
@@ -1786,14 +1951,14 @@ def instructions_formatting_function(processing_class: "AutoTokenizer"):  # type
                     {"role": "user", "content": examples["prompt"][i]},
                     {"role": "assistant", "content": examples["completion"][i]},
                 ]
-                output_texts.append(processing_class.apply_chat_template(converted_sample, tokenize=False))  # type: ignore
+                output_texts.append(processing_class.apply_chat_template(converted_sample, tokenize=False))
             return output_texts
         else:
             converted_sample = [
                 {"role": "user", "content": examples["prompt"]},
                 {"role": "assistant", "content": examples["completion"]},
             ]
-            return processing_class.apply_chat_template(converted_sample, tokenize=False)  # type: ignore
+            return processing_class.apply_chat_template(converted_sample, tokenize=False)
 
     return format_dataset
 
@@ -1825,7 +1990,7 @@ def get_formatting_func_from_dataset(
         Returns None if dataset doesn't match known formats.
     """
     try:
-        from datasets import Dataset, Value
+        from datasets import Dataset, Value  # pyright: ignore[reportMissingTypeStubs]
     except ImportError as e:
         raise ImportError("Please install the datasets library to use this function.") from e
     FORMAT_MAPPING = {

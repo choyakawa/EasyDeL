@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,25 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-import typing as tp
-
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerMetadata,
+)
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import ModelOutput
-from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
-from easydel.layers.caching import PagesCache, PagesMetadata, TransformerCache, TransformerMetadata
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.infra.modeling_outputs import ModelOutput, VLMCausalLMOutput
+from easydel.infra.utils import ACT2FN
+from easydel.layers import RowParallelLinear
+from easydel.modules._base import BaseVisionLanguageModule
 
 from ..auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel
 from .llava_configuration import LlavaConfig
@@ -44,45 +50,52 @@ class LlavaCausalLMOutputWithPast(ModelOutput):
     Base class for Llava causal language model (or autoregressive) outputs.
 
     Args:
-        loss (`chex.Array` of shape `(1,)`, *optional*, returned when `labels` is provided):
+        loss (`Array` of shape `(1,)`, *optional*, returned when `labels` is provided):
             Language modeling loss (for next-token prediction).
-        logits (`chex.Array` of shape `(batch_size, sequence_length, config.vocab_size)`):
+        logits (`Array` of shape `(batch_size, sequence_length, config.vocab_size)`):
             Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-        past_key_values (`tuple(tuple(chex.Array))`, *optional*, returned when `use_cache=True` is
+        past_key_values (`tuple(tuple(Array))`, *optional*, returned when `use_cache=True` is
             passed or when `config.use_cache=True`):
-            Tuple of `tuple(chex.Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
+            Tuple of `tuple(Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
             `(batch_size, num_heads, sequence_length, embed_size_per_head)`)
 
             Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
             `past_key_values` input) to speed up sequential decoding.
-        hidden_states (`tuple(chex.Array)`, *optional*, returned when `output_hidden_states=True` is passed or when
+        hidden_states (`tuple(Array)`, *optional*, returned when `output_hidden_states=True` is passed or when
             `config.output_hidden_states=True`):
-            Tuple of `chex.Array` (one for the output of the embeddings, if the model has an embedding layer, +
+            Tuple of `Array` (one for the output of the embeddings, if the model has an embedding layer, +
             one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
-        attentions (`tuple(chex.Array)`, *optional*, returned when `output_attentions=True` is passed
+        attentions (`tuple(Array)`, *optional*, returned when `output_attentions=True` is passed
             or when `config.output_attentions=True`):
-            Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
-        image_hidden_states (`chex.Array`, *optional*):
-            A `chex.Array` of size (batch_size * num_patches, num_images, sequence_length, hidden_size)`.
+        image_hidden_states (`Array`, *optional*):
+            An `Array` of size (batch_size * num_patches, num_images, sequence_length, hidden_size)`.
             image_hidden_states of the model produced by the vision encoder and after projecting the last hidden state.
     """
 
-    loss: chex.Array | None = None
-    logits: chex.Array = None
+    loss: Array | None = None
+    logits: Array = None
     past_key_values: TransformerCache | None = None
-    hidden_states: tuple[chex.Array] | None = None
-    last_hidden_state: chex.Array | None = None
-    attentions: tuple[chex.Array] | None = None
-    image_hidden_states: chex.Array | None = None
+    hidden_states: tuple[Array] | None = None
+    last_hidden_state: Array | None = None
+    attentions: tuple[Array] | None = None
+    image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
 
 
 class LlavaMultiModalProjector(nn.Module):
+    """Multi-modal projector for LLaVA models.
+
+    Projects visual features from the vision encoder into the language model's
+    embedding space using a two-layer MLP with GELU activation. This enables
+    the language model to process visual information alongside text tokens.
+    """
+
     def __init__(
         self,
         config: LlavaConfig,
@@ -92,6 +105,16 @@ class LlavaMultiModalProjector(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the LLaVA multi-modal projector.
+
+        Args:
+            config (LlavaConfig): Model configuration with projector parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -102,7 +125,7 @@ class LlavaMultiModalProjector(nn.Module):
 
         self.linear_1 = RowParallelLinear(
             config.vision_config.hidden_size * num_feature_layers,
-            config.text_config.hidden_size,
+            config.get_text_config().hidden_size,
             use_bias=config.multimodal_projector_bias,
             kernel_init=nn.initializers.normal(0.02),
             param_dtype=param_dtype,
@@ -113,8 +136,8 @@ class LlavaMultiModalProjector(nn.Module):
 
         self.act = ACT2FN[config.projector_hidden_act]
         self.linear_2 = RowParallelLinear(
-            config.text_config.hidden_size,
-            config.text_config.hidden_size,
+            config.get_text_config().hidden_size,
+            config.get_text_config().hidden_size,
             use_bias=config.multimodal_projector_bias,
             kernel_init=nn.initializers.normal(0.02),
             param_dtype=param_dtype,
@@ -124,6 +147,16 @@ class LlavaMultiModalProjector(nn.Module):
         )
 
     def __call__(self, image_features: jax.Array) -> jax.Array:
+        """Project image features into the language model embedding space.
+
+        Args:
+            image_features (Array): Visual features from the vision encoder,
+                shape (batch_size, num_patches, vision_hidden_size).
+
+        Returns:
+            Array: Projected features with shape (batch_size, num_patches, text_hidden_size),
+                ready to be merged with text embeddings.
+        """
         hidden_states = checkpoint_name(self.linear_1(image_features), name="projector_linear1")
         hidden_states = self.act(hidden_states)
         hidden_states = checkpoint_name(self.linear_2(hidden_states), name="projector_linear2")
@@ -153,6 +186,18 @@ class LlavaModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize LLaVA base model.
+
+        Sets up the vision tower, multi-modal projector, and language model
+        components for vision-language understanding.
+
+        Args:
+            config (LlavaConfig): Model configuration containing vision and text config.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -175,7 +220,7 @@ class LlavaModel(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.language_model = AutoEasyDeLModel.from_config(
-            config=config.text_config,
+            config=config.get_text_config(),
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -186,14 +231,14 @@ class LlavaModel(EasyDeLBaseModule):
         self.vision_feature_layer = config.vision_feature_layer
         self.vision_feature_select_strategy = getattr(config, "vision_feature_select_strategy", "default")
 
-    def get_image_features(self, pixel_values: chex.Array) -> chex.Array:
+    def get_image_features(self, pixel_values: Array) -> Array:
         """Extracts and projects image features from the vision tower.
 
         Args:
-            pixel_values (chex.Array): Input pixel values for the images.
+            pixel_values (Array): Input pixel values for the images.
 
         Returns:
-            chex.Array: Processed image features ready for the language model.
+            Array: Processed image features ready for the language model.
         """
         image_features = self.vision_tower(pixel_values, output_hidden_states=True)
         selected_image_feature = image_features.hidden_states[self.vision_feature_layer]
@@ -205,39 +250,112 @@ class LlavaModel(EasyDeLBaseModule):
 
         return image_features
 
+    def compute_embedding(
+        self,
+        input_ids: Int[Array, "batch seq_len"] | None,
+        *,
+        image_features: Array | None = None,
+        pixel_values: Array | None = None,
+        **kwargs,
+    ) -> Array:
+        """Compute input embeddings with merged image and text features.
+
+        Processes input token IDs through the text embedding layer and optionally
+        merges image features at positions marked by image tokens.
+
+        Args:
+            input_ids (Array): Input token IDs of shape (batch_size, sequence_length).
+            image_features (Array | None, optional): Pre-extracted image features.
+                If None and pixel_values provided, features are extracted. Defaults to None.
+            pixel_values (Array | None, optional): Raw pixel values for image extraction.
+                Defaults to None.
+            **kwargs: Additional keyword arguments (unused).
+
+        Returns:
+            Array: Combined embeddings of shape (batch_size, sequence_length, hidden_size)
+                with image features merged at appropriate positions.
+
+        Raises:
+            ValueError: If input_ids is None.
+        """
+        if input_ids is None:
+            raise ValueError("`input_ids` must be provided when calling `compute_embedding`.")
+
+        vocab_size = self.config.get_text_config().vocab_size
+        image_token_id = self.config.image_token_id
+        if image_token_id >= vocab_size:
+            llm_input_ids = jnp.where(input_ids == image_token_id, 0, input_ids)
+        else:
+            llm_input_ids = input_ids
+
+        inputs_embeds = super().compute_embedding(llm_input_ids)
+
+        if image_features is None and pixel_values is not None:
+            image_features = self.get_image_features(pixel_values)
+
+        if image_features is not None:
+            multimodal_embeddings = image_features.reshape(-1, image_features.shape[-1]).astype(inputs_embeds.dtype)
+            inputs_embeds = BaseVisionLanguageModule.merge_multimodal_embeddings(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                multimodal_embeddings=multimodal_embeddings,
+                placeholder_token_id=image_token_id,
+            )
+
+        return inputs_embeds
+
     def __call__(
         self,
-        input_ids: chex.Array = None,
-        pixel_values: chex.Array = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        pixel_values: Array | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        inputs_embeds: chex.Array | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         **lm_kwargs,
     ):
-        """Forward pass for the LlavaModel model.
+        """Forward pass through the LLaVA base model.
+
+        Processes both visual and textual inputs, merging image features with text
+        embeddings before passing through the language model.
 
         Args:
-            input_ids (chex.Array): Input token IDs. (batch_size, sequence_length)
-            pixel_values (chex.Array): Input pixel values for images. (batch_size, num_channels, height, width)
-            attention_mask (Optional[chex.Array]): Mask for text attention.
-            position_ids (Optional[chex.Array]): Position IDs for text.
-            segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
-            past_key_values (Optional[TransformerCache | PagesCache]): Cached keys/values for language model.
-            cache_metadata (Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
-            inputs_embeds (Optional[chex.Array]): Input embeddings (alternative to input_ids).
-            output_attentions (Optional[bool]): Whether to output attentions.
-            output_hidden_states (Optional[bool]): Whether to output hidden states.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            pixel_values (Array | None, optional): Input pixel values for images of shape
+                (batch_size, num_channels, height, width). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states.
+                Defaults to None.
             **lm_kwargs: Additional arguments passed to the language model.
 
         Returns:
-            AyaVisionCausalLMOutputWithPast: Model outputs including logits and potentially past key/values,
+            LlavaCausalLMOutputWithPast: Model outputs including past key/values,
                 hidden states, attentions, and image hidden states.
+
+        Raises:
+            ValueError: If both or neither of input_ids and inputs_embeds are provided.
+            ValueError: If pixel_values is provided without input_ids.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -246,30 +364,21 @@ class LlavaModel(EasyDeLBaseModule):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        if input_ids is not None and self.config.image_token_index >= self.config.text_config.vocab_size:
-            special_image_mask = input_ids == self.config.image_token_index
-            llm_input_ids = input_ids
-            llm_input_ids = jnp.where(special_image_mask, 0, llm_input_ids)
-        else:
-            llm_input_ids = input_ids
+        if pixel_values is not None and input_ids is None:
+            raise ValueError("`input_ids` must be provided when `pixel_values` is not None.")
 
-        if inputs_embeds is None:
-            inputs_embeds = self.language_model.get_embedding()(llm_input_ids)
-
+        image_features = None
         if pixel_values is not None:
             image_features = self.get_image_features(pixel_values)
 
-            special_image_mask = jnp.expand_dims((input_ids == self.config.image_token_index), -1)
-            special_image_mask = jnp.broadcast_to(special_image_mask, inputs_embeds.shape)
-            image_features = image_features.astype(inputs_embeds.dtype)
-            inputs_embeds = jnp.place(
-                inputs_embeds,
-                special_image_mask,
-                image_features,
-                inplace=False,
+        if inputs_embeds is None:
+            inputs_embeds = self.compute_embedding(
+                input_ids,
+                image_features=image_features,
             )
         outputs = self.language_model(
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -277,7 +386,6 @@ class LlavaModel(EasyDeLBaseModule):
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
             inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
             **lm_kwargs,
         )
 
@@ -299,86 +407,51 @@ class LlavaModel(EasyDeLBaseModule):
         shardings=None,
         pad_token_id=None,
     ):
-        return self.language_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
+        """Initialize the key-value cache for autoregressive generation.
 
-    def _get_compile_model_kwargs(
-        self,
-        batch_size: int,
-        input_tokens_length: int,
-        input_sharding: jax.sharding.PartitionSpec,
-        rngs: jax.random.PRNGKey,
-        vision_included: bool = False,
-        vision_batch_size: int = 1,
-        vision_channels: int = 3,
-        vision_height: int | None = None,
-        vision_width: int | None = None,
-        required_props: tp.Mapping[str, dict[str, tp.Any]] | None = None,
-        **kwargs,
-    ):
-        """Helper function to get keyword arguments for model compilation, potentially including vision inputs.
+        Delegates to the underlying language model's cache initialization.
 
         Args:
-            batch_size (int): Batch size for text inputs.
-            input_tokens_length (int): Sequence length for text inputs.
-            input_sharding (jax.sharding.PartitionSpec): Sharding specification for text inputs.
-            rngs (jax.random.PRNGKey): Random number generator key.
-            vision_included (bool): Whether to include dummy vision inputs. Defaults to False.
-            vision_batch_size (int): Batch size for vision inputs. Defaults to 1.
-            vision_channels (int): Number of channels for vision inputs. Defaults to 3.
-            vision_height (Optional[int]): Height for vision inputs (defaults to config).
-            vision_width (Optional[int]): Width for vision inputs (defaults to config).
-            required_props (Optional[Mapping[str, Dict[str, Any]]]): Required properties.
-            **kwargs: Additional arguments passed to the language model's compile kwargs method.
+            batch_size (int): Batch size for the cache.
+            max_length (int): Maximum sequence length to cache.
+            starts (int | None, optional): Starting positions for cache initialization.
+                Defaults to None.
+            shardings (Any | None, optional): Sharding specifications for the cache.
+                Defaults to None.
+            pad_token_id (int | None, optional): Padding token ID. Defaults to None.
 
         Returns:
-            dict: Keyword arguments for model compilation.
+            TransformerCache: Initialized cache for the language model.
         """
-        basics = self.language_model._get_compile_model_kwargs(
-            batch_size=batch_size,
-            input_tokens_length=input_tokens_length,
-            input_sharding=input_sharding,
-            rngs=rngs,
-            vision_included=vision_included,
-            vision_batch_size=vision_batch_size,
-            vision_channels=vision_channels,
-            vision_height=vision_height,
-            vision_width=vision_width,
-            required_props=required_props,
-            **kwargs,
-        )
-
-        if vision_included:
-            pixel_values = jnp.ones(
-                (
-                    vision_batch_size or 1,
-                    vision_channels or 3,
-                    self.config.vision_config.image_size,
-                    self.config.vision_config.image_size,
-                ),
-                dtype="f4",
-            )
-            basics.update({"pixel_values": pixel_values})
-        return basics
+        return self.language_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
 
     def prepare_inputs_for_generation(
         self,
-        input_ids: chex.Array,
+        input_ids: Int[Array, "batch seq_len"],
         max_length: int,
         pad_token_id: int,
         starts: int | None = None,
-        pixel_values: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        pixel_values: Array | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
     ):
-        """Prepares inputs for text generation, including pixel values if provided.
+        """Prepare inputs for autoregressive text generation.
+
+        Sets up the model inputs for generation including text tokens and optional
+        image pixel values.
 
         Args:
-            input_ids (chex.Array): Initial input token IDs.
+            input_ids (Array): Initial input token IDs of shape (batch_size, sequence_length).
             max_length (int): Maximum generation length.
-            pixel_values (Optional[chex.Array]): Pixel values for image input.
-            attention_mask (Optional[chex.Array]): Attention mask.
+            pad_token_id (int): Token ID used for padding.
+            starts (int | None, optional): Starting positions for generation. Defaults to None.
+            pixel_values (Array | None, optional): Pixel values for image input of shape
+                (batch_size, num_channels, height, width). Defaults to None.
+            attention_mask (Array | None, optional): Attention mask of shape
+                (batch_size, sequence_length). Defaults to None.
 
         Returns:
-            dict: Model inputs ready for generation.
+            dict: Model inputs ready for generation, containing input_ids, attention_mask,
+                past_key_values, and pixel_values.
         """
         model_inputs = self.language_model.prepare_inputs_for_generation(
             input_ids=input_ids,
@@ -391,51 +464,66 @@ class LlavaModel(EasyDeLBaseModule):
         return model_inputs
 
     def update_inputs_for_generation(self, model_outputs, model_kwargs):
-        """Updates model inputs for the next step of generation, removing pixel values after the first step.
+        """Update model inputs for the next generation step.
+
+        Updates the inputs based on the previous step's outputs, removing pixel_values
+        after the first step since image features only need to be processed once.
 
         Args:
-            model_outputs: Outputs from the previous generation step.
-            model_kwargs: Current keyword arguments for the model.
+            model_outputs (LlavaCausalLMOutputWithPast): Outputs from the previous
+                generation step containing past_key_values.
+            model_kwargs (dict): Current keyword arguments for the model including
+                attention_mask, position_ids, and pixel_values.
 
         Returns:
-            dict: Updated model keyword arguments.
+            dict: Updated model keyword arguments with refreshed cache and positions,
+                with pixel_values removed after the first iteration.
         """
         model_kwargs = self.language_model.update_inputs_for_generation(model_outputs, model_kwargs)
         model_kwargs.pop("pixel_values", None)  # only effect first iter
         return model_kwargs
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        The vision tower acts as the encoder in this multi-modal setup.
+        """Return the encoder component of the model.
+
+        For LLaVA, the vision tower serves as the encoder for processing images.
+
+        Returns:
+            nn.Module: The vision tower module.
         """
         return self.vision_tower
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
+        """Return the decoder component of the model.
+
+        Returns:
+            nn.Module: The language model's decoder.
         """
         return self.language_model.get_decoder()
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        Base Models don't have a Language Model Head.
+        """Return the language model head.
+
+        Raises:
+            NotImplementedError: Base models don't have a language model head.
         """
         raise NotImplementedError("The base model does not have a language model head.")
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
+        """Return the embedding layer of the model.
+
+        Returns:
+            Embed: The text embedding layer from the language model.
         """
         return self.language_model.get_embedding()
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=LlavaConfig, model_type="llava")
-class LlavaForConditionalGeneration(EasyDeLBaseModule):
-    """
-    LlavaModel model for conditional text generation based on image inputs.
+class LlavaForConditionalGeneration(BaseVisionLanguageModule[LlavaModel, LlavaConfig]):  # type: ignore
+    """LLaVA model for conditional text generation based on image inputs.
+
     Combines a vision tower and a language model with a multi-modal projector.
+    Inherits from BaseVisionLanguageModule to leverage common VLM infrastructure.
 
     Attributes:
         config (LlavaConfig): Configuration object.
@@ -443,7 +531,26 @@ class LlavaForConditionalGeneration(EasyDeLBaseModule):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): JAX precision level.
         rngs (nn.Rngs): Random number generators.
+
+    Class Attributes:
+        _task_type: IMAGE_TEXT_TO_TEXT task type
+        _model_type: "llava" model identifier
+        _supports_video: False (LLaVA is image-only)
+        _uses_mrope: False (uses standard RoPE)
     """
+
+    # Class attributes for registration and capabilities
+    _task_type = TaskType.IMAGE_TEXT_TO_TEXT
+    _model_type = "llava"
+    _config_class = LlavaConfig
+    _auto_register = False  # Already registered via decorator
+    _supports_video = False
+    _uses_mrope = False
+
+    # Component name mapping
+    _vision_tower_name = "vision_tower"
+    _projector_name = "multi_modal_projector"
+    _language_model_name = "language_model"
 
     loss_type = "ForCausalLM"
 
@@ -456,74 +563,126 @@ class LlavaForConditionalGeneration(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the AyaVisionForConditionalGeneration model."""
+        """Initialize LLaVA model for conditional generation.
+
+        Sets up the vision-language model with a language modeling head for
+        image-conditioned text generation tasks.
+
+        Args:
+            config (LlavaConfig): Model configuration containing vision, text, and
+                projector settings.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
+            base_model_class=LlavaModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            # VLM-specific configuration
+            vision_feature_layer=config.vision_feature_layer,
+            vision_feature_select_strategy=getattr(config, "vision_feature_select_strategy", "default"),
+            image_token_index=config.image_token_id,
+            # LM head configuration
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
+            lm_head_bias=False,
         )
-        self.model = LlavaModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.text_config.hidden_size,
-            config.text_config.vocab_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            use_bias=False,
-            rngs=rngs,
-            kernel_init=nn.initializers.normal(config.text_config.initializer_range),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
+
+    def get_image_features(
+        self,
+        pixel_values: Float[Array, "batch channels height width"],
+        **kwargs,
+    ) -> Float[Array, "batch num_patches hidden"]:
+        """Extract and project image features from pixel values.
+
+        Delegates to the base model's get_image_features implementation which:
+        1. Passes pixel_values through the vision tower
+        2. Selects features from the configured layer
+        3. Applies the multimodal projector
+
+        Args:
+            pixel_values: Input image pixel values
+            **kwargs: Additional arguments (unused for LLaVA)
+
+        Returns:
+            Projected image features ready for merging with text embeddings
+        """
+        return self.base_model.get_image_features(pixel_values)
+
+    def compute_embedding(self, input_ids, *args, **kwargs):
+        """Compute input embeddings with merged image and text features.
+
+        Delegates to the base model's compute_embedding method.
+
+        Args:
+            input_ids (Array): Input token IDs of shape (batch_size, sequence_length).
+            *args: Additional positional arguments passed to base model.
+            **kwargs: Additional keyword arguments including pixel_values and image_features.
+
+        Returns:
+            Array: Combined embeddings with image features merged at image token positions.
+        """
+        return self.base_model.compute_embedding(input_ids, *args, **kwargs)
 
     def __call__(
         self,
-        input_ids: chex.Array = None,
-        pixel_values: chex.Array = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        pixel_values: Array | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
-        inputs_embeds: chex.Array | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         **lm_kwargs,
-    ):
-        """Forward pass for the LlavaModel model.
+    ) -> VLMCausalLMOutput:
+        """Forward pass for image-conditioned text generation.
+
+        Processes visual and textual inputs through the LLaVA model, optionally
+        applying the language modeling head for next-token prediction.
 
         Args:
-            input_ids (chex.Array): Input token IDs. (batch_size, sequence_length)
-            pixel_values (chex.Array): Input pixel values for images. (batch_size, num_channels, height, width)
-            attention_mask (Optional[chex.Array]): Mask for text attention.
-            position_ids (Optional[chex.Array]): Position IDs for text.
-            segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
-            past_key_values (Optional[TransformerCache | PagesCache]): Cached keys/values for language model.
-            cache_metadata (Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
-            inputs_embeds (Optional[chex.Array]): Input embeddings (alternative to input_ids).
-            output_attentions (Optional[bool]): Whether to output attentions.
-            output_hidden_states (Optional[bool]): Whether to output hidden states.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            pixel_values (Array | None, optional): Input pixel values for images of shape
+                (batch_size, num_channels, height, width). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token.
+                Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode).
+                Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the language modeling head.
+                Defaults to True.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings.
+                Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states.
+                Defaults to None.
             **lm_kwargs: Additional arguments passed to the language model.
 
         Returns:
-            AyaVisionCausalLMOutputWithPast: Model outputs including logits and potentially past key/values,
-                hidden states, attentions, and image hidden states.
+            VLMCausalLMOutput: Model outputs containing logits (if apply_lm_head is True),
+                past_key_values, hidden_states, attentions, and image_hidden_states.
+
+        Raises:
+            ValueError: If both or neither of input_ids and inputs_embeds are provided.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -533,9 +692,11 @@ class LlavaForConditionalGeneration(EasyDeLBaseModule):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
-        outputs = self.model(
+        # Forward through base model
+        outputs = self.base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -543,7 +704,6 @@ class LlavaForConditionalGeneration(EasyDeLBaseModule):
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
             inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
             pixel_values=pixel_values,
             **lm_kwargs,
         )
@@ -558,10 +718,10 @@ class LlavaForConditionalGeneration(EasyDeLBaseModule):
 
         lm_logits = None
         if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
+            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
+            lm_logits = self.apply_logit_cap(lm_logits)
 
-        return LlavaCausalLMOutputWithPast(
-            loss=None,
+        return VLMCausalLMOutput(
             logits=lm_logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
@@ -578,119 +738,56 @@ class LlavaForConditionalGeneration(EasyDeLBaseModule):
         shardings=None,
         pad_token_id=None,
     ):
-        return self.model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
-
-    def _get_compile_model_kwargs(
-        self,
-        batch_size: int,
-        input_tokens_length: int,
-        input_sharding: jax.sharding.PartitionSpec,
-        rngs: jax.random.PRNGKey,
-        vision_included: bool = False,
-        vision_batch_size: int = 1,
-        vision_channels: int = 3,
-        vision_height: int | None = None,
-        vision_width: int | None = None,
-        required_props: tp.Mapping[str, dict[str, tp.Any]] | None = None,
-        **kwargs,
-    ):
-        """Helper function to get keyword arguments for model compilation, potentially including vision inputs.
+        """Initialize the key-value cache for autoregressive generation.
 
         Args:
-            batch_size (int): Batch size for text inputs.
-            input_tokens_length (int): Sequence length for text inputs.
-            input_sharding (jax.sharding.PartitionSpec): Sharding specification for text inputs.
-            rngs (jax.random.PRNGKey): Random number generator key.
-            vision_included (bool): Whether to include dummy vision inputs. Defaults to False.
-            vision_batch_size (int): Batch size for vision inputs. Defaults to 1.
-            vision_channels (int): Number of channels for vision inputs. Defaults to 3.
-            vision_height (Optional[int]): Height for vision inputs (defaults to config).
-            vision_width (Optional[int]): Width for vision inputs (defaults to config).
-            required_props (Optional[Mapping[str, Dict[str, Any]]]): Required properties.
-            **kwargs: Additional arguments passed to the language model's compile kwargs method.
+            batch_size (int): Batch size for the cache.
+            max_length (int): Maximum sequence length to cache.
+            starts (int | None, optional): Starting positions for cache initialization.
+                Defaults to None.
+            shardings (Any | None, optional): Sharding specifications for the cache.
+                Defaults to None.
+            pad_token_id (int | None, optional): Padding token ID. Defaults to None.
 
         Returns:
-            dict: Keyword arguments for model compilation.
+            TransformerCache: Initialized cache for the language model.
         """
-        basics = self.model._get_compile_model_kwargs(
-            batch_size=batch_size,
-            input_tokens_length=input_tokens_length,
-            input_sharding=input_sharding,
-            rngs=rngs,
-            vision_included=vision_included,
-            vision_batch_size=vision_batch_size,
-            vision_channels=vision_channels,
-            vision_height=vision_height,
-            vision_width=vision_width,
-            required_props=required_props,
-            **kwargs,
-        )
-        return basics
+        return self.base_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
 
-    def prepare_inputs_for_generation(
-        self,
-        input_ids: chex.Array,
-        max_length: int,
-        pad_token_id: int,
-        starts: int | None = None,
-        pixel_values: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-    ):
-        """Prepares inputs for text generation, including pixel values if provided.
+    def apply_lm_head(self, hidden_states: Array) -> Array:
+        """Apply the language modeling head to hidden states.
+
+        Projects hidden states to vocabulary logits for next-token prediction.
 
         Args:
-            input_ids (chex.Array): Initial input token IDs.
-            max_length (int): Maximum generation length.
-            pixel_values (Optional[chex.Array]): Pixel values for image input.
-            attention_mask (Optional[chex.Array]): Attention mask.
+            hidden_states (Array): Hidden states of shape
+                (batch_size, sequence_length, hidden_size).
 
         Returns:
-            dict: Model inputs ready for generation.
+            Array: Logits of shape (batch_size, sequence_length, vocab_size).
         """
-        model_inputs = self.model.prepare_inputs_for_generation(
-            input_ids=input_ids,
-            max_length=max_length,
-            pad_token_id=pad_token_id,
-            starts=starts,
-            attention_mask=attention_mask,
-            pixel_values=pixel_values,
-        )
-        return model_inputs
+        return self.lm_head(hidden_states)
 
-    def update_inputs_for_generation(self, model_outputs, model_kwargs):
-        """Updates model inputs for the next step of generation, removing pixel values after the first step.
-
-        Args:
-            model_outputs: Outputs from the previous generation step.
-            model_kwargs: Current keyword arguments for the model.
+    def get_vision_tower(self) -> nn.Module:
+        """Return the vision tower component.
 
         Returns:
-            dict: Updated model keyword arguments.
+            nn.Module: The vision encoder used for image feature extraction.
         """
-        model_kwargs = self.model.update_inputs_for_generation(model_outputs, model_kwargs)
-        return model_kwargs
+        return self.base_model.vision_tower
 
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        The vision tower acts as the encoder in this multi-modal setup.
-        """
-        return self.model.vision_tower
+    def get_projector(self) -> nn.Module:
+        """Return the multimodal projector component.
 
-    def get_decoder(self):
+        Returns:
+            nn.Module: The projection layer that maps vision features to text space.
         """
-        Returns the decoder part of the model's graph definition.
-        """
-        return self.model.get_decoder()
+        return self.base_model.multi_modal_projector
 
-    def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        """
-        return self.lm_head
+    def get_language_model(self) -> nn.Module:
+        """Return the language model component.
 
-    def get_embedding(self):
+        Returns:
+            nn.Module: The underlying language model for text generation.
         """
-        Returns the embedding layer of the module.
-        """
-        return self.model.get_embedding()
+        return self.base_model.language_model

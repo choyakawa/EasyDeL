@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,14 +15,21 @@
 # pyright:reportUnusedImport=none
 # pyright:reportImportCycles=none
 
-__version__ = "0.1.5"
+__version__ = "0.3.0"
 
 import os as _os
 import sys as _sys
 import typing as _tp
 from logging import getLogger as _getlogger
 
-from eformer.loggings import get_logger as _get_logger
+try:
+    from eformer.loggings import get_logger as _get_logger
+except ModuleNotFoundError:  # pragma: no cover
+
+    def _get_logger(name: str | None = None):
+        return _getlogger(name or __name__)
+
+
 from packaging.version import Version as _version
 from ray import is_initialized
 
@@ -33,6 +40,134 @@ from .utils import is_package_available as _is_package_available
 _logger = _get_logger("EasyDeL")
 
 
+def _patch_transformers_import_utils() -> None:
+    """Backfill removed transformers import-utils symbols for remote model code."""
+    try:
+        from transformers.utils import import_utils as _hf_import_utils
+    except Exception:
+        return
+
+    if not hasattr(_hf_import_utils, "is_torch_fx_available"):
+
+        def _is_torch_fx_available() -> bool:
+            try:
+                is_torch_available = getattr(_hf_import_utils, "is_torch_available", None)
+                return bool(is_torch_available()) if callable(is_torch_available) else False
+            except Exception:
+                return False
+
+        _hf_import_utils.is_torch_fx_available = _is_torch_fx_available
+
+
+_patch_transformers_import_utils()
+
+
+def _patch_transformers_rope_scaling_property() -> None:
+    """Normalize HF rope_scaling access for legacy DeepSeek remote modules."""
+    try:
+        from transformers.configuration_utils import PretrainedConfig as _HFPretrainedConfig
+    except Exception:
+        return
+
+    rope_scaling_prop = getattr(_HFPretrainedConfig, "rope_scaling", None)
+    if not isinstance(rope_scaling_prop, property):
+        return
+
+    original_get = rope_scaling_prop.fget
+    if original_get is None or getattr(original_get, "_easydel_rope_scaling_patch", False):
+        return
+
+    def _patched_get(self):
+        value = original_get(self)
+        if getattr(self, "model_type", None) in {"deepseek_v2", "deepseek_v3"} and isinstance(value, dict):
+            rope_type = value.get("rope_type", value.get("type"))
+            if rope_type in (None, "default"):
+                return None
+        return value
+
+    _patched_get._easydel_rope_scaling_patch = True  # type: ignore[attr-defined]
+    _HFPretrainedConfig.rope_scaling = property(
+        _patched_get,
+        rope_scaling_prop.fset,
+        rope_scaling_prop.fdel,
+        rope_scaling_prop.__doc__,
+    )
+
+
+_patch_transformers_rope_scaling_property()
+
+
+def _patch_transformers_init_weights_tie_signature() -> None:
+    """Handle legacy remote-model `tie_weights()` signatures on new HF versions."""
+    try:
+        from transformers.modeling_utils import PreTrainedModel as _HFPreTrainedModel
+    except Exception:
+        return
+
+    original_init_weights = getattr(_HFPreTrainedModel, "init_weights", None)
+    if original_init_weights is None or getattr(original_init_weights, "_easydel_tie_patch", False):
+        return
+
+    def _patched_init_weights(self):
+        try:
+            return original_init_weights(self)
+        except TypeError as exc:
+            if "recompute_mapping" not in str(exc):
+                raise
+            return self.tie_weights()
+
+    _patched_init_weights._easydel_tie_patch = True  # type: ignore[attr-defined]
+    _HFPreTrainedModel.init_weights = _patched_init_weights
+
+
+_patch_transformers_init_weights_tie_signature()
+
+
+def _patch_transformers_autoconfig_gated_repo_skip() -> None:
+    """Convert gated-repo config load failures to pytest skips."""
+    try:
+        from transformers import AutoConfig as _HFAutoConfig
+    except Exception:
+        return
+
+    auto_config_from_pretrained = _HFAutoConfig.__dict__.get("from_pretrained", None)
+    if not isinstance(auto_config_from_pretrained, classmethod):
+        return
+    original_fn = auto_config_from_pretrained.__func__
+    if getattr(original_fn, "_easydel_gated_repo_patch", False):
+        return
+
+    def _patched_from_pretrained(cls, *args, **kwargs):
+        import os as _runtime_os
+
+        try:
+            return original_fn(cls, *args, **kwargs)
+        except OSError as exc:
+            if "PYTEST_CURRENT_TEST" not in _runtime_os.environ:
+                raise
+            message = str(exc).lower()
+            is_gated_error = (
+                "gated repo" in message
+                or "gated model" in message
+                or "you are trying to access a gated repo" in message
+                or "access to this model is restricted" in message
+                or "access to this repository is restricted" in message
+                or ("401" in message and "huggingface" in message)
+            )
+            if not is_gated_error:
+                raise
+            import unittest as _unittest
+
+            model_id = args[0] if args else kwargs.get("pretrained_model_name_or_path", "<unknown>")
+            raise _unittest.SkipTest(f"Skipping gated Hugging Face repo during tests: {model_id}") from exc
+
+    _patched_from_pretrained._easydel_gated_repo_patch = True  # type: ignore[attr-defined]
+    _HFAutoConfig.from_pretrained = classmethod(_patched_from_pretrained)
+
+
+_patch_transformers_autoconfig_gated_repo_skip()
+
+
 if _check_bool_flag("EASYDEL_AUTO", True):
     _sys.setrecursionlimit(10000)
 
@@ -40,19 +175,36 @@ if _check_bool_flag("EASYDEL_AUTO", True):
     _getlogger("jax._src.xla_bridge").setLevel(30)
     _getlogger("jax._src.mesh_utils").setLevel(30)
     _getlogger("jax._src.distributed").setLevel(30)
+
+    _getlogger("httpx").setLevel(30)
+    _getlogger("httpcore").setLevel(30)
+    _getlogger("datasets").setLevel(30)
+
+    _getlogger("numexpr.utils").setLevel(30)
+    _getlogger("numexpr").setLevel(30)
+
     # these people talk too much
     _getlogger("eray-executor").setLevel(30)
     _getlogger("absl").setLevel(30)
-    _getlogger("datasets").setLevel(30)
 
-    _os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    _os.environ["NUMEXPR_NUM_THREADS"] = "8"
+
     _os.environ["KMP_AFFINITY"] = "noverbose"
-    _os.environ["GRPC_VERBOSITY"] = "3"
+    _os.environ["GRPC_VERBOSITY"] = "ERROR"
     _os.environ["GLOG_minloglevel"] = "3"
-    _os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+
     _os.environ["CACHE_TRITON_KERNELS"] = "1"
-    _os.environ["TPU_MIN_LOG_LEVEL"] = "2"
-    _os.environ["TPU_STDERR_LOG_LEVEL"] = "2"
+    _os.environ["TPU_MIN_LOG_LEVEL"] = "4"
+    _os.environ["TPU_STDERR_LOG_LEVEL"] = "4"
+
+    _os.environ["TPU_LOG_DIR"] = "disabled"
+    _os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+    _os.environ["JAX_ENABLE_PGLE"] = "true"
+    _os.environ["JAX_CAPTURED_CONSTANTS_WARN_BYTES"] = "-1"
+
+    _os.environ["JAX_PGLE_PROFILING_RUNS"] = "3"
+    _os.environ["JAX_PGLE_AGGREGATION_PERCENTILE"] = "85"
     _os.environ["XLA_FLAGS"] = (
         _os.getenv("XLA_FLAGS", "") + " "
         "--xla_gpu_triton_gemm_any=true  "
@@ -73,8 +225,8 @@ if _check_bool_flag("EASYDEL_AUTO", True):
         "--xla_gpu_force_compilation_parallelism=4 "
         "--xla_gpu_enable_shared_constants=true "
         "--xla_gpu_enable_triton_gemm=true "
-        "--xla_gpu_graph_level=3 "
-        "--xla_gpu_enable_command_buffer=  "
+        "--xla_gpu_enable_command_buffer='' "
+        "--xla_disable_hlo_passes=collective-permute-motion "
     )
     _os.environ["LIBTPU_INIT_ARGS"] = (
         _os.getenv("LIBTPU_INIT_ARGS", "") + " "
@@ -88,14 +240,14 @@ if _check_bool_flag("EASYDEL_AUTO", True):
         "--xla_tpu_overlap_compute_collective_tc=true "
         "--xla_enable_async_all_gather=true "
         "--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true "
-        "--xla_tpu_megacore_fusion_allow_ags=true "
+        "--xla_tpu_megacore_fusion_allow_ags=false "
         "TPU_MEGACORE=MEGACORE_DENSE "
     )
     _os.environ.update(
         {
             "NCCL_LL128_BUFFSIZE": "-2",
             "NCCL_LL_BUFFSIZE": "-2",
-            "NCCL_PROTO": "SIMPLE,LL,LL128",
+            "NCCL_PROTO": "SIMPLE,LL,LL128",  # NOTE: tweak this one
         }
     )
     if _os.getenv("XLA_PYTHON_CLIENT_MEM_FRACTION", None) is None:
@@ -106,17 +258,10 @@ if _check_bool_flag("EASYDEL_AUTO", True):
 
 _import_structure = {
     "utils": [
-        "ArrayCache",
-        "DataCache",
-        "DataManager",
-        "DatasetLoadError",
-        "DatasetMixture",
-        "DatasetType",
-        "DataStreamOptimizer",
-        "FastDataLoader",
-        "FastDataManager",
-        "TextDatasetInform",
-        "VisualDatasetInform",
+        "ModelConverter",
+        "Registry",
+        "StateDictConverter",
+        "TensorConverter",
         "ejit",
         "ePath",
         "ePathLike",
@@ -130,23 +275,13 @@ _import_structure = {
         "SamplingParams",
         "ToolParser",
         "ToolParserManager",
-        "eLMConfig",
         "eSurge",
         "eSurgeApiServer",
         "eSurgeRunner",
-        "vDriver",
-        "vEngine",
-        "vInference",
-        "vInferenceApiServer",
-        "vInferenceConfig",
-        "vInferencePreCompileConfig",
-        "vSurge",
-        "vSurgeApiServer",
-        "vSurgeRequest",
         "vWhisperInference",
         "vWhisperInferenceConfig",
     ],
-    "inference.evaluations": ["eSurgeLMEvalAdapter", "vSurgeLMEvalAdapter"],
+    "inference.evaluations": ["eSurgeLMEvalAdapter"],
     "infra": [
         "EasyDeLBaseConfig",
         "EasyDeLBaseConfigDict",
@@ -171,7 +306,6 @@ _import_structure = {
         "EasyDeLGradientCheckPointers",
         "EasyDeLOptimizers",
         "EasyDeLPlatforms",
-        "EasyDeLQuantizationMethods",
         "EasyDeLSchedulers",
     ],
     "infra.factory": [
@@ -181,16 +315,40 @@ _import_structure = {
         "register_module",
     ],
     "layers": [],
-    "layers.attention_operator._attention_impl": [
-        "AttentionMetadata",
-        "AttentionRegistry",
-        "AttentionImpl",
+    "layers.quantization": [
+        "EasyDeLQuantizationConfig",
+        "EasyQuantizer",
+        "QuantizationType",
+    ],
+    "operations": [
+        "AttentionConfig",
+        "AttentionOutput",
+        "AutoRegressiveDecodeAttn",
+        "BaseOperationConfig",
+        "BlockSparseAttn",
+        "BlockSparseAttentionConfig",
+        "FlashAttn",
+        "PagedFlashAttn",
+        "FlashAttentionConfig",
+        "OperationImpl",
+        "OperationMetadata",
+        "OperationRegistry",
+        "RaggedPageAttnV2",
+        "RaggedPageAttnV3",
+        "RaggedPageAttentionv2Config",
+        "RaggedPageAttentionv3Config",
+        "RingAttn",
+        "RingAttentionConfig",
+        "ScaledDotProductAttn",
+        "ScaledDotProductAttentionConfig",
+        "VanillaAttn",
     ],
     "layers.attention": [
         "AttentionMechanisms",
         "AttentionModule",
         "FlexibleAttentionModule",
     ],
+    "layers.moe": ["MoEMethods"],
     "modules": [],
     "modules.arctic": [
         "ArcticConfig",
@@ -198,9 +356,11 @@ _import_structure = {
         "ArcticModel",
     ],
     "modules.auto": [
+        "AutoEasyDeLAnyToAnyModel",
         "AutoEasyDeLConfig",
         "AutoEasyDeLModel",
         "AutoEasyDeLModelForCausalLM",
+        "AutoEasyDeLModelForDiffusionLM",
         "AutoEasyDeLModelForImageTextToText",
         "AutoEasyDeLModelForSeq2SeqLM",
         "AutoEasyDeLModelForSequenceClassification",
@@ -209,7 +369,9 @@ _import_structure = {
         "AutoEasyDeLVisionModel",
         "AutoShardAndGatherFunctions",
         "AutoState",
+        "AutoStateAnyToAnyModel",
         "AutoStateForCausalLM",
+        "AutoStateForDiffusionLM",
         "AutoStateForImageSequenceClassification",
         "AutoStateForImageTextToText",
         "AutoStateForSeq2SeqLM",
@@ -269,10 +431,26 @@ _import_structure = {
         "ExaoneForSequenceClassification",
         "ExaoneModel",
     ],
+    "modules.exaone4": [
+        "Exaone4Config",
+        "Exaone4ForCausalLM",
+        "Exaone4ForSequenceClassification",
+        "Exaone4Model",
+    ],
     "modules.falcon": [
         "FalconConfig",
         "FalconForCausalLM",
         "FalconModel",
+    ],
+    "modules.falcon_h1": [
+        "FalconH1Config",
+        "FalconH1ForCausalLM",
+        "FalconH1Model",
+    ],
+    "modules.falcon_mamba": [
+        "FalconMambaConfig",
+        "FalconMambaForCausalLM",
+        "FalconMambaModel",
     ],
     "modules.gemma": [
         "GemmaConfig",
@@ -318,6 +496,34 @@ _import_structure = {
         "Glm4MoeForSequenceClassification",
         "Glm4MoeModel",
     ],
+    "modules.glm4_moe_lite": [
+        "Glm4MoeLiteConfig",
+        "Glm4MoeLiteForCausalLM",
+        "Glm4MoeLiteModel",
+    ],
+    "modules.glm4v": [
+        "Glm4vConfig",
+        "Glm4vForConditionalGeneration",
+        "Glm4vModel",
+        "Glm4vTextConfig",
+        "Glm4vTextModel",
+        "Glm4vVisionConfig",
+        "Glm4vVisionModel",
+    ],
+    "modules.glm4v_moe": [
+        "Glm4vMoeConfig",
+        "Glm4vMoeForConditionalGeneration",
+        "Glm4vMoeModel",
+        "Glm4vMoeTextConfig",
+        "Glm4vMoeTextModel",
+        "Glm4vMoeVisionConfig",
+        "Glm4vMoeVisionModel",
+    ],
+    "modules.glm46v": [
+        "Glm46VConfig",
+        "Glm46VForConditionalGeneration",
+        "Glm46VModel",
+    ],
     "modules.gpt2": [
         "GPT2Config",
         "GPT2LMHeadModel",
@@ -350,6 +556,16 @@ _import_structure = {
         "InternLM2ForSequenceClassification",
         "InternLM2Model",
     ],
+    "modules.kimi_linear": [
+        "KimiLinearConfig",
+        "KimiLinearForCausalLM",
+        "KimiLinearModel",
+    ],
+    "modules.kimi_vl": [
+        "KimiVLConfig",
+        "KimiVLForConditionalGeneration",
+        "MoonViTConfig",
+    ],
     "modules.llama": [
         "LlamaConfig",
         "LlamaForCausalLM",
@@ -380,6 +596,11 @@ _import_structure = {
         "Mamba2Config",
         "Mamba2ForCausalLM",
         "Mamba2Model",
+    ],
+    "modules.minimax": [
+        "MiniMaxConfig",
+        "MiniMaxForCausalLM",
+        "MiniMaxModel",
     ],
     "modules.mistral": [
         "MistralConfig",
@@ -415,6 +636,12 @@ _import_structure = {
         "Olmo2ForCausalLM",
         "Olmo2ForSequenceClassification",
         "Olmo2Model",
+    ],
+    "modules.olmo3": [
+        "Olmo3Config",
+        "Olmo3ForCausalLM",
+        "Olmo3ForSequenceClassification",
+        "Olmo3Model",
     ],
     "modules.openelm": [
         "OpenELMConfig",
@@ -474,6 +701,52 @@ _import_structure = {
         "Qwen3MoeForSequenceClassification",
         "Qwen3MoeModel",
     ],
+    "modules.qwen3_next": [
+        "Qwen3NextConfig",
+        "Qwen3NextForCausalLM",
+        "Qwen3NextModel",
+    ],
+    "modules.qwen3_omni_moe": [
+        "Qwen3OmniMoeAudioConfig",
+        "Qwen3OmniMoeAudioEncoder",
+        "Qwen3OmniMoeAudioEncoderConfig",
+        "Qwen3OmniMoeCode2Wav",
+        "Qwen3OmniMoeCode2WavConfig",
+        "Qwen3OmniMoeConfig",
+        "Qwen3OmniMoeForConditionalGeneration",
+        "Qwen3OmniMoeModel",
+        "Qwen3OmniMoeTalkerCodePredictorConfig",
+        "Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration",
+        "Qwen3OmniMoeTalkerCodePredictorModel",
+        "Qwen3OmniMoeTalkerConfig",
+        "Qwen3OmniMoeTalkerForConditionalGeneration",
+        "Qwen3OmniMoeTalkerTextConfig",
+        "Qwen3OmniMoeTextConfig",
+        "Qwen3OmniMoeThinkerConfig",
+        "Qwen3OmniMoeThinkerForConditionalGeneration",
+        "Qwen3OmniMoeThinkerModel",
+        "Qwen3OmniMoeVisionConfig",
+        "Qwen3OmniMoeVisionEncoder",
+        "Qwen3OmniMoeVisionEncoderConfig",
+    ],
+    "modules.qwen3_vl": [
+        "Qwen3VLConfig",
+        "Qwen3VLTextConfig",
+        "Qwen3VLVisionConfig",
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3VLModel",
+        "Qwen3VLTextModel",
+        "Qwen3VisionTransformerPretrainedModel",
+    ],
+    "modules.qwen3_vl_moe": [
+        "Qwen3VLMoeConfig",
+        "Qwen3VLMoeForConditionalGeneration",
+        "Qwen3VLMoeModel",
+        "Qwen3VLMoeTextConfig",
+        "Qwen3VLMoeTextModel",
+        "Qwen3VLMoeVisionConfig",
+        "Qwen3VLMoeVisionTransformerPretrainedModel",
+    ],
     "modules.roberta": [
         "RobertaConfig",
         "RobertaForCausalLM",
@@ -481,6 +754,12 @@ _import_structure = {
         "RobertaForQuestionAnswering",
         "RobertaForSequenceClassification",
         "RobertaForTokenClassification",
+    ],
+    "modules.seed_oss": [
+        "SeedOssConfig",
+        "SeedOssForCausalLM",
+        "SeedOssForSequenceClassification",
+        "SeedOssModel",
     ],
     "modules.siglip": [
         "SiglipConfig",
@@ -490,6 +769,12 @@ _import_structure = {
         "SiglipTextModel",
         "SiglipVisionConfig",
         "SiglipVisionModel",
+    ],
+    "modules.smollm3": [
+        "SmolLM3Config",
+        "SmolLM3ForCausalLM",
+        "SmolLM3ForSequenceClassification",
+        "SmolLM3Model",
     ],
     "modules.stablelm": [
         "StableLmConfig",
@@ -514,36 +799,48 @@ _import_structure = {
     ],
     "trainers": [
         "BaseTrainer",
+        "BCOConfig",
+        "BCOTrainer",
+        "CPOConfig",
+        "CPOTrainer",
         "DistillationConfig",
         "DistillationTrainer",
         "DPOConfig",
         "DPOTrainer",
+        "GFPOConfig",
+        "GFPOTrainer",
+        "GKDConfig",
+        "GKDTrainer",
         "GRPOConfig",
         "GRPOTrainer",
+        "GSPOConfig",
+        "GSPOTrainer",
+        "KTOConfig",
+        "KTOTrainer",
+        "NashMDConfig",
+        "NashMDTrainer",
+        "PPOConfig",
+        "PPOTrainer",
+        "XPOConfig",
+        "XPOTrainer",
         "ORPOConfig",
         "ORPOTrainer",
         "RayDistributedTrainer",
         "RewardConfig",
         "RewardTrainer",
+        "SDPOConfig",
+        "SDPOTrainer",
         "SFTConfig",
         "SFTTrainer",
         "Trainer",
         "TrainingArguments",
         "pack_sequences",
     ],
-    "utils.parameters_transformation": [
-        "ModelConverter",
-        "StateDictConverter",
-        "TensorConverter",
-    ],
-    "utils.registery": [
-        "Registry",
-    ],
 }
 
 
 if _tp.TYPE_CHECKING:
-    from . import utils
+    from . import data, utils
     from .inference import (
         EngineRequest,
         EngineRequestStatus,
@@ -552,23 +849,13 @@ if _tp.TYPE_CHECKING:
         SamplingParams,
         ToolParser,
         ToolParserManager,
-        eLMConfig,
         eSurge,
         eSurgeApiServer,
         eSurgeRunner,
-        vDriver,
-        vEngine,
-        vInference,
-        vInferenceApiServer,
-        vInferenceConfig,
-        vInferencePreCompileConfig,
-        vSurge,
-        vSurgeApiServer,
-        vSurgeRequest,
         vWhisperInference,
         vWhisperInferenceConfig,
     )
-    from .inference.evaluations import eSurgeLMEvalAdapter, vSurgeLMEvalAdapter
+    from .inference.evaluations import eSurgeLMEvalAdapter
     from .infra import (
         EasyDeLBaseConfig,
         EasyDeLBaseConfigDict,
@@ -589,17 +876,19 @@ if _tp.TYPE_CHECKING:
         EasyDeLGradientCheckPointers,
         EasyDeLOptimizers,
         EasyDeLPlatforms,
-        EasyDeLQuantizationMethods,
         EasyDeLSchedulers,
     )
     from .infra.factory import ConfigType, TaskType, register_config, register_module
     from .layers.attention import AttentionMechanisms, AttentionModule, FlexibleAttentionModule
-    from .layers.attention_operator._attention_impl import AttentionImpl, AttentionMetadata, AttentionRegistry
+    from .layers.moe import MoEMethods
+    from .layers.quantization import EasyDeLQuantizationConfig, EasyQuantizer, QuantizationType
     from .modules.arctic import ArcticConfig, ArcticForCausalLM, ArcticModel
     from .modules.auto import (
+        AutoEasyDeLAnyToAnyModel,
         AutoEasyDeLConfig,
         AutoEasyDeLModel,
         AutoEasyDeLModelForCausalLM,
+        AutoEasyDeLModelForDiffusionLM,
         AutoEasyDeLModelForImageTextToText,
         AutoEasyDeLModelForSeq2SeqLM,
         AutoEasyDeLModelForSequenceClassification,
@@ -608,7 +897,9 @@ if _tp.TYPE_CHECKING:
         AutoEasyDeLVisionModel,
         AutoShardAndGatherFunctions,
         AutoState,
+        AutoStateAnyToAnyModel,
         AutoStateForCausalLM,
+        AutoStateForDiffusionLM,
         AutoStateForImageSequenceClassification,
         AutoStateForImageTextToText,
         AutoStateForSeq2SeqLM,
@@ -641,7 +932,10 @@ if _tp.TYPE_CHECKING:
     from .modules.deepseek_v2 import DeepseekV2Config, DeepseekV2ForCausalLM, DeepseekV2Model
     from .modules.deepseek_v3 import DeepseekV3Config, DeepseekV3ForCausalLM, DeepseekV3Model
     from .modules.exaone import ExaoneConfig, ExaoneForCausalLM, ExaoneForSequenceClassification, ExaoneModel
+    from .modules.exaone4 import Exaone4Config, Exaone4ForCausalLM, Exaone4ForSequenceClassification, Exaone4Model
     from .modules.falcon import FalconConfig, FalconForCausalLM, FalconModel
+    from .modules.falcon_h1 import FalconH1Config, FalconH1ForCausalLM, FalconH1Model
+    from .modules.falcon_mamba import FalconMambaConfig, FalconMambaForCausalLM, FalconMambaModel
     from .modules.gemma import GemmaConfig, GemmaForCausalLM, GemmaForSequenceClassification, GemmaModel
     from .modules.gemma2 import Gemma2Config, Gemma2ForCausalLM, Gemma2ForSequenceClassification, Gemma2Model
     from .modules.gemma3 import (
@@ -657,6 +951,26 @@ if _tp.TYPE_CHECKING:
     from .modules.glm import GlmConfig, GlmForCausalLM, GlmForSequenceClassification, GlmModel
     from .modules.glm4 import Glm4Config, Glm4ForCausalLM, Glm4ForSequenceClassification, Glm4Model
     from .modules.glm4_moe import Glm4MoeConfig, Glm4MoeForCausalLM, Glm4MoeForSequenceClassification, Glm4MoeModel
+    from .modules.glm4_moe_lite import Glm4MoeLiteConfig, Glm4MoeLiteForCausalLM, Glm4MoeLiteModel
+    from .modules.glm4v import (
+        Glm4vConfig,
+        Glm4vForConditionalGeneration,
+        Glm4vModel,
+        Glm4vTextConfig,
+        Glm4vTextModel,
+        Glm4vVisionConfig,
+        Glm4vVisionModel,
+    )
+    from .modules.glm4v_moe import (
+        Glm4vMoeConfig,
+        Glm4vMoeForConditionalGeneration,
+        Glm4vMoeModel,
+        Glm4vMoeTextConfig,
+        Glm4vMoeTextModel,
+        Glm4vMoeVisionConfig,
+        Glm4vMoeVisionModel,
+    )
+    from .modules.glm46v import Glm46VConfig, Glm46VForConditionalGeneration, Glm46VModel
     from .modules.gpt2 import GPT2Config, GPT2LMHeadModel, GPT2Model
     from .modules.gpt_j import GPTJConfig, GPTJForCausalLM, GPTJModel
     from .modules.gpt_neox import GPTNeoXConfig, GPTNeoXForCausalLM, GPTNeoXModel
@@ -668,6 +982,8 @@ if _tp.TYPE_CHECKING:
         InternLM2ForSequenceClassification,
         InternLM2Model,
     )
+    from .modules.kimi_linear import KimiLinearConfig, KimiLinearForCausalLM, KimiLinearModel
+    from .modules.kimi_vl import KimiVLConfig, KimiVLForConditionalGeneration, MoonViTConfig
     from .modules.llama import LlamaConfig, LlamaForCausalLM, LlamaForSequenceClassification, LlamaModel
     from .modules.llama4 import (
         Llama4Config,
@@ -682,12 +998,14 @@ if _tp.TYPE_CHECKING:
     from .modules.llava import LlavaConfig, LlavaForConditionalGeneration, LlavaModel
     from .modules.mamba import MambaConfig, MambaForCausalLM, MambaModel
     from .modules.mamba2 import Mamba2Config, Mamba2ForCausalLM, Mamba2Model
+    from .modules.minimax import MiniMaxConfig, MiniMaxForCausalLM, MiniMaxModel
     from .modules.mistral import MistralConfig, MistralForCausalLM, MistralForSequenceClassification, MistralModel
     from .modules.mistral3 import Mistral3Config, Mistral3ForConditionalGeneration, Mistral3Model, Mistral3Tokenizer
     from .modules.mixtral import MixtralConfig, MixtralForCausalLM, MixtralForSequenceClassification, MixtralModel
     from .modules.mosaic_mpt import MptAttentionConfig, MptConfig, MptForCausalLM, MptModel
     from .modules.olmo import OlmoConfig, OlmoForCausalLM, OlmoModel
     from .modules.olmo2 import Olmo2Config, Olmo2ForCausalLM, Olmo2ForSequenceClassification, Olmo2Model
+    from .modules.olmo3 import Olmo3Config, Olmo3ForCausalLM, Olmo3ForSequenceClassification, Olmo3Model
     from .modules.openelm import OpenELMConfig, OpenELMForCausalLM, OpenELMModel
     from .modules.opt import OPTConfig, OPTForCausalLM, OPTModel
     from .modules.phi import PhiConfig, PhiForCausalLM, PhiModel
@@ -699,6 +1017,52 @@ if _tp.TYPE_CHECKING:
     from .modules.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration, Qwen2VLModel
     from .modules.qwen3 import Qwen3Config, Qwen3ForCausalLM, Qwen3ForSequenceClassification, Qwen3Model
     from .modules.qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM, Qwen3MoeForSequenceClassification, Qwen3MoeModel
+    from .modules.qwen3_next import (
+        Qwen3NextConfig,
+        Qwen3NextForCausalLM,
+        Qwen3NextModel,
+    )
+    from .modules.qwen3_omni_moe import (
+        Qwen3OmniMoeAudioConfig,
+        Qwen3OmniMoeAudioEncoder,
+        Qwen3OmniMoeAudioEncoderConfig,
+        Qwen3OmniMoeCode2Wav,
+        Qwen3OmniMoeCode2WavConfig,
+        Qwen3OmniMoeConfig,
+        Qwen3OmniMoeForConditionalGeneration,
+        Qwen3OmniMoeModel,
+        Qwen3OmniMoeTalkerCodePredictorConfig,
+        Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration,
+        Qwen3OmniMoeTalkerCodePredictorModel,
+        Qwen3OmniMoeTalkerConfig,
+        Qwen3OmniMoeTalkerForConditionalGeneration,
+        Qwen3OmniMoeTalkerTextConfig,
+        Qwen3OmniMoeTextConfig,
+        Qwen3OmniMoeThinkerConfig,
+        Qwen3OmniMoeThinkerForConditionalGeneration,
+        Qwen3OmniMoeThinkerModel,
+        Qwen3OmniMoeVisionConfig,
+        Qwen3OmniMoeVisionEncoder,
+        Qwen3OmniMoeVisionEncoderConfig,
+    )
+    from .modules.qwen3_vl import (
+        Qwen3VisionTransformerPretrainedModel,
+        Qwen3VLConfig,
+        Qwen3VLForConditionalGeneration,
+        Qwen3VLModel,
+        Qwen3VLTextConfig,
+        Qwen3VLTextModel,
+        Qwen3VLVisionConfig,
+    )
+    from .modules.qwen3_vl_moe import (
+        Qwen3VLMoeConfig,
+        Qwen3VLMoeForConditionalGeneration,
+        Qwen3VLMoeModel,
+        Qwen3VLMoeTextConfig,
+        Qwen3VLMoeTextModel,
+        Qwen3VLMoeVisionConfig,
+        Qwen3VLMoeVisionTransformerPretrainedModel,
+    )
     from .modules.roberta import (
         RobertaConfig,
         RobertaForCausalLM,
@@ -707,6 +1071,7 @@ if _tp.TYPE_CHECKING:
         RobertaForSequenceClassification,
         RobertaForTokenClassification,
     )
+    from .modules.seed_oss import SeedOssConfig, SeedOssForCausalLM, SeedOssForSequenceClassification, SeedOssModel
     from .modules.siglip import (
         SiglipConfig,
         SiglipForImageClassification,
@@ -716,6 +1081,7 @@ if _tp.TYPE_CHECKING:
         SiglipVisionConfig,
         SiglipVisionModel,
     )
+    from .modules.smollm3 import SmolLM3Config, SmolLM3ForCausalLM, SmolLM3ForSequenceClassification, SmolLM3Model
     from .modules.stablelm import StableLmConfig, StableLmForCausalLM, StableLmModel
     from .modules.whisper import (
         WhisperConfig,
@@ -725,44 +1091,76 @@ if _tp.TYPE_CHECKING:
     )
     from .modules.xerxes import XerxesConfig, XerxesForCausalLM, XerxesModel
     from .modules.xerxes2 import Xerxes2Config, Xerxes2ForCausalLM, Xerxes2Model
+    from .operations import (
+        AttentionConfig,
+        AttentionOutput,
+        AutoRegressiveDecodeAttn,
+        BaseOperationConfig,
+        BlockSparseAttentionConfig,
+        BlockSparseAttn,
+        FlashAttentionConfig,
+        FlashAttn,
+        OperationImpl,
+        OperationMetadata,
+        OperationRegistry,
+        PagedFlashAttn,
+        RaggedPageAttentionv2Config,
+        RaggedPageAttentionv3Config,
+        RaggedPageAttnV2,
+        RaggedPageAttnV3,
+        RingAttentionConfig,
+        RingAttn,
+        ScaledDotProductAttentionConfig,
+        ScaledDotProductAttn,
+        VanillaAttn,
+    )
     from .trainers import (
         BaseTrainer,
+        BCOConfig,
+        BCOTrainer,
+        CPOConfig,
+        CPOTrainer,
         DistillationConfig,
         DistillationTrainer,
         DPOConfig,
         DPOTrainer,
+        GFPOConfig,
+        GFPOTrainer,
+        GKDConfig,
+        GKDTrainer,
         GRPOConfig,
         GRPOTrainer,
+        GSPOConfig,
+        GSPOTrainer,
+        KTOConfig,
+        KTOTrainer,
+        NashMDConfig,
+        NashMDTrainer,
         ORPOConfig,
         ORPOTrainer,
         RayDistributedTrainer,
         RewardConfig,
         RewardTrainer,
+        SDPOConfig,
+        SDPOTrainer,
         SFTConfig,
         SFTTrainer,
         Trainer,
         TrainingArguments,
+        XPOConfig,
+        XPOTrainer,
         pack_sequences,
     )
     from .utils import (
-        ArrayCache,
-        DataCache,
-        DataManager,
-        DatasetLoadError,
-        DatasetMixture,
-        DatasetType,
-        DataStreamOptimizer,
-        FastDataLoader,
-        FastDataManager,
-        TextDatasetInform,
-        VisualDatasetInform,
+        ModelConverter,
+        Registry,
+        StateDictConverter,
+        TensorConverter,
         ejit,
         ePath,
         ePathLike,
         traversals,
     )
-    from .utils.parameters_transformation import ModelConverter, StateDictConverter, TensorConverter
-    from .utils.registery import Registry
 else:
     _sys.modules[__name__] = _LazyModule(
         __name__,
@@ -772,13 +1170,23 @@ else:
         extra_objects={"__version__": __version__},
     )
 
-    _targeted_versions = ["0.0.62", "0.0.63"]
+    _targeted_eformer_versions = ["0.0.98"]
+    _targeted_ejkernel_versions = ["0.0.66"]
 
     from eformer import __version__ as _eform_version
+    from ejkernel import __version__ as _ejker_version
 
-    assert _version(_eform_version) in [_version(_targeted_version) for _targeted_version in _targeted_versions], (
-        f"this version of EasyDeL is only compatible with eformer {', '.join(_targeted_versions)},"
+    assert _version(_eform_version) in [
+        _version(_targeted_version) for _targeted_version in _targeted_eformer_versions
+    ], (
+        f"this version of EasyDeL is only compatible with eformer {', '.join(_targeted_eformer_versions)},"
         f" but found eformer {_eform_version}"
+    )
+    assert _version(_ejker_version) in [
+        _version(_targeted_version) for _targeted_version in _targeted_ejkernel_versions
+    ], (
+        f"this version of EasyDeL is only compatible with ejkernel {', '.join(_targeted_ejkernel_versions)},"
+        f" but found ejkernel {_ejker_version}"
     )
 
     if not _is_package_available("torch"):
@@ -788,24 +1196,33 @@ else:
     del _eform_version
 
 
-if _check_bool_flag("ENABLE_DISTRIBUTED_INIT", True):
+# Keep import side effects minimal: distributed/JAX backend initialization is opt-in.
+_distributed_init_enabled = _check_bool_flag("ENABLE_DISTRIBUTED_INIT", False)
+if _distributed_init_enabled:
     from eformer.executor import DistributedConfig as _DistributedConfig
 
     try:
         _DistributedConfig().initialize()
-    except RuntimeError:
-        _logger.warn("Failed to initialize jax-dist if you have initialized that manually you can ignore this warning")
+    except RuntimeError as e:
+        _logger.warning(
+            f"Failed to initialize jax-dist if you have initialized that manually you can ignore this warning {e}"
+        )
     except Exception:  # maybe it's a single process
-        _logger.warn("Failed to initialize jax-dist")
+        _logger.warning("Failed to initialize jax-dist")
     del _DistributedConfig
 else:
-    _logger.info(
+    _distributed_msg = (
         "Skipping initialization of `DistributedConfig` (ENABLE_DISTRIBUTED_INIT=0), "
         "you can initialize that via `ed.init_cluster()`."
     )
+    if "ENABLE_DISTRIBUTED_INIT" in _os.environ:
+        _logger.info(_distributed_msg)
+    else:
+        _logger.debug(_distributed_msg)
 
 
 del _os
 del _logger
 del _LazyModule
 del _is_package_available
+del _distributed_init_enabled

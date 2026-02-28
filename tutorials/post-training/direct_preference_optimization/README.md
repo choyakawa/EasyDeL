@@ -31,7 +31,7 @@ The provided script relies on a setup script from EasyDeL to prepare the TPU env
 2. **Run the EasyDeL setup script:**
 
     ```bash
-    bash <(curl -sL https://raw.githubusercontent.com/erfanzar/EasyDeL/refs/heads/main/tpu_setup.sh)
+    bash <(curl -sL https://raw.githubusercontent.com/erfanzar/EasyDeL/refs/heads/main/scripts/tpu_setup.sh)
     ```
 
     This command will download and execute a script that installs required packages such as JAX, EasyDeL, Ray, Hugging Face libraries, and other Python dependencies optimized for TPU operation. This process might take several minutes.
@@ -174,13 +174,11 @@ def main():
             # Override specific model configuration parameters.
             freq_max_position_embeddings=max_length, # For RoPE-based models, sets max position for frequency encoding.
             mask_max_position_embeddings=max_length, # Max length for attention mask.
-            kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE, # Disables quantization for KV cache.
             attn_mechanism=ed.AttentionMechanisms.AUTO, # EasyDeL selects the best attention mechanism (e.g., FlashAttention).
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE, # change this if u go OOM # Memory-saving technique for gradients.
         ),
         # partition_axis: Provides finer control over sharding, e.g., sharding KV heads via tensor parallelism.
         partition_axis=ed.PartitionAxis(kv_head_axis="tp"),
-        quantization_method=ed.EasyDeLQuantizationMethods.NONE, # Disables quantization for model weights.
     )
     logger.info("Model loaded successfully.")
 
@@ -208,7 +206,6 @@ def main():
         max_completion_length=max_length - sequence_length, # Max length for the completion.
         max_training_steps=None, # Max number of training steps (None for full dataset).
         max_evaluation_steps=None, # Max number of evaluation steps (None for full test set).
-        max_sequence_length=max_length, # Redundant but for clarity.
         loss_config=ed.LossConfig(z_loss=0.0), # DPO loss configuration, z_loss regularizes logits.
         track_memory=False, # Set to True to track memory usage (can add minor overhead).
         save_steps=1_000, # Save checkpoint every 1000 steps.

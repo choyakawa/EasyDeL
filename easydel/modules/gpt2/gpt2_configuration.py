@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 
 import typing
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -100,32 +100,33 @@ class GPT2Config(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vocab_size=50257,
-        n_positions=1024,
-        n_embd=768,
-        n_layer=12,
-        n_head=12,
-        n_inner=None,
-        activation_function="gelu_new",
-        resid_pdrop=0.1,
-        embd_pdrop=0.1,
-        attn_pdrop=0.1,
-        layer_norm_epsilon=1e-5,
-        initializer_range=0.02,
-        summary_type="cls_index",
-        summary_use_proj=True,
-        summary_activation=None,
-        summary_proj_to_labels=True,
-        summary_first_dropout=0.1,
-        scale_attn_weights=True,
-        use_cache=True,
-        bos_token_id=50256,
-        eos_token_id=50256,
-        scale_attn_by_inverse_layer_idx=False,
-        reorder_and_upcast_attn=False,
+        vocab_size: int = 50257,
+        n_positions: int = 1024,
+        n_embd: int = 768,
+        n_layer: int = 12,
+        n_head: int = 12,
+        n_inner: int | None = None,
+        activation_function: str = "gelu_new",
+        resid_pdrop: float = 0.1,
+        embd_pdrop: float = 0.1,
+        attn_pdrop: float = 0.1,
+        layer_norm_epsilon: float = 1e-5,
+        initializer_range: float = 0.02,
+        summary_type: str = "cls_index",
+        summary_use_proj: bool = True,
+        summary_activation: str | None = None,
+        summary_proj_to_labels: bool = True,
+        summary_first_dropout: float = 0.1,
+        scale_attn_weights: bool = True,
+        use_cache: bool = True,
+        bos_token_id: int = 50256,
+        eos_token_id: int = 50256,
+        scale_attn_by_inverse_layer_idx: bool = False,
+        reorder_and_upcast_attn: bool = False,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         tie_word_embeddings: bool = False,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initializes a GPT2Config object.
@@ -187,6 +188,9 @@ class GPT2Config(EasyDeLBaseConfig):
         self.eos_token_id = eos_token_id
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.n_layer
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -195,24 +199,15 @@ class GPT2Config(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"wte/embedding", pmag.resolve(ColumnWise)),
-            (r"wpe/embedding", pmag.resolve(Replicated)),
-            (r"(attn|crossattention)/c_attn/kernel", pmag.resolve(ColumnWise)),
-            (r"(attn|crossattention)/q_attn/kernel", pmag.resolve(ColumnWise)),
-            (r"(attn|crossattention)/c_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/c_fc/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/c_proj/kernel", pmag.resolve(RowWise)),
-            (r".*/(ln_1|ln_2|ln_cross_attn|ln_f)/scale", pmag.resolve(Replicated)),
-            (r".*/(ln_1|ln_2|ln_cross_attn|ln_f)/bias", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r".*(c_attn|q_attn|c_proj|c_fc|lm_head)/bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None

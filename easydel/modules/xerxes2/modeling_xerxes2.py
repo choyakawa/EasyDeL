@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,257 +14,300 @@
 
 
 import functools
+from typing import ClassVar
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheConfig,
+    TransformerCacheView,
+    TransformerMetadata,
+)
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
-    BaseModelOutput,
     DecoderLayerOutput,
     MoeCausalLMOutput,
     MoeModelOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
-    TransformerCache,
-    TransformerCacheMetaData,
-    TransformerCacheView,
-    TransformerMetadata,
-)
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.moe import (
+from easydel.infra.utils import ACT2FN, auto_remat
+from easydel.layers import (
     BaseMoeModule,
+    ColumnParallelLinear,
     ColumnParallelMoELinear,
+    Embed,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
+    RMSNorm,
+    RowParallelLinear,
     RowParallelMoELinear,
 )
-from easydel.layers.norms import RMSNorm
+from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.norms import LayerNorm
+from easydel.layers.rotary import yarn_get_mscale
+from easydel.modules._base import BaseCausalLMModule
 
 from .xerxes2_configuration import Xerxes2Config as Xerxes2Config
 
 logger = get_logger(__name__)
 
 
-class Xerxes2Attention(AttentionModule):
+class Xerxes2Attention(UnifiedAttention):
+    """Xerxes2 Multi-head Latent Attention (MLA) layer.
+
+    Implements Multi-head Latent Attention from DeepSeek-V2 architecture with compressed
+    key-value representations using LoRA-style low-rank projections and separate nope/rope
+    dimensions for efficient long-context processing.
+
+    Features:
+        - Compressed KV representation with low-rank LoRA projections
+        - Separate nope (non-positional) and rope (rotary) head dimensions
+        - Optional query LoRA compression for reduced memory footprint
+        - YaRN-based attention scaling for extended context lengths
+        - Grouped-query attention support via shared KV projections
+    """
+
+    projection_mapping: ClassVar[dict[str, str]] = {
+        "mla_q_proj": "q_proj",
+        "mla_q_a_proj": "q_a_proj",
+        "mla_q_a_layernorm": "q_a_layernorm",
+        "mla_q_b_proj": "q_b_proj",
+        "mla_kv_a_proj_with_mqa": "kv_a_proj_with_mqa",
+        "mla_kv_a_layernorm": "kv_a_layernorm",
+        "mla_kv_b_proj": "kv_b_proj",
+        "output_projection": "o_proj",
+    }
+
     def __init__(
         self,
         config: Xerxes2Config,
+        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(config=config)
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
+        """Initialize Xerxes2 Multi-head Latent Attention layer.
 
-        self.embed_dim = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.qhead_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
-        self.vhead_dim = config.vhead_dim
-
-        self.qk_rope_head_dim = config.qk_rope_head_dim
+        Args:
+            config (Xerxes2Config): Model configuration with MLA parameters including
+                qk_nope_head_dim, qk_rope_head_dim, vhead_dim, and kv_lora_dim.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
+        # Set MLA-specific dimensions before calling super().__init__()
+        # so they're available in define_network
+        self.config = config
+        self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
         self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.v_head_dim = config.vhead_dim
+        self.kv_lora_rank = config.kv_lora_dim
 
-        column_parallel_linear = functools.partial(
-            ColumnParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        row_parallel_linear = functools.partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            layer_idx=layer_idx,
+            attention_type="mla",
+            causal=True,
+            use_mla_lora=config.q_lora_dim is not None,
         )
 
-        if self.config.q_lora_dim is not None:
-            self.qa_proj = column_parallel_linear(config.hidden_size, config.q_lora_dim)
-            self.qa_norm = nn.LayerNorm(
-                config.q_lora_dim,
+        # Override head_dim for MLA - use value head dimension for output merging
+        self.head_dim = self.v_head_dim
+
+    def define_network(
+        self,
+        config: Xerxes2Config,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        precision: jax.lax.Precision,
+        rngs: nn.Rngs,
+    ):
+        """Define MLA-specific network structure for Xerxes2.
+
+        Creates the projection layers for Multi-head Latent Attention, including
+        optional LoRA compression for queries and mandatory LoRA compression for
+        key-value pairs.
+
+        Args:
+            config (Xerxes2Config): Model configuration.
+            dtype (jnp.dtype): Data type for computation.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision (jax.lax.Precision): Numerical precision for operations.
+            rngs (nn.Rngs): Random number generator state.
+        """
+
+        if not self.use_mla_lora:
+            setattr(
+                self,
+                self.projection_mapping["mla_q_proj"],
+                ColumnParallelLinear(
+                    config.hidden_size,
+                    config.num_attention_heads * self.q_head_dim,
+                    rngs=rngs,
+                    use_bias=False,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                    precision=precision,
+                ),
+            )
+        else:
+            setattr(
+                self,
+                self.projection_mapping["mla_q_a_proj"],
+                ColumnParallelLinear(
+                    config.hidden_size,
+                    config.q_lora_dim,
+                    rngs=rngs,
+                    use_bias=False,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                    precision=precision,
+                ),
+            )
+            setattr(
+                self,
+                self.projection_mapping["mla_q_a_layernorm"],
+                LayerNorm(
+                    config.q_lora_dim,
+                    rngs=rngs,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                ),
+            )
+            setattr(
+                self,
+                self.projection_mapping["mla_q_b_proj"],
+                ColumnParallelLinear(
+                    config.q_lora_dim,
+                    config.num_attention_heads * self.q_head_dim,
+                    rngs=rngs,
+                    use_bias=False,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                    precision=precision,
+                ),
+            )
+
+        setattr(
+            self,
+            self.projection_mapping["mla_kv_a_proj_with_mqa"],
+            ColumnParallelLinear(
+                config.hidden_size,
+                config.kv_lora_dim + config.qk_rope_head_dim,
+                rngs=rngs,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                precision=precision,
+            ),
+        )
+        setattr(
+            self,
+            self.projection_mapping["mla_kv_a_layernorm"],
+            LayerNorm(
+                config.kv_lora_dim,
                 rngs=rngs,
                 dtype=dtype,
                 param_dtype=param_dtype,
-            )
-            self.qb_proj = column_parallel_linear(config.q_lora_dim, self.num_heads * self.qhead_dim)
-        else:
-            self.qc_proj = column_parallel_linear(config.hidden_size, self.num_heads * self.qhead_dim)
-        self.kv_mqa_proj = column_parallel_linear(
-            config.hidden_size,
-            config.kv_lora_dim + config.qk_rope_head_dim,
+            ),
         )
-        self.kv_norm = nn.LayerNorm(
-            config.kv_lora_dim,
-            rngs=rngs,
-            dtype=dtype,
-            param_dtype=param_dtype,
+        setattr(
+            self,
+            self.projection_mapping["mla_kv_b_proj"],
+            ColumnParallelLinear(
+                config.kv_lora_dim,
+                config.num_attention_heads * (config.qk_nope_head_dim + config.vhead_dim),
+                rngs=rngs,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                precision=precision,
+            ),
         )
-        self.kvi_proj = column_parallel_linear(
-            config.kv_lora_dim,
-            self.num_heads * (self.qhead_dim - self.qk_rope_head_dim + self.vhead_dim),
+        setattr(
+            self,
+            self.projection_mapping["output_projection"],
+            RowParallelLinear(
+                config.num_attention_heads * self.v_head_dim,
+                config.hidden_size,
+                rngs=rngs,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                precision=precision,
+            ),
         )
-        self.o_proj = row_parallel_linear(
-            self.num_heads * self.vhead_dim,
-            self.config.hidden_size,
-        )
+        self.rotary = self._create_rotary(config, dtype)
+        self.attention_performer = self._create_attention_performer(config, rngs)
 
-        self.attention_performer = FlexibleAttentionModule(
+    def _create_attention_performer(self, config, rngs):
+        """Create attention performer module with YaRN scaling.
+
+        Args:
+            config: Model configuration with rope_scaling parameters.
+            rngs: Random number generator state.
+
+        Returns:
+            FlexibleAttentionModule: Configured attention performer with optional
+                YaRN-based mscale for extended context attention.
+        """
+        softmax_scale = self.q_head_dim**-0.5
+        if self.config.rope_scaling is not None:
+            mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
+            scaling_factor = self.config.rope_scaling["factor"]
+            if mscale_all_dim:
+                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
+                softmax_scale = softmax_scale * mscale * mscale
+        return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
-            softmax_scale=self.qhead_dim**-0.5,
+            softmax_scale=softmax_scale,
             dropout_prob=0.0,
-        )
-        self.rotary = self.config.get_basic_rope(
-            self.dtype,
-            self.qk_rope_head_dim,
-            self.qk_rope_head_dim,
-            config.rope_theta,
-        )
-
-    def _split_heads(self, hidden_states, num_heads):
-        return hidden_states.reshape((*hidden_states.shape[:2], num_heads, self.head_dim))
-
-    def __call__(
-        self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
-        frequencies: tuple[chex.Array, chex.Array],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
-        output_attentions: bool = False,
-    ):
-        """Forward pass of the attention module."""
-        batch_size, sequence_length = hidden_states.shape[:2]
-        if self.config.q_lora_dim is None:
-            query_states = self.qc_proj(hidden_states)
-        else:
-            query_states = self.qb_proj(self.qa_norm(self.qa_proj(hidden_states)))
-        query_states = query_states.reshape(
-            batch_size,
-            sequence_length,
-            self.num_heads,
-            self.qhead_dim,
-        )
-        compressed_kv = self.kv_mqa_proj(hidden_states)
-        compressed_kv = compressed_kv.reshape(
-            batch_size,
-            sequence_length,
-            1,
-            self.config.kv_lora_dim + self.config.qk_rope_head_dim,
-        )
-
-        q_nope, q_pe = (
-            query_states[..., : self.qk_nope_head_dim],
-            query_states[..., self.qk_nope_head_dim :],
-        )
-        k_pe = compressed_kv[..., self.config.kv_lora_dim :]
-        compressed_kv = compressed_kv[..., : self.config.kv_lora_dim]
-        kv = self.kvi_proj(self.kv_norm(compressed_kv))
-        value_states = kv[..., self.qk_nope_head_dim : self.qk_nope_head_dim + self.vhead_dim]
-        k_nope = kv[..., : self.qk_nope_head_dim]
-
-        q_pe, k_pe = self.rotary(
-            positions=position_ids,
-            query=q_pe,
-            key=k_pe,
-            frequencies=frequencies,
-        )
-
-        query_states = (
-            jnp.zeros(
-                (batch_size, sequence_length, self.num_heads, self.qhead_dim),
-                dtype=q_pe.dtype,
-            )
-            .at[..., : self.qk_nope_head_dim]
-            .set(q_nope)
-            .at[..., self.qk_nope_head_dim :]
-            .set(q_pe)
-        )
-        key_states = (
-            jnp.zeros(
-                (batch_size, sequence_length, 1, self.qhead_dim),
-                dtype=q_pe.dtype,
-            )
-            .at[..., : self.qk_nope_head_dim]
-            .set(k_nope)
-            .at[..., self.qk_nope_head_dim :]
-            .set(k_pe)
-        )
-
-        (
-            key_states,
-            value_states,
-            attention_mask,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-        )
-
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
-            causal=True,
-        )
-
-        attn_output = checkpoint_name(
-            self.o_proj(self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))), "attn_output"
-        )
-
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
         )
 
 
 class Xerxes2MLP(nn.Module):
+    """Multi-Layer Perceptron module for dense Xerxes2 decoder layers.
+
+    Implements a gated feedforward network with SiLU activation using fused gate/up
+    projections for efficient computation. Used in non-MoE decoder layers.
+
+    Features:
+        - Fused gate_up projection for memory efficiency
+        - SiLU (Swish) gating activation
+        - Column/Row parallel linear layers for tensor parallelism
+    """
+
     def __init__(
         self,
         config: Xerxes2Config,
@@ -274,6 +317,16 @@ class Xerxes2MLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Xerxes2 MLP block.
+
+        Args:
+            config (Xerxes2Config): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -289,7 +342,6 @@ class Xerxes2MLP(nn.Module):
             precision=precision,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         row_parallel_linear = functools.partial(
             RowParallelLinear,
@@ -299,12 +351,21 @@ class Xerxes2MLP(nn.Module):
             precision=precision,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.gate_up_proj = column_parallel_linear(config.hidden_size, 2 * config.intermediate_size, rngs=rngs)
         self.down_proj = row_parallel_linear(config.intermediate_size, config.hidden_size, rngs=rngs)
 
-    def __call__(self, hidden_states):
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply gated feedforward transformation with fused projections.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
+
+        Returns:
+            Transformed hidden states [batch, seq_len, hidden_dim]
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -322,7 +383,16 @@ class Xerxes2MLP(nn.Module):
 
 
 class Xerxes2MoeMLPStack(nn.Module):
-    """Xerxes2Moe MoE MLP using the new ParallelMoELinear layers."""
+    """Mixture-of-Experts MLP stack using parallel MoE linear layers.
+
+    Implements the expert feedforward networks for the MoE block with efficient
+    parallel computation across all experts simultaneously.
+
+    Features:
+        - Parallel gate/up/down projections across all experts
+        - Expert tensor mode for efficient batched computation
+        - Configurable hidden activation function
+    """
 
     def __init__(
         self,
@@ -333,6 +403,17 @@ class Xerxes2MoeMLPStack(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Xerxes2 MoE MLP stack.
+
+        Args:
+            config (Xerxes2Config): Model configuration with MoE parameters including
+                num_experts and moe_intermediate_size.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -345,8 +426,10 @@ class Xerxes2MoeMLPStack(nn.Module):
             rngs=rngs,
             kernel_init=nn.initializers.normal(),
             use_bias=False,
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
         )
         self.down_proj = RowParallelMoELinear(
             num_experts=config.num_experts,
@@ -355,8 +438,10 @@ class Xerxes2MoeMLPStack(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
         )
         self.up_proj = ColumnParallelMoELinear(
             num_experts=config.num_experts,
@@ -365,36 +450,62 @@ class Xerxes2MoeMLPStack(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, hidden_states: chex.Array, group_sizes: chex.Array) -> chex.Array:
-        """Forward pass through MoE MLP."""
+    def __call__(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
+    ) -> Array:
+        """Apply gated MoE feedforward transformation.
+
+        Processes routed tokens through the parallel expert MLPs with gated activation.
+
+        Args:
+            hidden_states: Input tensor for routed tokens.
+            group_sizes: Number of tokens assigned to each expert.
+            sorted_experts: Optional sorted expert indices for efficient routing.
+
+        Returns:
+            Transformed hidden states after expert processing.
+        """
         return checkpoint_name(
             self.down_proj(
-                self.act_fn(self.gate_proj(hidden_states, group_sizes)) * self.up_proj(hidden_states, group_sizes),
+                self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts))
+                * self.up_proj(hidden_states, group_sizes, sorted_experts),
                 group_sizes,
+                sorted_experts,
             ),
             "moe_output",
         )
 
 
 class Xerxes2MoeSparseBlock(BaseMoeModule):
-    """Sparse Mixture of Experts (MoE) block for Xerxes2 MoE.
+    """Sparse Mixture-of-Experts block for Xerxes2 models.
 
-    This block routes input hidden states to a selected subset of experts
-    and combines their outputs.
+    Implements a top-k routing mechanism where each token is processed by
+    a subset of expert MLPs, enabling parameter-efficient scaling. Uses
+    configurable routing and load balancing strategies.
+
+    Features:
+        - Top-k expert selection with configurable routing strategy
+        - Optional probability normalization via norm_topk_prob
+        - Standard load balancing for training stability
+        - Efficient parallel expert computation via MLP stack
 
     Attributes:
-        config (Xerxes2MoeConfig): Configuration object for the model.
-        gate (ParallelLinear): Linear layer for the gating network.
-        experts (nn.List[Xerxes2MoeMLP]): List of expert MLP modules.
+        config (Xerxes2Config): Configuration object for the model.
+        gate (ColumnParallelLinear): Linear layer for the gating/routing network.
+        experts (Xerxes2MoeMLPStack): Parallel expert MLP modules.
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
     """
 
     def __init__(
@@ -406,14 +517,16 @@ class Xerxes2MoeSparseBlock(BaseMoeModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Xerxes2MoeSparseBlock module.
+        """Initialize Xerxes2 Sparse MoE block.
 
         Args:
-            config (Xerxes2MoeConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (Xerxes2Config): Model configuration with MoE parameters including
+                num_experts and num_experts_per_tok.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -448,29 +561,46 @@ class Xerxes2MoeSparseBlock(BaseMoeModule):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: chex.Array) -> tuple[chex.Array, chex.Array]:
-        """Forward pass of the Sparse MoE block.
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
+        """Apply sparse MoE transformation with top-k expert routing.
+
+        Routes each token to a subset of experts based on gating scores,
+        processes through the selected experts, and combines outputs.
 
         Args:
-            hidden_states (chex.Array): Input hidden states (batch_size * sequence_length, hidden_dim).
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
 
         Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing:
-                - final_hidden_states (chex.Array): The output hidden states after MoE processing.
-                - router_logits (chex.Array): The logits output by the gating network.
+            tuple: A tuple containing:
+                - final_hidden_states: Transformed hidden states [batch, seq_len, hidden_dim]
+                - router_logits: Router logits for load balancing loss [batch, seq_len, num_experts]
         """
-        out, router_logits = self._moe_call(
+        out, router_logits = self.moe_call(
+            hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            hidden_state=hidden_states,
-            output_metrics=False,
-            validate_inputs=True,
-            apply_capacity_constraint=False,
+            wi_kernel=self.experts.gate_proj.kernel.value,
+            wu_kernel=self.experts.up_proj.kernel.value,
+            wd_kernel=self.experts.down_proj.kernel.value,
+            act_fn=self.experts.act_fn,
         )
-        return out, router_logits
+        return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
 class Xerxes2DecoderLayer(nn.Module):
+    """Single decoder layer for Xerxes2 models.
+
+    Combines Multi-head Latent Attention with either dense MLP or sparse MoE
+    feedforward networks. Uses pre-norm architecture with RMS normalization
+    and residual connections.
+
+    Features:
+        - Multi-head Latent Attention (MLA) with compressed KV
+        - Layer-specific MoE vs dense MLP selection based on decoder_sparse_step
+        - Pre/post normalization for both attention and feedforward blocks
+        - Gradient checkpointing support for memory efficiency
+    """
+
     def __init__(
         self,
         config: Xerxes2Config,
@@ -481,6 +611,16 @@ class Xerxes2DecoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Xerxes2 decoder layer.
+
+        Args:
+            config (Xerxes2Config): Model configuration.
+            layer_idx (int): Index of this layer in the model, used to determine MoE vs dense.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -496,7 +636,8 @@ class Xerxes2DecoderLayer(nn.Module):
             exclude_names=config.gradient_checkpointing_targets,
         )
         self.self_attn = attn_block(
-            self.config,
+            config=self.config,
+            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -535,26 +676,36 @@ class Xerxes2DecoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
-        frequencies: tuple[chex.Array, chex.Array],
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo,
+        position_ids: Int[Array, "batch seq_len"],
+        frequencies: tuple[Array, Array],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
-    ):
-        """
-        Forward pass of the module block.
+    ) -> DecoderLayerOutput:
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture with MLA attention followed by
+        either dense MLP or sparse MoE feedforward, with residual connections.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            frequencies (tuple[Array, Array]): Precomputed RoPE frequencies (cos, sin).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view
+                for key-value caching during generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata for cache management. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            output_router_logits (bool, optional): Whether to return MoE router logits. Defaults to False.
+
         Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+            DecoderLayerOutput: Contains hidden states, attention weights, router logits, and cache view.
         """
         residual = hidden_states
 
@@ -566,15 +717,14 @@ class Xerxes2DecoderLayer(nn.Module):
         )
         attn_outputs = self.self_attn(
             hidden_states,
-            attention_mask,
+            mask_info,
             position_ids,
-            causal_mask,
-            frequencies,
             mode,
             cache_view,
             cache_metadata,
-            segment_ids,
             output_attentions,
+            frequencies,
+            None,
         )
         hidden_states = self.post_attention_layernorm(attn_outputs.attention_output)
         hidden_states = residual + hidden_states
@@ -603,6 +753,25 @@ class Xerxes2DecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Xerxes2Config, model_type="xerxes2")
 class Xerxes2Model(EasyDeLBaseModule):
+    """Xerxes2 base model implementation.
+
+    Implements the Xerxes2 decoder-only transformer architecture with Multi-head
+    Latent Attention (MLA), hybrid dense/MoE feedforward layers, and RMSNorm.
+    Supports efficient long-context processing via compressed KV representations.
+
+    Features:
+        - Multi-head Latent Attention with LoRA-compressed KV states
+        - Hybrid architecture with configurable dense/MoE layer patterns
+        - YaRN-based rotary position embeddings for extended contexts
+        - Gradient checkpointing for memory-efficient training
+
+    Attributes:
+        config (Xerxes2Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
+
     def __init__(
         self,
         config: Xerxes2Config,
@@ -612,6 +781,15 @@ class Xerxes2Model(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Xerxes2 base model.
+
+        Args:
+            config (Xerxes2Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -620,13 +798,7 @@ class Xerxes2Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             config.vocab_size,
             config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
@@ -634,17 +806,19 @@ class Xerxes2Model(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = [
-            Xerxes2DecoderLayer(
-                config=config,
-                layer_idx=layer_idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for layer_idx in range(config.num_hidden_layers)
-        ]
+        self.layers = nn.List(
+            [
+                Xerxes2DecoderLayer(
+                    config=config,
+                    layer_idx=layer_idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(
             dim=config.hidden_size,
             eps=config.rms_norm_eps,
@@ -654,23 +828,64 @@ class Xerxes2Model(EasyDeLBaseModule):
 
     @functools.cached_property
     def frequencies(self) -> jnp.ndarray:
-        """Returns frequency values from the config."""
-        return self.config.get_basic_frequencies(self.config.qk_rope_head_dim)
+        """Compute and cache rotary position embedding frequencies.
+
+        Returns:
+            jnp.ndarray: Precomputed RoPE frequencies for the rope head dimension.
+        """
+        return self.config.get_basic_frequencies(self.config.qk_rope_head_dim)  # pyright: ignore[reportReturnType]
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-    ) -> BaseModelOutput:
+    ) -> MoeModelOutput:
+        """Forward pass through the Xerxes2 base model.
+
+        Processes input tokens through embedding, all decoder layers with MLA attention
+        and hybrid dense/MoE feedforward, and final normalization.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return MoE router logits from all layers.
+                Defaults to None.
+
+        Returns:
+            MoeModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                past_key_values, and optional router_logits.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -679,7 +894,7 @@ class Xerxes2Model(EasyDeLBaseModule):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(inputs=input_ids.astype("i4"))
 
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits
@@ -691,16 +906,14 @@ class Xerxes2Model(EasyDeLBaseModule):
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-        else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         hidden_states = inputs_embeds
         if mode is None:
@@ -723,15 +936,13 @@ class Xerxes2Model(EasyDeLBaseModule):
 
             layer_outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
-                causal_mask=self.causal_mask,
                 output_attentions=output_attentions,
                 output_router_logits=output_router_logits,
-                segment_ids=segment_ids,
                 frequencies=self.frequencies,
             )
             hidden_states = layer_outputs.hidden_states
@@ -783,8 +994,30 @@ class Xerxes2Model(EasyDeLBaseModule):
         return self.embed_tokens
 
 
-@register_module(TaskType.CAUSAL_LM, config=Xerxes2Config, model_type="xerxes2")
-class Xerxes2ForCausalLM(EasyDeLBaseModule):
+class Xerxes2ForCausalLM(BaseCausalLMModule[Xerxes2Model, Xerxes2Config]):  # type: ignore
+    """Xerxes2 model with a language modeling head for causal language modeling tasks.
+
+    Extends the base Xerxes2Model by adding a linear language modeling head for
+    autoregressive text generation. Supports hybrid dense/MoE architecture with
+    auxiliary load balancing loss for stable MoE training.
+
+    Features:
+        - Multi-head Latent Attention for efficient KV caching
+        - Hybrid dense/MoE feedforward with configurable layer patterns
+        - Auxiliary load balancing loss for MoE expert utilization
+        - YaRN-based position embeddings for extended context support
+
+    Attributes:
+        config (Xerxes2Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "xerxes2"
+    _config_class = Xerxes2Config
+
     def __init__(
         self,
         config: Xerxes2Config,
@@ -794,174 +1027,144 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the Xerxes2ForCausalLM model.
+
+        Args:
+            config (Xerxes2Config): The model configuration.
+            dtype (jnp.dtype, optional): The data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): The data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): The precision to use for matrix multiplication.
+                Defaults to None.
+            rngs (nn.Rngs): The random number generators.
+        """
         super().__init__(
             config=config,
+            base_model_class=Xerxes2Model,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = Xerxes2Model(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            self.config.hidden_size,
-            self.config.vocab_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            lm_head_bias=False,
+            router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
     ) -> MoeCausalLMOutput:
-        outputs = self.model(
+        """Forward pass through the Xerxes2 causal language model.
+
+        Processes input through the base model and applies the language modeling head
+        with optional MoE auxiliary loss computation.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the language modeling head. Defaults to True.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return MoE router logits from all layers.
+                Defaults to None.
+
+        Returns:
+            MoeCausalLMOutput: Contains logits, hidden_states, last_hidden_state, attentions,
+                past_key_values, router_logits, and auxiliary loss.
+        """
+        return self.forward_moe(
             input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            output_router_logits=output_router_logits,
             mode=mode,
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
-            inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
+            apply_lm_head=apply_lm_head,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
+            aux_loss_fn=self._compute_aux_loss,
         )
 
-        hidden_states = outputs.last_hidden_state
+    def _compute_aux_loss(self, outputs, attention_mask):
+        """Compute auxiliary load balancing loss for MoE layers.
 
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+        Calculates the auxiliary loss that encourages balanced expert utilization
+        across all MoE layers, scaled by the router_aux_loss_coef.
+
+        Args:
+            outputs: Model outputs containing router_logits from MoE layers.
+            attention_mask: Attention mask to exclude padding tokens from loss computation.
+
+        Returns:
+            Auxiliary loss value if router_logits are available, None otherwise.
+        """
+        if outputs.router_logits is None or len(outputs.router_logits) == 0:
+            return None
+
+        aux_loss = auxiliary_load_balancing_loss_func(
+            gate_logits=outputs.router_logits,
+            num_experts=self.config.num_experts,
+            top_k=self.config.num_experts_per_tok,
+            attention_mask=attention_mask,
         )
 
-        lm_logits = None
-        if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
-        aux_loss = None
-        if output_router_logits and outputs.router_logits is not None:
-            aux_loss = auxiliary_load_balancing_loss_func(
-                gate_logits=outputs.router_logits,
-                num_experts=self.config.num_experts,
-                top_k=self.config.num_experts_per_tok,
-                attention_mask=attention_mask,
-            )
-            aux_loss += aux_loss * self.config.router_aux_loss_coef
+        return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
 
-        return MoeCausalLMOutput(
-            logits=lm_logits,
-            aux_loss=aux_loss,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            past_key_values=outputs.past_key_values,
-        )
+    def create_transformer_cache_config(self, batch_size: int, max_length: int):
+        """Create cache configuration for MLA-based key-value caching.
 
-    def create_cache_metadata(
-        self,
-        batch_size: int,
-        max_length: int,
-        pad_token_id: int | None = None,
-    ):
-        if pad_token_id is None:
-            if hasattr(self, "generation_config"):
-                pad_token_id = self.generation_config.pad_token_id
-            elif hasattr(self.config, "pad_token_id"):
-                pad_token_id = self.config.pad_token_id
-            else:
-                pad_token_id = 0
+        Creates a TransformerCacheConfig with dimensions appropriate for Multi-head
+        Latent Attention, using separate key and value dimensions based on the
+        nope/rope head dimensions.
+
+        Args:
+            batch_size: Number of sequences in the batch.
+            max_length: Maximum sequence length for the cache.
+
+        Returns:
+            TransformerCacheConfig: Configuration for initializing the KV cache
+                with MLA-specific key_dim (qk_rope + qk_nope) and value_dim (vhead_dim).
+        """
         head_dim = getattr(self.config, "head_dim", None)
         if head_dim is None:
             head_dim = self.config.hidden_size // self.config.num_attention_heads
         num_key_value_heads = getattr(self.config, "num_key_value_heads", None)
         if num_key_value_heads is None:
             num_key_value_heads = self.config.num_attention_heads
-        return TransformerCacheMetaData.create(
+        return TransformerCacheConfig.create(
             num_hidden_layers=self.config.num_hidden_layers,
             batch_size=batch_size,
             sequence_length=max_length,
-            num_heads=1,
+            num_heads=self.config.num_attention_heads,
             key_dim=self.config.qk_rope_head_dim + self.config.qk_nope_head_dim,
             value_dim=self.config.vhead_dim,
         )
-
-    def init_cache(
-        self,
-        batch_size: int,
-        max_length: int,
-        starts: int | None = None,
-        shardings: dict | None = None,
-        pad_token_id: int | None = None,
-    ):
-        shardings = shardings or dict()
-        return TransformerCache.init_cache(
-            dtype=self.config.kvdtype,
-            partition_manager=self.config.partition_manager,
-            metadata=self.create_cache_metadata(
-                batch_size=batch_size,
-                max_length=max_length,
-                pad_token_id=pad_token_id,
-            ),
-            quantizer=self._quant_class(
-                quantization_method=self.config.kv_cache_quantization_method,
-                block_size=self.config.kv_cache_quantization_blocksize,
-                quantization_platform=self.config.platform,
-            ),
-            mesh=self.config.mesh,
-            starts=starts,
-            mask_type_details=self.config.get_mask_details(),
-        )
-
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
-        """
-        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
-
-    def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
-        return self.model.get_decoder()
-
-    def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        """
-        return self.lm_head
-
-    def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
-        return self.model.get_embedding()

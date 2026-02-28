@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -36,7 +36,7 @@ Key Features:
 Example:
     >>> from easydel.trainers import SFTConfig, SFTTrainer
     >>> config = SFTConfig(
-    ...     max_sequence_length=2048,
+    ...     max_length=2048,
     ...     learning_rate=2e-5,
     ...     packing=True,
     ...     num_train_epochs=3

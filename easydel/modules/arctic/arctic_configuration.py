@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, ExpertColumnWiseAlt, ExpertRowWiseAlt, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -108,35 +108,35 @@ class ArcticConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vocab_size=32000,
-        hidden_size=4096,
-        intermediate_size=14336,
-        num_hidden_layers=32,
-        num_attention_heads=32,
-        num_key_value_heads=None,
-        hidden_act="silu",
-        max_position_embeddings=4096,
-        initializer_range=0.02,
-        rms_norm_eps=1e-5,
-        use_cache=True,
-        pad_token_id=None,
-        bos_token_id=1,
-        eos_token_id=2,
-        tie_word_embeddings=False,
-        rope_theta=1e6,
-        sliding_window=None,
-        attention_dropout=0.0,
-        num_experts_per_tok=1,
-        num_local_experts=8,
-        router_aux_loss_coef=0.001,
-        moe_layer_frequency=2,
-        parallel_attn_mlp_res=False,
-        moe_train_capacity_factor=1,
-        moe_eval_capacity_factor=1,
-        enable_expert_tensor_parallelism=False,
-        moe_min_capacity=0,
-        moe_token_dropping=True,
-        quantization=None,
+        vocab_size: int = 32000,
+        hidden_size: int = 4096,
+        intermediate_size: int = 14336,
+        num_hidden_layers: int = 32,
+        num_attention_heads: int = 32,
+        num_key_value_heads: int | None = None,
+        hidden_act: str = "silu",
+        max_position_embeddings: int = 4096,
+        initializer_range: float = 0.02,
+        rms_norm_eps: float = 1e-5,
+        use_cache: bool = True,
+        pad_token_id: int | None = None,
+        bos_token_id: int = 1,
+        eos_token_id: int = 2,
+        tie_word_embeddings: bool = False,
+        rope_theta: float = 1e6,
+        sliding_window: int | None = None,
+        attention_dropout: float = 0.0,
+        num_experts_per_tok: int = 1,
+        num_local_experts: int = 8,
+        router_aux_loss_coef: float = 0.001,
+        moe_layer_frequency: int = 2,
+        parallel_attn_mlp_res: bool = False,
+        moe_train_capacity_factor: float = 1,
+        moe_eval_capacity_factor: float = 1,
+        enable_expert_tensor_parallelism: bool = False,
+        moe_min_capacity: int = 0,
+        moe_token_dropping: bool = True,
+        quantization: str | None = None,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         use_scan_mlp: bool = False,
         scan_mlp_chunk_size: int = 1024,
@@ -186,7 +186,7 @@ class ArcticConfig(EasyDeLBaseConfig):
         if self.layer_types is None:
             self.layer_types = [
                 "sliding_attention" if self.sliding_window is not None else "full_attention"
-                for i in range(self.num_hidden_layers)
+                for _ in range(self.num_hidden_layers)
             ]
         super().__init__(
             pad_token_id=pad_token_id,
@@ -196,26 +196,18 @@ class ArcticConfig(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs):
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
+        Returns:
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        Shard parameters for Arctic model with MoE support.
-        """
-        pmag = self.partition_manager
-        return (
-            (r"model/embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"block_sparse_moe/gate/kernel", pmag.resolve(ColumnWise)),
-            (r"block_sparse_moe/experts/.*/(w1|w3)/kernel", pmag.resolve(ExpertColumnWiseAlt)),
-            (r"block_sparse_moe/experts/.*/w2/kernel", pmag.resolve(ExpertRowWiseAlt)),
-            (r"block_sparse_moe/mlp/(w1|w3)/kernel", pmag.resolve(ColumnWise)),
-            (r"block_sparse_moe/mlp/w2/kernel", pmag.resolve(RowWise)),
-            (r"residual_mlp/(w1|w3)/kernel", pmag.resolve(ColumnWise)),
-            (r"residual_mlp/w2/kernel", pmag.resolve(RowWise)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"score/kernel", pmag.resolve(RowWise)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
         """Retrieve attention mask details for each layer in the model.

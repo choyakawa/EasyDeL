@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,264 +13,276 @@
 # limitations under the License.
 
 
+import typing
 from functools import cached_property
 
-import chex
 import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
+from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
+from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers.attention import UnifiedAttention
+from easydel.modules._base import BaseCausalLMModule
 
 from .openelm_configuration import OpenELMConfig, make_divisible
 
 
-class OpenELMMultiHeadCausalAttention(AttentionModule):
-    """OpenELM Multi-Head Causal Attention module.
+class OpenELMMultiHeadCausalAttention(UnifiedAttention):
+    """Multi-head causal attention layer for OpenELM models.
 
-    This module implements the multi-head causal self-attention mechanism used in the OpenELM model.
-    It supports Grouped Query Attention (GQA) and optional RMS Normalization of query and key projections.
-
-    Attributes:
-        config (OpenELMConfig): Configuration object for the model.
-        layer_idx (int): The index of the current layer.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        qkv_proj (ParallelLinear): Combined linear layer for query, key, and value projections.
-        q_norm (RMSNorm, optional): RMS Normalization applied to the query projection if enabled.
-        k_norm (RMSNorm, optional): RMS Normalization applied to the key projection if enabled.
-        out_proj (ParallelLinear): Linear layer for the output projection.
-        head_dim (int): Dimensionality of each attention head.
-        attention_performer (FlexibleAttentionModule): Module to perform the core attention computation.
-        num_q_heads (int): Number of query heads.
-        num_k_heads (int): Number of key heads.
-        num_v_heads (int): Number of value heads.
-        transformer_dim (int): Dimensionality of the transformer model.
-        num_groups (int): Number of query groups for GQA.
-        rotary (RoPE): Rotary position embedding module.
+    Implements attention with per-layer head configuration, supporting variable
+    numbers of query and key-value heads across different layers. Uses fused
+    QKV projections and optional QK normalization for improved training stability.
     """
+
+    projection_mapping: typing.ClassVar = dict(UnifiedAttention.projection_mapping)
+    projection_mapping.update(
+        {
+            "query_key_value_projection": "qkv_proj",
+            "output_projection": "out_proj",
+        }
+    )
 
     def __init__(
         self,
         config: OpenELMConfig,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
-        """Initializes the OpenELMMultiHeadCausalAttention module.
+        """Initialize OpenELM attention layer with per-layer head configuration.
 
         Args:
-            config (OpenELMConfig): The configuration object for the OpenELM model.
-            layer_idx (int): The index of the current decoder layer.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (OpenELMConfig): Model configuration with per-layer attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer, used to determine head counts.
         """
-        super().__init__(config=config)
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
         self.layer_idx = layer_idx
-        head_dim = config.head_dim
-        q_heads = config.num_query_heads[layer_idx]
-        k_heads = config.num_kv_heads[layer_idx]
-        v_heads = config.num_kv_heads[layer_idx]
+        self.num_q_heads = config.num_query_heads[layer_idx]
+        self.num_k_heads = config.num_kv_heads[layer_idx]
+        self.num_v_heads = config.num_kv_heads[layer_idx]
+        self.head_dim = config.head_dim
+        original_num_heads = getattr(config, "num_attention_heads", None)
+        original_num_kv_heads = getattr(config, "num_key_value_heads", None)
+        config.num_attention_heads = self.num_q_heads
+        config.num_key_value_heads = self.num_k_heads
+        try:
+            super().__init__(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                layer_idx=layer_idx,
+                attention_type="standard",
+                causal=True,
+                use_fused_qkv=True,
+                use_gqa=True,
+            )
+        finally:
+            if original_num_heads is None:
+                delattr(config, "num_attention_heads")
+            else:
+                config.num_attention_heads = original_num_heads
+            if original_num_kv_heads is None:
+                delattr(config, "num_key_value_heads")
+            else:
+                config.num_key_value_heads = original_num_kv_heads
+        # Override base head bookkeeping with per-layer values
+        self.num_heads = self.num_q_heads
+        self.num_key_value_heads = self.num_k_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.transformer_dim = config.model_dim
 
+    def define_network(
+        self,
+        config: OpenELMConfig,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        precision: jax.lax.PrecisionLike,
+        rngs: nn.Rngs,
+    ) -> None:
+        """Define the attention network components.
+
+        Creates the fused QKV projection, output projection, optional QK normalization
+        layers, rotary embeddings, and attention performer.
+
+        Args:
+            config (OpenELMConfig): Model configuration.
+            dtype (jnp.dtype): Data type for computation.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision (jax.lax.PrecisionLike): Numerical precision for operations.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.qkv_proj = ColumnParallelLinear(
             config.model_dim,
-            (q_heads + k_heads + v_heads) * head_dim,
+            (self.num_q_heads + self.num_k_heads + self.num_v_heads) * self.head_dim,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
+
+        self.out_proj = RowParallelLinear(
+            self.num_q_heads * self.head_dim,
+            config.model_dim,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            precision=precision,
+            rngs=rngs,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+        )
+
         if config.normalize_qk_projections:
             self.q_norm = RMSNorm(
-                dim=config.head_dim,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
+                dim=self.head_dim,
+                dtype=dtype,
+                param_dtype=param_dtype,
                 eps=1e-6,
                 rngs=rngs,
             )
             self.k_norm = RMSNorm(
-                dim=config.head_dim,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
+                dim=self.head_dim,
+                dtype=dtype,
+                param_dtype=param_dtype,
                 eps=1e-6,
                 rngs=rngs,
             )
         else:
             self.q_norm = None
             self.k_norm = None
+        self.rotary = self._create_rotary(config, dtype)
+        self.attention_performer = self._create_attention_performer(config, rngs)
 
-        self.out_proj = RowParallelLinear(
-            q_heads * head_dim,
-            config.model_dim,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            precision=precision,
-            rngs=rngs,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        self.head_dim = head_dim
-
-        self.attention_performer = FlexibleAttentionModule(
-            rngs=rngs,
-            base_config=config,
-            softmax_scale=self.head_dim**-0.5,
-            dropout_prob=0.0,
-        )
-
-        self.head_dim = config.head_dim
-        self.num_q_heads = q_heads
-        self.num_k_heads = k_heads
-        self.num_v_heads = v_heads
-        self.transformer_dim = config.model_dim
-        self.num_groups = self.num_q_heads // self.num_k_heads
-
-        self.rotary = self.config.get_basic_rope(
-            self.dtype,
-            head_size=self.config.head_dim,
-            rotary_dim=self.config.head_dim,
-            base=self.config.rope_freq_constant,
-        )
-
-    def _merge_heads(self, hidden_states):
-        """
-        Merges the attention heads into a single hidden state tensor.
-
-        Args:
-            hidden_states (chex.Array): The hidden states with separate head dimensions.
-
-        Returns:
-            chex.Array: The hidden states with merged head dimensions.
-        """
-        return hidden_states.reshape((*hidden_states.shape[:2], self.num_q_heads * self.head_dim))
-
-    def __call__(
+    def _postprocess_qkv(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
-        output_attentions: bool = False,
-        fcm_mask: chex.Array | None = None,
-        frequencies: chex.Array | None = None,
-    ):
-        """
-        Forward pass of the OpenELMMultiHeadCausalAttention module.
+        query_states: jnp.ndarray,
+        key_states: jnp.ndarray,
+        value_states: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Apply optional QK normalization to query and key states.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (bool): Whether to return attention weights. Default is False.
-            fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+            query_states (jnp.ndarray): Query tensor.
+            key_states (jnp.ndarray): Key tensor.
+            value_states (jnp.ndarray): Value tensor.
 
         Returns:
-            tp.Union[tp.Tuple[chex.Array, chex.Array], tp.Tuple[chex.Array]]:
-                A tuple containing the attention output hidden states. If `output_attentions` is True,
-                it also includes the attention weights.
+            tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]: Normalized query, key, and value states.
+        """
+        if self.q_norm is not None:
+            query_states = self.q_norm(query_states)
+        if self.k_norm is not None:
+            key_states = self.k_norm(key_states)
+        return query_states, key_states, value_states
+
+    def _create_rotary(self, config: OpenELMConfig, dtype: jnp.dtype):
+        """Create rotary position embedding for this attention layer.
+
+        Args:
+            config (OpenELMConfig): Model configuration with RoPE parameters.
+            dtype (jnp.dtype): Data type for the rotary embeddings.
+
+        Returns:
+            Rotary embedding module for applying positional information.
+        """
+        return config.get_basic_rope(
+            dtype,
+            head_size=config.head_dim,
+            rotary_dim=config.head_dim,
+            base=config.rope_freq_constant,
+        )
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
+        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+        alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
+    ) -> AttentionLayerOutput:
+        """Forward pass through the attention layer.
+
+        Computes multi-head attention with rotary position embeddings and optional
+        KV caching for efficient autoregressive generation.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, seq_len, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, seq_len).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view
+                for KV states. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache operations. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+            alibi (Array | None, optional): ALiBi attention biases. Defaults to None.
+
+        Returns:
+            AttentionLayerOutput: Contains attention output, optional attention weights, and cache view.
         """
         batch_size, sequence_length = hidden_states.shape[:2]
 
-        # [B, S, d] --> [B, S, (q_h + k_h + v_h) * h]
-        qkv = checkpoint_name(self.qkv_proj(hidden_states), "attn_qkv")
-        # [B, S, (q_h + k_h + v_h) * h] --> [B, S, (q_h + k_h + v_h), h]
+        qkv = checkpoint_name(self.query_key_value_projection(hidden_states), "attn_qkv")
         qkv = qkv.reshape(
             batch_size,
             sequence_length,
             self.num_q_heads + self.num_k_heads + self.num_v_heads,
             self.head_dim,
         )
-        # [B, S, (q_h + k_h + v_h), h] --> [B, (q_h + k_h + v_h), S, h]
-        qkv = qkv.transpose(0, 2, 1, 3)
-        # [B, (q_h + k_h + v_h), S, h] --> [B, q_h, S h], [B, k_h, S, h], [B, v_h, S, h]
-        query_states = qkv[
-            :,
-            : self.num_q_heads,
-            :,
-            :,
-        ]
-        key_states = qkv[
-            :,
-            self.num_q_heads : self.num_k_heads + self.num_q_heads,
-            :,
-            :,
-        ]
-        value_states = qkv[
-            :,
-            self.num_k_heads + self.num_q_heads :,
-            :,
-            :,
-        ]
-        if self.q_norm is not None:
-            query_states = checkpoint_name(self.q_norm(query_states), "attn_query")
-        else:
-            query_states = checkpoint_name(query_states, "attn_query")
+        query_states = qkv[:, :, : self.num_q_heads, :]
+        key_states = qkv[:, :, self.num_q_heads : self.num_q_heads + self.num_k_heads, :]
+        value_states = qkv[:, :, self.num_q_heads + self.num_k_heads :, :]
 
-        if self.k_norm is not None:
-            key_states = checkpoint_name(self.k_norm(key_states), "attn_key")
-        else:
-            key_states = checkpoint_name(key_states, "attn_key")
-
-        value_states = checkpoint_name(value_states, "attn_value")
-        query_states, key_states, value_states = map(
-            lambda x: x.transpose(0, 2, 1, 3),
-            [query_states, key_states, value_states],
-        )
-
+        query_states, key_states, value_states = self._postprocess_qkv(query_states, key_states, value_states)
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
+        query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
 
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
+        causal_for_kernel = self.causal
+        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+            causal_for_kernel = False
+
+        sliding_window_for_kernel = self.sliding_window
+        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
+            sliding_window_for_kernel = None
 
         (
             key_states,
             value_states,
-            attention_mask,
+            mask_info,
             init_attention_bias,
             cache_view,
             cache_metadata,
@@ -279,12 +291,14 @@ class OpenELMMultiHeadCausalAttention(AttentionModule):
             key=key_states,
             value=value_states,
             cache_view=cache_view,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            fcm_mask=fcm_mask,
+            cache_metadata=cache_metadata,
+            mask_info=mask_info,
         )
 
-        attentions = self.attention_performer.forward(
+        softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
+        softmax_aux = getattr(softmax_aux, "value", softmax_aux)
+
+        attentions: AttentionLayerOutput = self.attention_performer.forward(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
@@ -293,14 +307,14 @@ class OpenELMMultiHeadCausalAttention(AttentionModule):
             cache_metadata=cache_metadata,
             cache_view=cache_view,
             init_bias=init_attention_bias,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
-            causal=True,
+            mask_info=mask_info,
+            causal=causal_for_kernel,
+            sliding_window=sliding_window_for_kernel,
+            softmax_aux=softmax_aux,
         )
 
-        attn_output = checkpoint_name(
-            self.out_proj(self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))), "attn_output"
-        )
+        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
+        attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -332,12 +346,12 @@ class OpenELMFeedForwardNetwork(nn.Module):
     def __init__(
         self,
         config: OpenELMConfig,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the OpenELMFeedForwardNetwork module.
 
@@ -359,7 +373,7 @@ class OpenELMFeedForwardNetwork(nn.Module):
         ffn_multiplier = config.ffn_multipliers[layer_idx]
         intermediate_dim = int(
             make_divisible(
-                ffn_multiplier * config.model_dim,  # type:ignore
+                ffn_multiplier * config.model_dim,
                 divisor=config.ffn_dim_divisor,
             )
         )
@@ -374,7 +388,6 @@ class OpenELMFeedForwardNetwork(nn.Module):
                 precision=precision,
                 rngs=rngs,
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                **get_dot_general_by_bits(config.bits, config.easy_method),
             )
             self.proj_2 = RowParallelLinear(
                 intermediate_dim,
@@ -385,7 +398,6 @@ class OpenELMFeedForwardNetwork(nn.Module):
                 precision=precision,
                 rngs=rngs,
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                **get_dot_general_by_bits(config.bits, config.easy_method),
             )
             self.ffn_with_glu = True
         else:
@@ -398,7 +410,6 @@ class OpenELMFeedForwardNetwork(nn.Module):
                 precision=precision,
                 rngs=rngs,
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                **get_dot_general_by_bits(config.bits, config.easy_method),
             )
             self.proj_2 = RowParallelLinear(
                 intermediate_dim,
@@ -409,13 +420,22 @@ class OpenELMFeedForwardNetwork(nn.Module):
                 precision=precision,
                 rngs=rngs,
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                **get_dot_general_by_bits(config.bits, config.easy_method),
             )
             self.ffn_with_glu = False
 
         self.act = ACT2FN[config.activation_fn_name]
 
-    def __call__(self, hidden_states: chex.Array) -> chex.Array:
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply feedforward transformation with optional gated linear unit.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, seq_len, hidden_dim).
+
+        Returns:
+            Array: Transformed hidden states of shape (batch_size, seq_len, hidden_dim).
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -461,12 +481,12 @@ class OpenELMDecoderLayer(nn.Module):
     def __init__(
         self,
         config: OpenELMConfig,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the OpenELMDecoderLayer.
 
@@ -497,19 +517,19 @@ class OpenELMDecoderLayer(nn.Module):
 
         self.attn = attn_block(
             config=config,
-            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
         self.ffn = mlp_block(
             config=config,
-            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
         self.ffn_norm = RMSNorm(
             self.config.model_dim,
@@ -528,50 +548,45 @@ class OpenELMDecoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
-        fcm_mask: chex.Array | None = None,
-        frequencies: chex.Array | None = None,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
-        """Forward pass of the OpenELMDecoderLayer module.
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + ffn(norm(x)).
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (bool): Whether to return attention weights. Default is False.
-            fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view
+                for KV states. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache operations. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
 
         Returns:
-            tp.Tuple[chex.Array, tp.Optional[chex.Array]]:
-                A tuple containing the output hidden states and optionally the attention weights.
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
         """
         residual = hidden_states
         hidden_states = self.attn_norm(hidden_states)
 
         attn_outputs = self.attn(
             hidden_states,
-            attention_mask,
+            mask_info,
             position_ids,
-            causal_mask,
             mode,
             cache_view,
             cache_metadata,
-            segment_ids,
             output_attentions,
-            fcm_mask,
             frequencies,
         )
         hidden_states = checkpoint_name(residual + attn_outputs.attention_output, "residual")
@@ -614,7 +629,7 @@ class OpenELMModel(EasyDeLBaseModule):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         rngs (nn.Rngs): Random number generators.
-        token_embeddings (nn.Embed): Embedding layer for input tokens.
+        token_embeddings (Embed): Embedding layer for input tokens.
         layers (tp.List[OpenELMDecoderLayer]): List of decoder layers.
         norm (RMSNorm): Final layer normalization.
         gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
@@ -645,7 +660,7 @@ class OpenELMModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.token_embeddings = nn.Embed(
+        self.token_embeddings = Embed(
             config.vocab_size,
             config.model_dim,
             dtype=dtype,
@@ -653,17 +668,19 @@ class OpenELMModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
-            OpenELMDecoderLayer(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                layer_idx=i,
-                rngs=rngs,
-            )
-            for i in range(self.config.num_transformer_layers)
-        ]
+        self.layers = nn.List(
+            [
+                OpenELMDecoderLayer(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    layer_idx=i,
+                    rngs=rngs,
+                )
+                for i in range(self.config.num_transformer_layers)
+            ]
+        )
         self.norm = RMSNorm(
             config.model_dim,
             dtype=self.dtype,
@@ -687,6 +704,11 @@ class OpenELMModel(EasyDeLBaseModule):
 
     @cached_property
     def frequencies(self):
+        """Compute and cache rotary position embedding frequencies.
+
+        Returns:
+            Array: Precomputed frequency tensor for rotary position embeddings.
+        """
         return self.config.get_basic_frequencies(
             head_size=self.config.head_dim,
             rotary_dim=self.config.head_dim,
@@ -695,44 +717,51 @@ class OpenELMModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        apply_lm_head: bool = True,
     ) -> BaseModelOutput:
-        """Forward pass of the OpenELMModel.
+        """Forward pass through the OpenELM base model.
+
+        Processes input tokens through embedding, all decoder layers with RoPE and RMSNorm,
+        and final normalization.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
-            past_key_values (tp.Optional[TransformerCache | PagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, model_dim). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-            BaseModelOutput: The model's output.
-                returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-                and `attentions` (optional).
+            BaseModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                and updated past_key_values.
 
         Raises:
-            ValueError: If neither `input_ids` nor `inputs_embeds` is provided.
+            ValueError: If both input_ids and inputs_embeds are None or both are provided.
+            AssertionError: If sequence_length exceeds max_context_length.
         """
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -741,25 +770,21 @@ class OpenELMModel(EasyDeLBaseModule):
             inputs_embeds = checkpoint_name(self.token_embeddings(input_ids.astype("i4")), "embeddings")
         else:
             raise ValueError("you should specify inputs_embeds or input_ids one of them")
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
-        assert (
-            sequence_length <= self.config.max_context_length
-        ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_context_length} got {sequence_length})"
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-        else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
+        assert sequence_length <= self.config.max_context_length, (
+            f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_context_length} got {sequence_length})"
+        )
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
 
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
-        if attention_mask.ndim == 2:
-            attention_mask = jnp.expand_dims(attention_mask, (1, 2))
         if mode is None:
             mode = (
                 common_types.MODE_DECODE
@@ -780,14 +805,12 @@ class OpenELMModel(EasyDeLBaseModule):
                 all_hidden_states += (hidden_states,)
             layer_outputs = layer(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
-                segment_ids=segment_ids,
                 position_ids=position_ids,
-                causal_mask=self.causal_mask,
                 frequencies=self.frequencies,
             )
             hidden_states = layer_outputs.hidden_states
@@ -837,24 +860,23 @@ class OpenELMModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=OpenELMConfig, model_type="openelm")
-class OpenELMForCausalLM(EasyDeLBaseModule):
-    """OpenELM model with a Causal Language Modeling head.
+class OpenELMForCausalLM(BaseCausalLMModule[OpenELMModel, OpenELMConfig]):
+    """OpenELM model with a language modeling head for causal language modeling tasks.
 
-    This model consists of the base OpenELM transformer (`OpenELMModel`) followed by a
-    linear layer (`lm_head`) that projects the transformer's output hidden states
-    to the vocabulary size, producing logits for next token prediction.
-    Optionally, the input token embeddings can be tied to the output projection layer.
+    This model is a transformer-based language model with per-layer head configuration,
+    causal attention masks, and optional input-output embedding sharing for efficient
+    autoregressive language generation.
 
     Attributes:
-        config (OpenELMConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        transformer (OpenELMModel): The core OpenELM transformer model.
-        lm_head (ColumnParallelLinear, optional): The linear layer for projecting hidden states to vocabulary logits.
-            This is None if `config.share_input_output_layers` is True.
+        config (OpenELMConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
     """
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "openelm"
+    _config_class = OpenELMConfig
 
     def __init__(
         self,
@@ -865,142 +887,22 @@ class OpenELMForCausalLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the OpenELMForCausalLM model.
+        """Initialize OpenELM model for causal language modeling.
 
         Args:
-            config (OpenELMConfig): The configuration object for the OpenELM model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (OpenELMConfig): Model configuration with OpenELM-specific parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
+            base_model_class=OpenELMModel,
+            base_model_name="transformer",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            lm_head_bias=False,
         )
-        self.transformer = OpenELMModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.model_dim,
-            config.vocab_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            rngs=rngs,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-
-    def __call__(
-        self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        apply_lm_head: bool = True,
-    ) -> CausalLMOutput:
-        """Forward pass of the OpenELMForCausalLM model.
-
-        Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
-            past_key_values (tp.Optional[TransformerCache | PagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
-
-
-        Returns:
-            CausalLMOutput: The model's output.
-                returns a `CausalLMOutput` object containing `logits`, `hidden_states` (optional),
-                and `attentions` (optional).
-        """
-        outputs = self.transformer(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            mode=mode,
-            past_key_values=past_key_values,
-            cache_metadata=cache_metadata,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            segment_ids=segment_ids,
-        )
-
-        hidden_states = outputs.last_hidden_state
-
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-
-        lm_logits = None
-        if apply_lm_head:
-            lm_logits = checkpoint_name(self.apply_lm_head(outputs.last_hidden_state), "lm_head_output")
-
-        return CausalLMOutput(
-            logits=lm_logits,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            past_key_values=outputs.past_key_values,
-        )
-
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
-        """
-        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
-
-    def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
-        return self.transformer.get_decoder()
-
-    def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        """
-        return self.lm_head
-
-    def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
-        return self.transformer.get_embedding()

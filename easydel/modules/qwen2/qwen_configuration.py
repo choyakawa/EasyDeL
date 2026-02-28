@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Mapping
 
-import typing as tp
-
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -96,23 +95,23 @@ class Qwen2Config(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vocab_size=151936,
-        hidden_size=4096,
-        intermediate_size=22016,
-        num_hidden_layers=32,
-        num_attention_heads=32,
-        num_key_value_heads=32,
-        hidden_act="silu",
-        max_position_embeddings=32768,
-        initializer_range=0.02,
-        rms_norm_eps=1e-6,
-        use_cache=True,
-        tie_word_embeddings=False,
-        rope_theta=10000.0,
-        use_sliding_window=False,
-        sliding_window=4096,
-        max_window_layers=28,
-        attention_dropout=0.0,
+        vocab_size: int = 151936,
+        hidden_size: int = 4096,
+        intermediate_size: int = 22016,
+        num_hidden_layers: int = 32,
+        num_attention_heads: int = 32,
+        num_key_value_heads: int | None = 32,
+        hidden_act: str = "silu",
+        max_position_embeddings: int = 32768,
+        initializer_range: float = 0.02,
+        rms_norm_eps: float = 1e-6,
+        use_cache: bool = True,
+        tie_word_embeddings: bool = False,
+        rope_theta: float = 10000.0,
+        use_sliding_window: bool = False,
+        sliding_window: int | None = 4096,
+        max_window_layers: int = 28,
+        attention_dropout: float = 0.0,
         resid_pdrop: float = 0.0,
         embd_pdrop: float = 0.0,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
@@ -124,7 +123,7 @@ class Qwen2Config(EasyDeLBaseConfig):
         bits: int | None = None,
         scan_layers: bool = True,
         layer_types: list[str] | None = None,
-        rope_scaling: tp.Mapping[str, str | float] | None = None,
+        rope_scaling: Mapping[str, str | float] | None = None,
         **kwargs,
     ):
         """Initializes a Qwen2Config object.
@@ -158,7 +157,7 @@ class Qwen2Config(EasyDeLBaseConfig):
             number_rep_kv (int, optional): Number of repetitions for key/value vectors. Defaults to 1.
             bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
             scan_layers (bool, optional): Whether to use scan for transformer layers. Defaults to True.
-            rope_scaling (tp.Optional[tp.Mapping[str, str | float]], optional):
+            rope_scaling (tp.Optional[Mapping[str, str | float]], optional):
                 RoPE scaling configuration. Defaults to None.
             **kwargs: Additional keyword arguments passed to the parent class.
         """
@@ -199,9 +198,11 @@ class Qwen2Config(EasyDeLBaseConfig):
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = [
-                "sliding_attention"
-                if self.sliding_window is not None and i >= self.max_window_layers
-                else "full_attention"
+                (
+                    "sliding_attention"
+                    if self.sliding_window is not None and i >= self.max_window_layers
+                    else "full_attention"
+                )
                 for i in range(self.num_hidden_layers)
             ]
         if self.rope_scaling is not None and "type" in self.rope_scaling:
@@ -214,31 +215,18 @@ class Qwen2Config(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/bias", pmag.resolve(Replicated)),
-            (r"self_attn/o_proj/bias", pmag.resolve(Replicated)),
-            (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            (
-                r".*/(input_layernorm|post_attention_layernorm|norm)/kernel",
-                pmag.resolve(Replicated),
-            ),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"score/kernel", pmag.resolve(RowWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
         """Retrieve attention mask details for each layer in the model.

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -54,22 +54,37 @@ Example:
 
 from __future__ import annotations
 
-import functools
 import hashlib
-import inspect
 import os
 import pickle
 import typing as tp
 import warnings
+from functools import wraps
 
 import jax
 import numpy as np
+from ejkernel.callib import ejit  # pyright: ignore[reportMissingTypeStubs]
+from jax._src.interpreters import pxla
 from jax.experimental.serialize_executable import deserialize_and_load, serialize
 
 from .helpers import check_bool_flag, get_cache_dir
 
 if tp.TYPE_CHECKING:
     from jax._src.stages import Compiled, Lowered
+
+ejit = ejit
+
+__all__ = [
+    "NoCompileContext",
+    "ejit",
+    "get_hash_of_lowering",
+    "get_safe_hash_int",
+    "hash_fn",
+    "load_cached_functions",
+    "load_compiled_fn",
+    "save_compiled_fn",
+    "smart_compile",
+]
 
 P = tp.ParamSpec("P")
 R = tp.TypeVar("R")
@@ -78,14 +93,17 @@ RECOMPILE_FORCE = check_bool_flag("EASYDEL_RECOMPILE_FORCE", False)
 ECACHE_COMPILES = check_bool_flag("EASYDEL_CACHE_COMPILES", False)
 
 CACHE_DIR = get_cache_dir()
-COMPILE_FUNC_DIR = CACHE_DIR / "ejit_compiled_functions"
-COMPILE_FUNC_DIR.mkdir(parents=True, exist_ok=True)
+
+COMPILE_FUNC_DIR = os.getenv("COMPILE_FUNC_DIR", CACHE_DIR / "ejit_compiled_functions")
+if not isinstance(COMPILE_FUNC_DIR, str):
+    COMPILE_FUNC_DIR.mkdir(parents=True, exist_ok=True)
+
 COMPILED_FILE_NAME = "compiled.executable"
 SIGNATURE_FILE_NAME = "compiled.signature"
 COMPILED_CACHE: dict[str, Compiled] = {}
 
 
-def _get_hardware_signature() -> str:
+def _get_hardware_signature() -> str:  # pyright: ignore[reportUnusedFunction]
     """Create signature for current JAX hardware environment.
 
     Returns:
@@ -110,7 +128,7 @@ def _get_leaf_signature(leaf: tp.Any) -> tp.Hashable:
     return type(leaf)
 
 
-def _get_args_signature(args: tuple, kwargs: dict) -> str:
+def _get_args_signature(args: tuple, kwargs: dict) -> str:  # pyright: ignore[reportUnusedFunction]
     """Create signature for function arguments.
 
     Generates a unique signature based on the PyTree structure,
@@ -126,192 +144,6 @@ def _get_args_signature(args: tuple, kwargs: dict) -> str:
     arg_leaves, arg_tree = jax.tree_util.tree_flatten((args, kwargs))
     leaf_signatures = tuple(map(_get_leaf_signature, arg_leaves))
     return str((arg_tree, leaf_signatures))
-
-
-def ejit(
-    func: tp.Callable[P, R] | None = None,
-    *,
-    static_argnums: int | tp.Sequence[int] | None = None,
-    static_argnames: str | tp.Iterable[str] | None = None,
-    donate_argnums: int | tp.Sequence[int] | None = None,
-    in_shardings: tp.Any = None,
-    out_shardings: tp.Any = None,
-    donate_argnames: str | tp.Iterable[str] | None = None,
-    keep_unused: bool = False,
-    backend: str | None = None,
-    inline: bool = False,
-    abstracted_axes: tp.Any | None = None,
-    compiler_options: dict[str, tp.Any] | None = None,
-):
-    """Enhanced JIT compilation with persistent caching.
-
-    Drop-in replacement for jax.jit that caches compiled functions
-    to disk for reuse across script runs, significantly reducing
-    compilation overhead.
-
-    Features:
-        - Two-level caching (in-memory LRU + persistent disk cache)
-        - Automatic cache invalidation on signature changes
-        - Graceful fallback to standard jax.jit on errors
-        - Support for all jax.jit parameters
-
-    Args:
-        func: Function to JIT-compile and cache.
-        static_argnums: Indices of static arguments.
-        static_argnames: Names of static arguments.
-        donate_argnums: Indices of donated arguments.
-        in_shardings: Input sharding specifications.
-        out_shardings: Output sharding specifications.
-
-    Returns:
-        JIT-compiled function with caching.
-
-    Example:
-        >>> @ejit
-        ... def fast_matmul(a, b):
-        ...     return a @ b
-        >>> # First call compiles and caches
-        >>> result = fast_matmul(x, y)
-        >>> # Subsequent calls use cached version
-    """
-    if func is None:
-        return functools.partial(
-            ejit,
-            static_argnums=static_argnums,
-            static_argnames=static_argnames,
-            donate_argnums=donate_argnums,
-            in_shardings=in_shardings,
-            out_shardings=out_shardings,
-            abstracted_axes=abstracted_axes,
-            backend=backend,
-            compiler_options=compiler_options,
-            donate_argnames=donate_argnames,
-            inline=inline,
-            keep_unused=keep_unused,
-        )
-
-    if not ECACHE_COMPILES:
-        from jax.experimental.compilation_cache import compilation_cache as cc
-
-        cc.set_cache_dir(str(COMPILE_FUNC_DIR))
-        jax.config.update("jax_compilation_cache_dir", str(COMPILE_FUNC_DIR))
-        jitted_function = jax.jit(
-            func,
-            static_argnums=static_argnums,
-            static_argnames=static_argnames,
-            donate_argnums=donate_argnums,
-            in_shardings=in_shardings,
-            out_shardings=out_shardings,
-            abstracted_axes=abstracted_axes,
-            backend=backend,
-            compiler_options=compiler_options,
-            donate_argnames=donate_argnames,
-            inline=inline,
-            keep_unused=keep_unused,
-        )
-        return jitted_function
-    jitted_function = jax.jit(
-        func,
-        static_argnums=static_argnums,
-        static_argnames=static_argnames,
-        donate_argnums=donate_argnums,
-        in_shardings=in_shardings,
-        out_shardings=out_shardings,
-        abstracted_axes=abstracted_axes,
-        backend=backend,
-        compiler_options=compiler_options,
-        donate_argnames=donate_argnames,
-        inline=inline,
-        keep_unused=keep_unused,
-    )
-    try:
-        func_source = inspect.getsource(func)
-        hardware_sig = _get_hardware_signature()
-        jit_options_sig = str((static_argnums, static_argnames, donate_argnums, in_shardings, out_shardings))
-        static_key_part = "".join([func_source, hardware_sig, jit_options_sig])
-    except Exception as e:
-        warnings.warn(
-            f"Could not create static cache key for ejit function '{func.__name__}'. "
-            f"Falling back to regular jit. Error: {e}",
-            stacklevel=2,
-        )
-
-        return jitted_function
-
-    static_arg_indices = (
-        set(static_argnums)
-        if isinstance(static_argnums, list | tuple)
-        else {static_argnums}
-        if static_argnums is not None
-        else set()
-    )
-    static_arg_names_set = (
-        set(static_argnames)
-        if isinstance(static_argnames, list | tuple)
-        else {static_argnames}
-        if static_argnames is not None
-        else set()
-    )
-
-    def get_compiled_and_cache(args_sig: str, args, kwargs) -> Compiled | None:
-        """
-        This inner function handles the "slow path": looking up in the L2 cache,
-        on disk, or compiling. It's decorated with LRU cache so it only runs
-        once per unique set of argument shapes.
-        """
-        compilation_key = hashlib.md5((static_key_part + args_sig).encode("utf-8")).hexdigest()
-
-        if compilation_key in COMPILED_CACHE and not RECOMPILE_FORCE:
-            return COMPILED_CACHE[compilation_key]
-
-        func_dir = COMPILE_FUNC_DIR / compilation_key
-        filepath = func_dir / COMPILED_FILE_NAME
-        if filepath.exists() and not RECOMPILE_FORCE:
-            try:
-                with open(filepath, "rb") as f:
-                    serialized, in_tree, out_tree = pickle.load(f)
-                compiled_func = deserialize_and_load(serialized, in_tree, out_tree)
-                COMPILED_CACHE[compilation_key] = compiled_func
-                return compiled_func
-            except Exception as e:
-                warnings.warn(f"Could not load ejit cache from '{filepath}'. Recompiling. Error: {e}", stacklevel=2)
-
-        try:
-            lowered_func = jitted_function.lower(*args, **kwargs)
-            compiled_func = lowered_func.compile()
-
-            try:
-                serialized, in_tree, out_tree = serialize(compiled_func)
-                func_dir.mkdir(parents=True, exist_ok=True)
-                with open(filepath, "wb") as f:
-                    pickle.dump((serialized, in_tree, out_tree), f)
-            except Exception:
-                pass
-
-            COMPILED_CACHE[compilation_key] = compiled_func
-            return compiled_func
-        except Exception as e:
-            warnings.warn(f"ejit compilation failed for '{func.__name__}'. Error: {e}", stacklevel=2)
-            return None
-
-    @functools.wraps(func)
-    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-        try:
-            args_sig = _get_args_signature(args, kwargs)
-            compiled_func = get_compiled_and_cache(args_sig, args, kwargs)
-
-        except Exception as e:
-            warnings.warn(
-                f"ejit signature generation failed for '{func.__name__}'. Falling back. Error: {e}", stacklevel=2
-            )
-            return jitted_function(*args, **kwargs)
-        if compiled_func is None:
-            return jitted_function(*args, **kwargs)
-        dynamic_args = tuple(arg for i, arg in enumerate(args) if i not in static_arg_indices)
-        dynamic_kwargs = {k: v for k, v in kwargs.items() if k not in static_arg_names_set}
-        return compiled_func(*dynamic_args, **dynamic_kwargs)
-
-    return wrapper
 
 
 def load_cached_functions(verbose: bool = True) -> None:
@@ -492,20 +324,41 @@ def smart_compile(
         return compiled_func, signature
 
 
-if __name__ == "__main__":
-    jnp = jax.numpy
+class NoCompileContext:
+    """Context manager that fails if JAX triggers a new compilation.
 
-    @ejit
-    def my_function(x, y):
-        return x * y + x
+    Useful around hot paths that are expected to hit cached executables only.
+    """
 
-    a = jnp.array([1, 2, 3], dtype=jnp.float32)
-    b = jnp.array([4, 5, 6], dtype=jnp.float32)
+    def __init__(self, message: str = "JAX attempted to compile a new executable inside ForbidCompile."):
+        """Initialize the guard with a custom failure message."""
+        self.message = message
+        self._original_func = None
 
-    result1 = my_function(a, b)  # Compiles and caches on first call
-    result2 = my_function(a, b)  # Returns cached result
+    def __enter__(self):
+        """Patch JAX's cached lowering to detect compilation cache misses."""
+        # Store the original function
+        self._original_func = pxla._cached_lowering_to_hlo
+        original_cached_func = self._original_func
 
-    c = jnp.array([1, 2, 3], dtype=jnp.float32)
-    d = jnp.array([1, 1, 1], dtype=jnp.float32)
-    result3 = my_function(c, d)
-    print(result1, result2, result3)
+        @wraps(original_cached_func)
+        def wrapper(*args, **kwargs):
+            info_before = original_cached_func.cache_info()
+            misses_before = info_before.misses
+
+            result = original_cached_func(*args, **kwargs)
+            info_after = original_cached_func.cache_info()
+            misses_after = info_after.misses
+
+            if misses_after > misses_before:
+                raise RuntimeError(self.message)
+
+            return result
+
+        pxla._cached_lowering_to_hlo = wrapper
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        """Restore the cached lowering function."""
+        if self._original_func:
+            pxla._cached_lowering_to_hlo = self._original_func
+        return False

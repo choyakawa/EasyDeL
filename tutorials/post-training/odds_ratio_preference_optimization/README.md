@@ -37,7 +37,7 @@ The provided script relies on a setup script from EasyDeL to prepare the TPU env
 2. **Run the EasyDeL setup script:**
 
     ```bash
-    bash <(curl -sL https://raw.githubusercontent.com/erfanzar/EasyDeL/refs/heads/main/tpu_setup.sh)
+    bash <(curl -sL https://raw.githubusercontent.com/erfanzar/EasyDeL/refs/heads/main/scripts/tpu_setup.sh)
     ```
 
     This command downloads and executes a script that installs required packages such as JAX, EasyDeL, Ray, Hugging Face libraries, and other Python dependencies optimized for TPU operation. This process might take several minutes.
@@ -72,7 +72,7 @@ The provided script relies on a setup script from EasyDeL to prepare the TPU env
 Save the provided Python script as `orpo_finetune.py` (or any other `.py` name) on your TPU VM. Let's walk through its key components.
 
 ```python
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 # ... (license header) ...
 
 import os
@@ -173,12 +173,10 @@ def main():
             # Override specific model configuration parameters.
             freq_max_position_embeddings=max_length,
             mask_max_position_embeddings=max_length,
-            kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
             attn_mechanism=ed.AttentionMechanisms.AUTO, # EasyDeL picks the best attention mechanism.
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE, # change this if u go OOM
         ),
         partition_axis=ed.PartitionAxis(kv_head_axis="tp"), # Advanced sharding for tensor parallelism.
-        quantization_method=ed.EasyDeLQuantizationMethods.NONE, # No weight quantization.
     )
     logger.info("Model loaded successfully.")
 

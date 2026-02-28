@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -83,60 +83,32 @@ class GemmaConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vocab_size=256000,
-        hidden_size=3072,
-        intermediate_size=24576,
-        num_hidden_layers=28,
-        num_attention_heads=16,
-        num_key_value_heads=16,
-        head_dim=256,
-        hidden_act="gelu_pytorch_tanh",
-        max_position_embeddings=8192,
-        initializer_range=0.02,
-        rms_norm_eps=1e-6,
-        use_cache=True,
-        pad_token_id=0,
-        eos_token_id=1,
-        bos_token_id=2,
-        tie_word_embeddings=True,
-        rope_theta=10000.0,
-        attention_bias=False,
-        attention_dropout=0.0,
+        vocab_size: int = 256000,
+        hidden_size: int = 3072,
+        intermediate_size: int | None = 24576,
+        num_hidden_layers: int = 28,
+        num_attention_heads: int = 16,
+        num_key_value_heads: int = 16,
+        head_dim: int = 256,
+        hidden_act: str = "gelu_pytorch_tanh",
+        max_position_embeddings: int = 8192,
+        initializer_range: float = 0.02,
+        rms_norm_eps: float = 1e-6,
+        use_cache: bool = True,
+        pad_token_id: int = 0,
+        eos_token_id: int = 1,
+        bos_token_id: int = 2,
+        tie_word_embeddings: bool = True,
+        rope_theta: float = 10000.0,
+        attention_bias: bool = False,
+        attention_dropout: float = 0.0,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
         scan_layers: bool = False,
-        hidden_activation="gelu_pytorch_tanh",
+        hidden_activation: str | None = "gelu_pytorch_tanh",
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
-        """Initialize a new GemmaConfig instance.
-
-        Args:
-          vocab_size (int, optional): Size of the vocabulary. Defaults to 256000.
-          hidden_size (int, optional): Dimensionality of the embeddings and hidden states. Defaults to 3072.
-          intermediate_size (int, optional): Dimensionality of the feed-forward layer. Defaults to 24576.
-          num_hidden_layers (int, optional): Number of hidden layers. Defaults to 28.
-          num_attention_heads (int, optional): Number of attention heads. Defaults to 16.
-          num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to 16.
-          head_dim (int, optional): Dimension of each attention head. Defaults to 256.
-          hidden_act (str, optional): Activation function for hidden layers. Defaults to "gelu_pytorch_tanh".
-          max_position_embeddings (int, optional): Maximum sequence length. Defaults to 8192.
-          initializer_range (float, optional): Range for weight initialization. Defaults to 0.02.
-          rms_norm_eps (float, optional): Epsilon for RMS normalization. Defaults to 1e-6.
-          use_cache (bool, optional): Whether to use KV cache for generation. Defaults to True.
-          pad_token_id (int, optional): ID for padding token. Defaults to 0.
-          eos_token_id (int, optional): ID for end of sequence token. Defaults to 1.
-          bos_token_id (int, optional): ID for beginning of sequence token. Defaults to 2.
-          tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to True.
-          rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
-          attention_bias (bool, optional): Whether to use bias in attention. Defaults to False.
-          attention_dropout (float, optional): Dropout probability for attention. Defaults to 0.0.
-          gradient_checkpointing (EasyDeLGradientCheckPointers, optional):
-            Checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
-          bits (Optional[int], optional): Quantization bits. Defaults to None.
-          scan_layers (bool, optional): Whether to scan layers. Defaults to False.
-          hidden_activation (str, optional): Activation for hidden layers. Defaults to "gelu_pytorch_tanh".
-          **kwargs: Additional arguments.
-        """
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
         self.scan_layers = scan_layers
@@ -156,6 +128,9 @@ class GemmaConfig(EasyDeLBaseConfig):
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.hidden_activation = hidden_activation
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -165,24 +140,15 @@ class GemmaConfig(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            (r".*(input_layernorm|post_attention_layernorm|norm)/kernel", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"score/kernel", pmag.resolve(RowWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None

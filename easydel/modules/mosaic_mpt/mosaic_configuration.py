@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 
 import typing
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -51,16 +51,16 @@ class MptAttentionConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        attn_type="multihead_attention",
-        attn_pdrop=0,
-        attn_impl="torch",
-        clip_qkv=None,
-        softmax_scale=None,
-        prefix_lm=False,
-        qk_ln=False,
-        attn_uses_sequence_id=False,
-        alibi=True,
-        alibi_bias_max=8,
+        attn_type: str = "multihead_attention",
+        attn_pdrop: float | None = 0,
+        attn_impl: str = "torch",
+        clip_qkv: float | None = None,
+        softmax_scale: float | None = None,
+        prefix_lm: bool = False,
+        qk_ln: bool = False,
+        attn_uses_sequence_id: bool = False,
+        alibi: bool = True,
+        alibi_bias_max: int = 8,
         **kwargs,
     ):
         """Initializes an MptAttentionConfig object.
@@ -209,7 +209,7 @@ class MptConfig(EasyDeLBaseConfig):
         embedding_fraction: float = 1.0,
         norm_type: str = "low_precision_layernorm",
         use_cache: bool = False,
-        initializer_range=0.02,
+        initializer_range: float = 0.02,
         alibi: bool = True,
         use_bias: bool = False,
         act_fn: str = "gelu",
@@ -218,6 +218,7 @@ class MptConfig(EasyDeLBaseConfig):
         use_norm_bias: bool = False,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initializes an MptConfig object.
@@ -286,6 +287,9 @@ class MptConfig(EasyDeLBaseConfig):
         self.bits = bits
         self.layer_norm_epsilon = layer_norm_epsilon
         self.from_pt = False
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.n_layers
 
         super().__init__(bits=bits, **kwargs)
 
@@ -305,22 +309,15 @@ class MptConfig(EasyDeLBaseConfig):
                 config[k] = v
         return config
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"wte/embedding", pmag.resolve(ColumnWise)),
-            (r"attn/Wqkv/kernel", pmag.resolve(ColumnWise)),
-            (r"attn/out_proj/kernel", pmag.resolve(RowWise)),
-            (r"ffn/up_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"ffn/down_proj/kernel", pmag.resolve(RowWise)),
-            (r".*/(norm_1|norm_2|norm_f)/scale", pmag.resolve(Replicated)),
-            (r".*/(norm_1|norm_2|norm_f)/bias", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r".*(Wqkv|out_proj|up_proj|down_proj|lm_head)/bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None

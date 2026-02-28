@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,17 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import inspect
 import typing as tp
 from functools import cached_property, partial
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
-from jax import lax
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -35,9 +37,11 @@ from easydel.infra.modeling_outputs import (
     EncoderLayerOutput,
     ImageClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN
+from easydel.infra.utils import ACT2FN, ArrayParam
+from easydel.layers import ColumnParallelLinear, Embed
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.linear import ColumnParallelLinear
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import BaseImageClassificationModule
 
 from .clip_configuration import CLIPConfig, CLIPTextConfig, CLIPVisionConfig
 
@@ -72,15 +76,10 @@ def clip_loss(similarity: jax.Array) -> jax.Array:
 
 
 class CLIPVisionEmbeddings(nn.Module):
-    """
-    Constructs the vision embeddings for CLIP.
+    """Vision embeddings module for CLIP models.
 
-    Attributes:
-            config (CLIPVisionConfig): Configuration object.
-            dtype (jnp.dtype): Data type for computation.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): JAX precision level.
-            rngs (nn.Rngs): Random number generators.
+    Converts image pixel values into patch embeddings with position encodings
+    and a learnable class token for vision transformer processing.
     """
 
     def __init__(
@@ -92,17 +91,27 @@ class CLIPVisionEmbeddings(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize CLIP vision embeddings.
+
+        Args:
+            config (CLIPVisionConfig): Vision model configuration with embedding parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         embed_dim = config.hidden_size
         image_size = config.image_size
         patch_size = config.patch_size
 
-        self.class_embedding = nn.Param(
-            jax.nn.initializers.normal(stddev=0.02)(
-                rngs.params(),
-                shape=(embed_dim,),
-                dtype=param_dtype,
-            ),
+        self.class_embedding = ArrayParam.bound(
+            shape=(embed_dim,),
+            dtype=param_dtype,
+            init_method="normal",
+            init_kwargs={"stddev": 0.02},
+            key=rngs.params(),
         )
 
         self.patch_embedding = nn.Conv(
@@ -121,7 +130,7 @@ class CLIPVisionEmbeddings(nn.Module):
 
         self.num_patches = (image_size // patch_size) ** 2
         num_positions = self.num_patches + 1
-        self.position_embedding = nn.Embed(
+        self.position_embedding = Embed(
             num_positions,
             embed_dim,
             embedding_init=jax.nn.initializers.normal(),
@@ -130,15 +139,19 @@ class CLIPVisionEmbeddings(nn.Module):
             rngs=rngs,
         )
 
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for custom embedding parameters."""
+        return {"class_embedding": Replicated}
+
     def __call__(self, pixel_values):
-        """
-        Forward pass for vision embeddings.
+        """Create vision embeddings from pixel values.
 
         Args:
-                pixel_values (chex.Array): Input pixel values (batch_size, num_channels, height, width).
+            pixel_values: Input pixel values of shape (batch_size, height, width, channels).
 
         Returns:
-                chex.Array: Combined class and patch embeddings.
+            Combined class token and patch embeddings with position encodings,
+            shape (batch_size, num_patches + 1, hidden_size).
         """
         patch_embeds = self.patch_embedding(pixel_values)
         batch_size, height, width, channels = patch_embeds.shape
@@ -158,15 +171,10 @@ class CLIPVisionEmbeddings(nn.Module):
 
 
 class CLIPTextEmbeddings(nn.Module):
-    """
-    Constructs the text embeddings for CLIP.
+    """Text embeddings module for CLIP models.
 
-    Attributes:
-            config (CLIPTextConfig): Configuration object.
-            dtype (jnp.dtype): Data type for computation.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): JAX precision level.
-            rngs (nn.Rngs): Random number generators.
+    Combines token embeddings and position embeddings for text
+    transformer processing in the CLIP architecture.
     """
 
     def __init__(
@@ -178,9 +186,19 @@ class CLIPTextEmbeddings(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize CLIP text embeddings.
+
+        Args:
+            config (CLIPTextConfig): Text model configuration with embedding parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         embed_dim = config.hidden_size
 
-        self.token_embedding = nn.Embed(
+        self.token_embedding = Embed(
             config.vocab_size,
             embed_dim,
             embedding_init=jax.nn.initializers.normal(),
@@ -188,7 +206,7 @@ class CLIPTextEmbeddings(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.position_embedding = nn.Embed(
+        self.position_embedding = Embed(
             config.max_position_embeddings,
             embed_dim,
             embedding_init=jax.nn.initializers.normal(),
@@ -198,15 +216,15 @@ class CLIPTextEmbeddings(nn.Module):
         )
 
     def __call__(self, input_ids, position_ids):
-        """
-        Forward pass for text embeddings.
+        """Create text embeddings from token IDs.
 
         Args:
-                input_ids (chex.Array): Input token IDs.
-                position_ids (chex.Array): Position IDs.
+            input_ids: Input token IDs of shape (batch_size, sequence_length).
+            position_ids: Position indices of shape (batch_size, sequence_length).
 
         Returns:
-                chex.Array: Combined token and position embeddings.
+            Combined token and position embeddings of shape
+            (batch_size, sequence_length, hidden_size).
         """
         input_embeds = self.token_embedding(input_ids.astype("i4"))
         position_embeds = self.position_embedding(position_ids.astype("i4"))
@@ -216,15 +234,10 @@ class CLIPTextEmbeddings(nn.Module):
 
 
 class CLIPAttention(AttentionModule):
-    """
-    CLIP Attention module, supporting both text (causal) and vision (non-causal) attention.
+    """Multi-head attention module for CLIP models.
 
-    Attributes:
-            config (Union[CLIPTextConfig, CLIPVisionConfig]): Configuration object.
-            dtype (jnp.dtype): Data type for computation.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): JAX precision level.
-            rngs (nn.Rngs): Random number generators.
+    Supports both causal attention for text encoder and non-causal
+    attention for vision encoder based on configuration type.
     """
 
     def __init__(
@@ -236,6 +249,17 @@ class CLIPAttention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize CLIP attention layer.
+
+        Args:
+            config (CLIPTextConfig | CLIPVisionConfig): Model configuration with
+                attention parameters. Determines causal/non-causal behavior.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(config=config)
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -270,50 +294,46 @@ class CLIPAttention(AttentionModule):
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=config.attention_dropout,
+            requires_cache=False,  # Vision/text encoder doesn't need KV cache
         )
 
     def _split_heads(self, hidden_states):
-        """
-        Splits hidden states into multiple heads.
+        """Split hidden states into multiple attention heads.
 
         Args:
-                hidden_states (chex.Array): Input hidden states.
+            hidden_states: Input tensor of shape (batch, seq_len, embed_dim).
 
         Returns:
-                chex.Array: Reshaped hidden states.
+            Reshaped tensor of shape (batch, seq_len, num_heads, head_dim).
         """
         return hidden_states.reshape((*hidden_states.shape[:2], self.num_heads, self.head_dim))
 
     def _merge_heads(self, hidden_states):
-        """
-        Merges multiple heads back into a single hidden state tensor.
+        """Merge attention heads back into hidden states.
 
         Args:
-                hidden_states (chex.Array): Input hidden states.
+            hidden_states: Input tensor of shape (batch, seq_len, num_heads, head_dim).
 
         Returns:
-                chex.Array: Merged hidden states.
+            Merged tensor of shape (batch, seq_len, embed_dim).
         """
         return hidden_states.reshape((*hidden_states.shape[:2], self.embed_dim))
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array | None = None,
-        causal_mask: chex.Array | None = None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
         output_attentions: bool = False,
     ):
-        """
-        Forward pass for the CLIP attention module.
+        """Apply multi-head self-attention.
 
         Args:
-                hidden_states (chex.Array): Input hidden states.
-                attention_mask (Optional[chex.Array]): Mask to prevent attention to certain positions.
-                causal_mask (Optional[chex.Array]): Causal mask for text attention.
-                output_attentions (bool): Whether to output attention weights.
+            hidden_states: Input tensor of shape (batch, seq_len, hidden_dim).
+            mask_info: Attention mask information for masking padded positions.
+            output_attentions: Whether to return attention weights. Defaults to False.
 
         Returns:
-                Tuple[chex.Array, Optional[chex.Array]]: Attention output and optionally attention weights.
+            AttentionLayerOutput containing attention output and optional attention weights.
         """
         query = checkpoint_name(self.q_proj(hidden_states), name="attn_query")
         key = checkpoint_name(self.k_proj(hidden_states), name="attn_key")
@@ -323,43 +343,13 @@ class CLIPAttention(AttentionModule):
         key = self._split_heads(key)
         value = self._split_heads(value)
 
-        causal_attention_mask = None
-        if self.causal:
-            assert causal_mask is not None
-            query_length, key_length = query.shape[1], key.shape[1]
-            causal_attention_mask = causal_mask[:, :, key_length - query_length : key_length, :key_length]
-
-        if attention_mask is not None and causal_attention_mask is not None:
-            if attention_mask.ndim == 2:
-                attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-            attention_mask = nn.combine_masks(
-                attention_mask,
-                causal_attention_mask,
-                dtype="i4",
-            )
-        elif causal_attention_mask is not None:
-            attention_mask = causal_attention_mask
-        elif attention_mask is not None:
-            if attention_mask.ndim == 2:
-                attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-        attention_bias = None
-        if attention_mask is not None:
-            attention_bias = lax.select(
-                attention_mask > 0,
-                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-            )
-            attention_mask = None
-
         attentions = self.attention_performer.forward(
             query_states=query,
             key_states=key,
             value_states=value,
             mode=common_types.MODE_TRAIN,
             bias=None,
-            init_bias=lambda: attention_bias,
-            attention_mask=attention_mask,
-            segment_ids=None,
+            mask_info=mask_info,
             causal=self.causal,
         )
 
@@ -374,15 +364,10 @@ class CLIPAttention(AttentionModule):
 
 
 class CLIPMLP(nn.Module):
-    """
-    CLIP MLP (Feed-Forward) layer.
+    """Multi-Layer Perceptron module for CLIP models.
 
-    Attributes:
-            config (Union[CLIPTextConfig, CLIPVisionConfig]): Configuration object.
-            dtype (jnp.dtype): Data type for computation.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): JAX precision level.
-            rngs (nn.Rngs): Random number generators.
+    Implements the feedforward network with configurable activation function
+    for both text and vision encoders in the CLIP architecture.
     """
 
     def __init__(
@@ -394,6 +379,16 @@ class CLIPMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize CLIP MLP block.
+
+        Args:
+            config (CLIPTextConfig | CLIPVisionConfig): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -412,15 +407,16 @@ class CLIPMLP(nn.Module):
         self.fc1 = linear_class(config.hidden_size, config.intermediate_size)
         self.fc2 = linear_class(config.intermediate_size, config.hidden_size)
 
-    def __call__(self, hidden_states: chex.Array):
-        """
-        Forward pass for the MLP layer.
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply feedforward transformation.
 
         Args:
-                hidden_states (chex.Array): Input hidden states.
+            hidden_states: Input tensor of shape (batch, seq_len, hidden_dim).
 
         Returns:
-                chex.Array: Output hidden states.
+            Transformed hidden states of shape (batch, seq_len, hidden_dim).
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -439,15 +435,10 @@ class CLIPMLP(nn.Module):
 
 
 class CLIPEncoderLayer(nn.Module):
-    """
-    Single CLIP encoder layer, combining self-attention and MLP.
+    """Single encoder layer for CLIP models.
 
-    Attributes:
-            config (Union[CLIPTextConfig, CLIPVisionConfig]): Configuration object.
-            dtype (jnp.dtype): Data type for computation.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): JAX precision level.
-            rngs (nn.Rngs): Random number generators.
+    Combines multi-head self-attention and feedforward networks with
+    layer normalization and residual connections.
     """
 
     def __init__(
@@ -459,6 +450,15 @@ class CLIPEncoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize CLIP encoder layer.
+
+        Args:
+            config (CLIPTextConfig | CLIPVisionConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -471,7 +471,7 @@ class CLIPEncoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.layer_norm1 = nn.LayerNorm(
+        self.layer_norm1 = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -485,7 +485,7 @@ class CLIPEncoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.layer_norm2 = nn.LayerNorm(
+        self.layer_norm2 = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -495,30 +495,28 @@ class CLIPEncoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array | None = None,
-        causal_mask: chex.Array | None = None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
         output_attentions: bool = False,
     ):
-        """
-        Forward pass for the encoder layer.
+        """Forward pass through the encoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + mlp(norm(x)).
 
         Args:
-                hidden_states (chex.Array): Input hidden states.
-                attention_mask (Optional[chex.Array]): Attention mask.
-                causal_mask (Optional[chex.Array]): Causal mask (for text).
-                output_attentions (bool): Whether to output attention weights.
+            hidden_states: Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info: Attention mask information for masking positions.
+            output_attentions: Whether to return attention weights. Defaults to False.
 
         Returns:
-                Tuple[chex.Array, ...]: Output hidden states and optional attention weights.
+            EncoderLayerOutput containing hidden states and optional attention weights.
         """
         residual = hidden_states
 
         hidden_states = self.layer_norm1(hidden_states)
         attn_outputs = self.self_attn(
             hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
+            mask_info=mask_info,
             output_attentions=output_attentions,
         )
         hidden_states = attn_outputs.attention_output
@@ -536,15 +534,10 @@ class CLIPEncoderLayer(nn.Module):
 
 
 class CLIPEncoder(nn.Module):
-    """
-    Transformer encoder consisting of `CLIPEncoderLayer` layers.
+    """Transformer encoder for CLIP models.
 
-    Attributes:
-            config (Union[CLIPTextConfig, CLIPVisionConfig]): Configuration object.
-            dtype (jnp.dtype): Data type for computation.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): JAX precision level.
-            rngs (nn.Rngs): Random number generators.
+    Stacks multiple CLIPEncoderLayer instances to form the complete
+    encoder for either text or vision processing.
     """
 
     def __init__(
@@ -556,29 +549,39 @@ class CLIPEncoder(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize CLIP encoder.
+
+        Args:
+            config (CLIPTextConfig | CLIPVisionConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-        self.layers = [
-            CLIPEncoderLayer(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for _ in range(config.num_hidden_layers)
-        ]
+        self.layers = nn.List(
+            [
+                CLIPEncoderLayer(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for _ in range(config.num_hidden_layers)
+            ]
+        )
 
     @cached_property
     def causal_mask(self):
-        """
-        Returns the causal mask if the encoder is for text, otherwise None.
+        """Get causal mask for text encoder.
 
         Returns:
-                Optional[chex.Array]: Causal mask.
+            Causal attention mask for text encoder, None for vision encoder.
         """
         if isinstance(self.config, CLIPTextConfig):
             return self.config.get_basic_causal_mask()
@@ -586,24 +589,24 @@ class CLIPEncoder(nn.Module):
 
     def __call__(
         self,
-        inputs_embeds: chex.Array,
-        attention_mask: chex.Array | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
-        """
-        Forward pass for the CLIP encoder.
+        """Forward pass through all encoder layers.
 
         Args:
-                inputs_embeds (chex.Array): Input embeddings.
-                attention_mask (Optional[chex.Array]): Attention mask.
-                output_attentions (bool): Whether to output attention weights.
-                output_hidden_states (bool): Whether to output all hidden states.
-
+            inputs_embeds: Input embeddings of shape (batch_size, sequence_length, hidden_dim).
+            mask_info: Attention mask information. Defaults to None.
+            output_attentions: Whether to return attention weights from all layers.
+                Defaults to False.
+            output_hidden_states: Whether to return hidden states from all layers.
+                Defaults to False.
 
         Returns:
-                Union[BaseModelOutput, Tuple]: Encoder output
-                    (last hidden state, optional hidden states, optional attentions).
+            BaseModelOutput containing last hidden state, optional all hidden states,
+            and optional attention weights.
         """
         hidden_states = inputs_embeds
         all_attentions = () if output_attentions else None
@@ -615,8 +618,7 @@ class CLIPEncoder(nn.Module):
 
             layer_outputs = layer(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                causal_mask=self.causal_mask,
+                mask_info=mask_info,
                 output_attentions=output_attentions,
             )
             hidden_states = layer_outputs.hidden_states
@@ -635,15 +637,10 @@ class CLIPEncoder(nn.Module):
 
 
 class CLIPTextTransformer(EasyDeLBaseModule):
-    """
-    The transformer encoder for the CLIP text model.
+    """Text transformer encoder for CLIP models.
 
-    Attributes:
-            config (CLIPTextConfig): Configuration object.
-            dtype (jnp.dtype): Data type for computation.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): JAX precision level.
-            rngs (nn.Rngs): Random number generators.
+    Processes text tokens through embeddings, multiple encoder layers with
+    causal attention, and final layer normalization to produce text representations.
     """
 
     def __init__(
@@ -655,6 +652,15 @@ class CLIPTextTransformer(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize CLIP text transformer.
+
+        Args:
+            config (CLIPTextConfig): Text model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -676,7 +682,7 @@ class CLIPTextTransformer(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.final_layer_norm = nn.LayerNorm(
+        self.final_layer_norm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -688,25 +694,28 @@ class CLIPTextTransformer(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
+        input_ids: Int[Array, "batch seq_len"],
+        mask_info: MaskInfo,
+        position_ids: Int[Array, "batch seq_len"],
+        output_attentions: bool | None = False,
+        output_hidden_states: bool | None = False,
     ):
-        """Forward pass for the text transformer.
+        """Forward pass through the text transformer.
+
+        Processes text tokens through embeddings, encoder layers with causal attention,
+        and produces pooled output from the EOS token position.
 
         Args:
-                input_ids (chex.Array): Input token IDs.
-                attention_mask (chex.Array): Attention mask.
-                position_ids (chex.Array): Position IDs.
-                output_attentions (bool): Whether to output attention weights.
-                output_hidden_states (bool): Whether to output all hidden states.
-
+            input_ids: Input token IDs of shape (batch_size, sequence_length).
+            mask_info: Attention mask information for masking padded tokens.
+            position_ids: Position indices of shape (batch_size, sequence_length).
+            output_attentions: Whether to return attention weights. Defaults to False.
+            output_hidden_states: Whether to return hidden states from all layers.
+                Defaults to False.
 
         Returns:
-                Union[BaseModelOutputWithPooling, Tuple]: Transformer output (last hidden state, pooled output,
-                    optional hidden states, optional attentions).
+            BaseModelOutputWithPooling containing last hidden state, pooled output,
+            optional hidden states, and optional attention weights.
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -714,10 +723,10 @@ class CLIPTextTransformer(EasyDeLBaseModule):
         )
 
         hidden_states = self.embeddings(input_ids=input_ids, position_ids=position_ids)
-
+        mask_info = MaskInfo.dynamic_init(mask_info=mask_info, input_ids=input_ids)
         encoder_outputs = self.encoder(
             inputs_embeds=hidden_states,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
         )
@@ -771,15 +780,10 @@ class CLIPTextTransformer(EasyDeLBaseModule):
 
 
 class CLIPVisionTransformer(EasyDeLBaseModule):
-    """
-    The transformer encoder for the CLIP vision model.
+    """Vision transformer encoder for CLIP models.
 
-    Attributes:
-            config (CLIPVisionConfig): Configuration object.
-            dtype (jnp.dtype): Data type for computation.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): JAX precision level.
-            rngs (nn.Rngs): Random number generators.
+    Processes images through patch embeddings, multiple encoder layers with
+    bidirectional attention, and layer normalization to produce vision representations.
     """
 
     def __init__(
@@ -791,6 +795,15 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize CLIP vision transformer.
+
+        Args:
+            config (CLIPVisionConfig): Vision model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -805,7 +818,7 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.pre_layrnorm = nn.LayerNorm(
+        self.pre_layrnorm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -819,7 +832,7 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.post_layernorm = nn.LayerNorm(
+        self.post_layernorm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -829,21 +842,25 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
 
     def __call__(
         self,
-        pixel_values: chex.Array | None = None,
+        pixel_values: Array | None = None,
         output_attentions=None,
         output_hidden_states=None,
     ):
-        """Forward pass for the vision transformer.
+        """Forward pass through the vision transformer.
+
+        Processes images through patch embeddings, pre-layer norm, encoder layers,
+        and produces pooled output from the class token.
 
         Args:
-                pixel_values (Optional[chex.Array]): Input pixel values.
-                output_attentions (Optional[bool]): Whether to output attention weights.
-                output_hidden_states (Optional[bool]): Whether to output all hidden states.
-
+            pixel_values: Input pixel values of shape (batch_size, channels, height, width)
+                or (batch_size, height, width, channels). Automatically transposed if needed.
+            output_attentions: Whether to return attention weights. Defaults to config value.
+            output_hidden_states: Whether to return hidden states from all layers.
+                Defaults to config value.
 
         Returns:
-                Union[BaseModelOutputWithPooling, Tuple]: Transformer output (last hidden state, pooled output, optional
-                    hidden states, optional attentions).
+            BaseModelOutputWithPooling containing last hidden state, pooled output
+            from class token, optional hidden states, and optional attention weights.
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -851,7 +868,8 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
         )
 
         if pixel_values is not None and pixel_values.ndim == 4:
-            pixel_values = jnp.swapaxes(pixel_values, 1, 3)
+            # Convert from NCHW (PyTorch) to NHWC (JAX)
+            pixel_values = jnp.transpose(pixel_values, (0, 2, 3, 1))
         hidden_states = self.embeddings(pixel_values)
         hidden_states = self.pre_layrnorm(hidden_states)
 
@@ -899,16 +917,12 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
         return self.embeddings
 
 
+@register_module(config=CLIPTextConfig, model_type="clip_text_model", task_type=TaskType.BASE_MODULE)
 class CLIPTextModel(EasyDeLBaseModule):
-    """
-    Bare CLIP text model (transformer) outputting raw hidden-states without any specific head on top.
+    """CLIP text model outputting raw hidden states.
 
-    Attributes:
-            config (CLIPTextConfig): Configuration object.
-            dtype (jnp.dtype): Data type for computation.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): JAX precision level.
-            rngs (nn.Rngs): Random number generators.
+    A bare transformer encoder for text that produces embeddings without
+    any task-specific head, suitable for use in contrastive learning.
     """
 
     def __init__(
@@ -920,6 +934,15 @@ class CLIPTextModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize CLIP text model.
+
+        Args:
+            config (CLIPTextConfig): Text model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -937,28 +960,43 @@ class CLIPTextModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
+        input_ids: Int[Array, "batch seq_len"],
+        mask_info: MaskInfo | None = None,
+        attention_mask: Array | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
-        """Forward pass for the bare CLIP text model.
+        """Forward pass through the CLIP text model.
 
         Args:
-                input_ids (chex.Array): Input token IDs.
-                attention_mask (chex.Array): Attention mask.
-                position_ids (chex.Array): Position IDs.
-                output_attentions (bool): Whether to output attention weights.
-                output_hidden_states (bool): Whether to output all hidden states.
-
+            input_ids: Input token IDs of shape (batch_size, sequence_length).
+            mask_info: Pre-computed attention mask information. Overrides attention_mask if provided.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) indicating
+                which tokens to attend to. Auto-generated as all-ones if not provided.
+            position_ids: Position indices of shape (batch_size, sequence_length).
+                Auto-generated if not provided.
+            output_attentions: Whether to return attention weights. Defaults to False.
+            output_hidden_states: Whether to return hidden states from all layers.
+                Defaults to False.
 
         Returns:
-                Union[BaseModelOutputWithPooling, Tuple]: Model output.
+            BaseModelOutputWithPooling containing last hidden state, pooled output,
+            optional hidden states, and optional attention weights.
         """
+        batch_size, seq_len = input_ids.shape
+
+        if position_ids is None:
+            position_ids = jnp.broadcast_to(jnp.arange(seq_len, dtype=jnp.int32)[None, :], (batch_size, seq_len))
+
+        if mask_info is None:
+            if attention_mask is None:
+                attention_mask = jnp.ones((batch_size, seq_len), dtype=jnp.bool_)
+            mask_info = MaskInfo.from_attention_mask(attention_mask)
+
         return self.text_model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -992,15 +1030,10 @@ class CLIPTextModel(EasyDeLBaseModule):
 
 
 class CLIPTextModelWithProjection(EasyDeLBaseModule):
-    """
-    CLIP text model with a projection layer on top.
+    """CLIP text model with a projection layer.
 
-    Attributes:
-            config (CLIPTextConfig): Configuration object.
-            dtype (jnp.dtype): Data type for computation.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): JAX precision level.
-            rngs (nn.Rngs): Random number generators.
+    Extends the text transformer with a linear projection layer to map
+    text embeddings to the shared multimodal embedding space.
     """
 
     def __init__(
@@ -1012,6 +1045,15 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize CLIP text model with projection.
+
+        Args:
+            config (CLIPTextConfig): Text model configuration with projection_dim.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1038,28 +1080,29 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
+        input_ids: Int[Array, "batch seq_len"],
+        mask_info: MaskInfo,
+        position_ids: Int[Array, "batch seq_len"],
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ) -> CLIPTextModelOutput:
-        """Forward pass for the CLIP text model with projection.
+        """Forward pass through the CLIP text model with projection.
 
         Args:
-                input_ids (chex.Array): Input token IDs.
-                attention_mask (chex.Array): Attention mask.
-                position_ids (chex.Array): Position IDs.
-                output_attentions (bool): Whether to output attention weights.
-                output_hidden_states (bool): Whether to output all hidden states.
-
+            input_ids: Input token IDs of shape (batch_size, sequence_length).
+            mask_info: Attention mask information for masking padded tokens.
+            position_ids: Position indices of shape (batch_size, sequence_length).
+            output_attentions: Whether to return attention weights. Defaults to False.
+            output_hidden_states: Whether to return hidden states from all layers.
+                Defaults to False.
 
         Returns:
-                Union[CLIPTextModelOutput, Tuple]: Model output including projected text embeddings.
+            CLIPTextModelOutput containing projected text embeddings, last hidden state,
+            optional hidden states, and optional attention weights.
         """
         text_outputs = self.text_model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -1105,15 +1148,10 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
 @register_module(config=CLIPVisionConfig, model_type="clip_vision_model", task_type=TaskType.BASE_VISION)
 @register_module(config=CLIPVisionConfig, model_type="clip_vision_model", task_type=TaskType.BASE_MODULE)
 class CLIPVisionModel(EasyDeLBaseModule):
-    """
-    Bare CLIP vision model (transformer) outputting raw hidden-states without any specific head on top.
+    """CLIP vision model outputting raw hidden states.
 
-    Attributes:
-            config (CLIPVisionConfig): Configuration object.
-            dtype (jnp.dtype): Data type for computation.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): JAX precision level.
-            rngs (nn.Rngs): Random number generators.
+    A bare vision transformer that processes images and produces embeddings
+    without any task-specific head, suitable for use in contrastive learning.
     """
 
     def __init__(
@@ -1125,6 +1163,15 @@ class CLIPVisionModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize CLIP vision model.
+
+        Args:
+            config (CLIPVisionConfig): Vision model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1142,20 +1189,22 @@ class CLIPVisionModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        pixel_values: chex.Array,
+        pixel_values: Array,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
-        """Forward pass for the bare CLIP vision model.
+        """Forward pass through the CLIP vision model.
 
         Args:
-                pixel_values (chex.Array): Input pixel values.
-                output_attentions (bool): Whether to output attention weights.
-                output_hidden_states (bool): Whether to output all hidden states.
-
+            pixel_values: Input pixel values of shape (batch_size, channels, height, width)
+                or (batch_size, height, width, channels).
+            output_attentions: Whether to return attention weights. Defaults to False.
+            output_hidden_states: Whether to return hidden states from all layers.
+                Defaults to False.
 
         Returns:
-                Union[BaseModelOutputWithPooling, Tuple]: Model output.
+            BaseModelOutputWithPooling containing last hidden state, pooled output,
+            optional hidden states, and optional attention weights.
         """
         return self.vision_model(
             pixel_values=pixel_values,
@@ -1191,16 +1240,11 @@ class CLIPVisionModel(EasyDeLBaseModule):
 
 
 @register_module(config=CLIPVisionConfig, model_type="clip", task_type=TaskType.IMAGE_CLASSIFICATION)
-class CLIPForImageClassification(EasyDeLBaseModule):
-    """
-    CLIP vision model with an image classification head on top (a linear layer on the pooled final hidden state).
+class CLIPForImageClassification(BaseImageClassificationModule[CLIPVisionTransformer, CLIPVisionConfig]):  # type: ignore
+    """CLIP vision model with image classification head.
 
-    Attributes:
-            config (CLIPVisionConfig): Configuration object.
-            dtype (jnp.dtype): Data type for computation.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): JAX precision level.
-            rngs (nn.Rngs): Random number generators.
+    Extends the CLIP vision transformer with a linear classification layer
+    on top of the mean-pooled patch embeddings for image classification tasks.
     """
 
     def __init__(
@@ -1212,36 +1256,45 @@ class CLIPForImageClassification(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the CLIPForImageClassification model."""
+        """Initialize CLIP for image classification.
+
+        Args:
+            config (CLIPVisionConfig): Vision model configuration with num_labels.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
+            base_model_class=CLIPVisionTransformer,
+            base_model_name="vision_model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.vision_model = CLIPVisionTransformer(
-            config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.classifier = ColumnParallelLinear(
-            config.vision_config.hidden_size,
-            config.num_labels,
-            rngs=rngs,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
+            pooling_strategy="mean",
         )
 
     def __call__(
         self,
-        pixel_values: chex.Array | None = None,
+        pixel_values: Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> tuple | ImageClassifierOutput:
+        """Forward pass for image classification.
+
+        Args:
+            pixel_values: Input pixel values of shape (batch_size, channels, height, width)
+                or (batch_size, height, width, channels).
+            output_attentions: Whether to return attention weights. Defaults to config value.
+            output_hidden_states: Whether to return hidden states from all layers.
+                Defaults to config value.
+
+        Returns:
+            ImageClassifierOutput containing classification logits, optional hidden states,
+            and optional attention weights.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1293,9 +1346,20 @@ class CLIPForImageClassification(EasyDeLBaseModule):
         """
         return self.vision_model.embeddings
 
+    def get_task_head(self):
+        """Returns the image classification head."""
+        return self.classifier
+
 
 @register_module(config=CLIPConfig, model_type="clip", task_type=TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION)
 class CLIPModel(EasyDeLBaseModule):
+    """Contrastive Language-Image Pre-training (CLIP) model.
+
+    Combines text and vision encoders with projection heads to create
+    a shared embedding space for zero-shot image classification and
+    image-text retrieval tasks.
+    """
+
     def __init__(
         self,
         config: CLIPConfig,
@@ -1305,6 +1369,15 @@ class CLIPModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize CLIP model.
+
+        Args:
+            config (CLIPConfig): Combined text and vision configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1312,7 +1385,7 @@ class CLIPModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        text_config = self.config.text_config
+        text_config = self.config.get_text_config()
         vision_config = self.config.vision_config
 
         self.projection_dim = self.config.projection_dim
@@ -1342,19 +1415,61 @@ class CLIPModel(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.visual_projection = linear_class(config.vision_config.hidden_size, self.projection_dim)
-        self.text_projection = linear_class(config.text_config.hidden_size, self.projection_dim)
+        self.text_projection = linear_class(config.get_text_config().hidden_size, self.projection_dim)
 
-        self.logit_scale = nn.Param(jnp.ones([]) * self.config.logit_scale_init_value)
+        self.logit_scale = ArrayParam.bound(
+            shape=(),
+            dtype=jnp.float32,
+            init_method="ones",
+            key=None,
+            value=jnp.ones((), dtype=jnp.float32) * self.config.logit_scale_init_value,
+        )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for custom scalar parameters."""
+        return {"logit_scale": Replicated}
 
     def __call__(
         self,
-        input_ids: chex.Array,
-        pixel_values: chex.Array,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None,
+        pixel_values: Array,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions=None,
         output_hidden_states=None,
     ) -> CLIPOutput:
+        """Performs forward pass through CLIP's dual-encoder architecture.
+
+        Processes images through the vision transformer and text through the text transformer,
+        projects both to a shared embedding space, and computes contrastive similarity logits
+        between all image-text pairs in the batch.
+
+        Args:
+            input_ids: Text token IDs of shape (batch_size, sequence_length). Tokenized text
+                inputs for the text encoder.
+            pixel_values: Image pixel values of shape (batch_size, channels, height, width)
+                or (batch_size, height, width, channels) depending on data format. Preprocessed
+                images for the vision encoder.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) for text,
+                indicating which tokens to attend to. Auto-generated as all-ones if not provided.
+            mask_info: Pre-computed mask information for text. If provided, overrides
+                `attention_mask`.
+            position_ids: Explicit position indices of shape (batch_size, sequence_length)
+                for text. Auto-generated from attention_mask if not provided.
+            output_attentions: Whether to return attention weights from vision and text encoders.
+            output_hidden_states: Whether to return hidden states from all layers of both encoders.
+
+        Returns:
+            CLIPOutput containing:
+                - logits_per_image: Similarity scores of shape (batch, batch) where entry [i,j]
+                    is the scaled cosine similarity between image i and text j
+                - logits_per_text: Transposed similarity scores of shape (batch, batch)
+                - text_embeds: L2-normalized text embeddings of shape (batch, projection_dim)
+                - image_embeds: L2-normalized image embeddings of shape (batch, projection_dim)
+                - text_model_output: Full output from text encoder including hidden states
+                - vision_model_output: Full output from vision encoder including hidden states
+        """
         if attention_mask is None and input_ids is not None:
             attention_mask = jnp.ones_like(input_ids)
         if position_ids is None and attention_mask is not None:
@@ -1369,6 +1484,7 @@ class CLIPModel(EasyDeLBaseModule):
         text_outputs = self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -1398,20 +1514,48 @@ class CLIPModel(EasyDeLBaseModule):
 
     def get_text_features(
         self,
-        input_ids: chex.Array,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"],
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
     ):
+        """Extract text features from input tokens.
+
+        Processes text through the text encoder and projects to the shared
+        embedding space.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, sequence_length).
+            attention_mask: Boolean mask indicating tokens to attend to.
+            mask_info: Pre-computed mask information.
+            position_ids: Position indices for tokens.
+
+        Returns:
+            Projected text features of shape (batch_size, projection_dim).
+        """
         text_outputs = self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
         )
         pooled_output = text_outputs[1]
         text_features = checkpoint_name(self.text_projection(pooled_output), name="text_projection_output")
         return text_features
 
-    def get_image_features(self, pixel_values: chex.Array):
+    def get_image_features(self, pixel_values: Array):
+        """Extract image features from pixel values.
+
+        Processes images through the vision encoder and projects to the shared
+        embedding space.
+
+        Args:
+            pixel_values: Input pixel values of shape (batch_size, channels, height, width)
+                or (batch_size, height, width, channels).
+
+        Returns:
+            Projected image features of shape (batch_size, projection_dim).
+        """
         vision_outputs = self.vision_model(pixel_values=pixel_values)
         pooled_output = vision_outputs[1]  # pooled_output
         image_features = checkpoint_name(self.visual_projection(pooled_output), name="visual_projection_output")
@@ -1425,11 +1569,38 @@ class CLIPModel(EasyDeLBaseModule):
         loss_kwargs=None,  # just to extract
         **batch,
     ) -> tuple[tp.Any, CLIPOutput]:
-        outputs = self(**batch)
+        """Compute contrastive loss for CLIP training.
+
+        Calculates the symmetric cross-entropy loss between image-text similarity
+        scores for contrastive learning.
+
+        Args:
+            labels: Unused, extracted for API compatibility.
+            loss_config: Unused, extracted for API compatibility.
+            loss_kwargs: Unused, extracted for API compatibility.
+            **batch: Input batch containing input_ids, pixel_values, and masks.
+
+        Returns:
+            Tuple of (CLIPOutput with loss, LossMetrics).
+        """
+        forward_batch = batch
+        try:
+            call_signature = inspect.signature(self.__call__)
+        except (TypeError, ValueError):
+            call_signature = None
+        if call_signature is not None:
+            call_parameters = call_signature.parameters
+            if not any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in call_parameters.values()):
+                accepted_keys = set(call_parameters.keys())
+                forward_batch = {key: value for key, value in batch.items() if key in accepted_keys}
+        if forward_batch.get("input_ids", None) is not None and forward_batch.get("inputs_embeds", None) is not None:
+            forward_batch = dict(forward_batch)
+            forward_batch.pop("inputs_embeds", None)
+        outputs = self(**forward_batch)
 
         loss = LossMetrics(loss=clip_loss(outputs.logits_per_text))
         outputs = outputs.replace(loss=loss.loss)
-        return outputs, loss
+        return outputs, loss  # pyright: ignore[reportReturnType]
 
     def get_encoder(self):
         """

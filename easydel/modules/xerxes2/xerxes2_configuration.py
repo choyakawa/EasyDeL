@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,10 +13,11 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, ExpertColumnWiseAlt, ExpertRowWiseAlt, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
+from easydel.layers import RopeConfig
 
 
 @register_config("xerxes2")
@@ -107,6 +108,8 @@ class Xerxes2Config(EasyDeLBaseConfig):
         vhead_dim: int = 128,
         mlp_only_layers: list[int] | None = None,
         hidden_act: str | None = None,
+        rope_scaling: dict | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         self.bits = bits
@@ -135,6 +138,12 @@ class Xerxes2Config(EasyDeLBaseConfig):
         self.vhead_dim = vhead_dim
         self.mlp_only_layers = [] if mlp_only_layers is None else mlp_only_layers
         self.hidden_act = hidden_act if hidden_act is not None else "silu"
+        if rope_scaling is None:
+            rope_scaling = {"type": "linear", "factor": 1.0}
+        self.rope_scaling = rope_scaling
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -144,47 +153,38 @@ class Xerxes2Config(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
 
-        Args:
-            fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
-                Whether to use fully sharded data parallelism.
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
 
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/qa_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/qb_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/qc_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/kv_mqa_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/kvi_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"self_attn/(qa_norm|kv_norm)/scale", pmag.resolve(Replicated)),
-            (r"self_attn/(qa_norm|kv_norm)/bias", pmag.resolve(Replicated)),
-            # Standard MLP rules
-            (r"mlp/gate_up_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            # MoE specific rules
-            (r"mlp/gate/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/gate/bias", pmag.resolve(Replicated)),
-            (r"mlp/experts/gate_proj/kernel", pmag.resolve(ExpertColumnWiseAlt)),
-            (r"mlp/experts/up_proj/kernel", pmag.resolve(ExpertColumnWiseAlt)),
-            (r"mlp/experts/down_proj/kernel", pmag.resolve(ExpertRowWiseAlt)),
-            (r"mlp/experts/.*/bias", pmag.resolve(Replicated)),
-            # Layer norms
-            (
-                r".*/(input_layernorm|post_attention_layernorm|pre_feedforward_layernorm|post_feedforward_layernorm|norm)/kernel",
-                pmag.resolve(Replicated),
-            ),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"score/kernel", pmag.resolve(RowWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
+
+    def _get_rope_config(self) -> RopeConfig:
+        """Get RoPE configuration from the instance attributes."""
+        if not hasattr(self, "rope_scaling") or self.rope_scaling is None:
+            config = RopeConfig.from_dict(
+                dict(
+                    rope_type="yarn",
+                    base=10000,
+                    scaling_factor=1.0,
+                    original_max_position_embeddings=4096,
+                    beta_fast=32,
+                    beta_slow=1,
+                    mscale=1,
+                    mscale_all_dim=0,
+                )
+            )
+        else:
+            config = RopeConfig.from_dict(self.rope_scaling)
+
+            if config.original_max_position_embeddings is None:
+                config.original_max_position_embeddings = getattr(self, "original_max_position_embeddings", None)
+
+        return config

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,25 +31,24 @@ various model architectures including language models, vision models,
 and multimodal architectures.
 """
 
+import collections.abc
 import typing as tp
 
 import jax
-import jax.experimental
-import jax.lib
-from eformer.escale import with_sharding_constraint
-from jax.sharding import NamedSharding, PartitionSpec
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
 from easydel.infra.loss_utils import LossMetrics
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import ejit
-from easydel.utils.helpers import capture_time, get_logger
+from easydel.utils.helpers import capture_time, get_logger  # pyright: ignore[reportPrivateLocalImportUsage]
 
-from ..base_trainer import BaseTrainer, TrainerConfigureFunctionOutput
-from ..trainer_protocol import BaseProgressBar, MetricsTracker, StepMetrics
+from ..base_trainer import BaseTrainer, TrainerConfigureFunctionOutput  # pyright: ignore[reportPrivateLocalImportUsage]
+from ..metrics import BaseProgressBar, MetricsTracker, StepMetrics
+from ..trainer_protocol import TrainerOutput
+from ..training_utils import resolve_straight_through_emulator
 from ._fn import evaluation_step, training_step
-from .modeling_output import TrainerOutput
 
 logger = get_logger(__name__)
 
@@ -219,15 +218,23 @@ class Trainer(BaseTrainer):
             - Empty sharding specs indicate replication across devices
         """
         empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=self.model.mesh)
+        straight_through_emulator = resolve_straight_through_emulator(
+            quantization_mode=self.arguments.quantization_mode,
+            quantization_group_size=self.arguments.quantization_group_size,
+            quantization_bits=self.arguments.quantization_bits,
+            tensor_straight_through=self.arguments.tensor_straight_through,
+            straight_through_emulator=self.arguments.straight_through_emulator,
+        )
         self._train_shared_fn_static_args = (
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
+            straight_through_emulator,
         )
         sharded_training_step_function = ejit(
             training_step,
-            static_argnums=(2, 3, 4, 5),
+            static_argnums=(2, 3, 4, 5, 6),
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
@@ -254,30 +261,6 @@ class Trainer(BaseTrainer):
             mesh=mesh,
             checkpoint_manager=checkpoint_manager,
         )
-
-    def _all_gather(self, arr: jax.Array) -> jax.Array:
-        """Gather array from all devices to a single replicated array.
-
-        Args:
-            arr: Array to gather across devices.
-
-        Returns:
-            Array replicated across all devices.
-        """
-        return jax.device_put(arr, NamedSharding(self.model.mesh, PartitionSpec()))
-
-    def _one_to_all(self, arr: jax.Array) -> jax.Array:
-        """Distribute array from one device to all devices.
-
-        Args:
-            arr: Array to distribute.
-
-        Returns:
-            Array distributed across devices.
-        """
-        with self.mesh:
-            arr = with_sharding_constraint(arr, PartitionSpec(None))
-        return arr
 
     def _run_training_loop(
         self,
@@ -343,6 +326,7 @@ class Trainer(BaseTrainer):
 
         if initial_step > 0:
             pbar.update(initial_step)
+            assert self.max_training_steps is not None, "max_training_steps must be set before training"
             steps_per_epoch = self.max_training_steps // self.arguments.num_train_epochs
 
             if self.arguments.use_grain:
@@ -498,7 +482,9 @@ class Trainer(BaseTrainer):
             def data_collator(x):
                 return x
 
+        assert self.max_training_steps is not None, "max_training_steps must be set before training"
         steps_per_epoch = self.max_training_steps // self.arguments.num_train_epochs
+        run_exception: Exception | None = None
 
         for _ in range(steps_per_epoch):
             current_step = int(jax.device_get(state.step))
@@ -534,7 +520,7 @@ class Trainer(BaseTrainer):
                     flops_per_token=self._backward_flops_per_token,
                     extra_flops_per_token=self._extra_backward_flops_per_token,
                     batch_size=self.training_batch_size,
-                    seq_length=self.arguments.max_sequence_length,
+                    seq_length=self.arguments.max_length,
                     mean_loss=mean_loss,
                     mean_accuracy=mean_accuracy,
                     mode="train",
@@ -551,13 +537,25 @@ class Trainer(BaseTrainer):
                     mode="train",
                 )
                 self.log_weight_distribution(state=state, step=current_step)
-                # Save checkpoint if needed
-                if self._should_save_checkpoint(current_step):
-                    _ = self._save_state(
-                        state=state,
-                        milestone=True,
-                        save_directory=self.arguments.save_directory,
+                try:
+                    self.maybe_generate(state=state, step=current_step, metrics=metrics)
+                except Exception as exc:  # pragma: no cover - preview must not interrupt training
+                    logger.warn(f"Preview generation hook failed: {exc}")
+
+                def checkpoint_callback(dest, mesh, meta, s=state):
+                    self._save_state(
+                        state=s,
+                        save_directory=str(self.arguments._get_save_directory() / dest),
                     )
+                    # Clean up old permanent checkpoints if save_total_limit is set
+                    self._cleanup_old_checkpoints()
+
+                self.checkpointer.on_step(
+                    mesh=self.mesh,
+                    pytree=None,  # State saving handled via callback
+                    step=current_step,
+                    true_callbacks=[checkpoint_callback],
+                )
                 if self._should_run_evaluation(current_step):
                     for _ in self.eval(model_state=state):
                         ...
@@ -636,7 +634,7 @@ class Trainer(BaseTrainer):
                     flops_per_token=self._forward_flops_per_token,
                     extra_flops_per_token=self._extra_forward_flops_per_token,
                     batch_size=self.evaluation_batch_size,
-                    seq_length=self.arguments.max_sequence_length,
+                    seq_length=self.arguments.max_length,
                     mean_loss=mean_loss,
                     mean_accuracy=mean_accuracy,
                     mode="eval",
@@ -683,7 +681,7 @@ class Trainer(BaseTrainer):
         self,
         state,
         batch,
-    ) -> tuple[EasyDeLState, LossMetrics, Exception | None]:
+    ) -> tuple[EasyDeLState, LossMetrics, BaseException | None]:
         """
         Execute a single training step with gradient computation and updates.
 
@@ -832,7 +830,7 @@ class Trainer(BaseTrainer):
         )
         return self._finalize_training(output, run_exception)
 
-    def eval(self, model_state: EasyDeLState) -> tp.Iterator[dict]:
+    def eval(self, model_state: EasyDeLState) -> collections.abc.Iterator[dict]:
         """
         Evaluate the model on the evaluation dataset.
 

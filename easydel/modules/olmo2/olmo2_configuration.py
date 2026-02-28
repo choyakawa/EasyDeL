@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 
 import typing
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -106,60 +106,32 @@ class Olmo2Config(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vocab_size=50304,
-        hidden_size=4096,
-        intermediate_size=11008,
-        num_hidden_layers=32,
-        num_attention_heads=32,
-        num_key_value_heads=None,
-        hidden_act="silu",
-        max_position_embeddings=2048,
-        initializer_range=0.02,
-        use_cache=True,
-        pad_token_id=1,
-        bos_token_id=None,
-        eos_token_id=50279,
-        tie_word_embeddings=False,
-        rope_theta=10000.0,
-        rope_scaling=None,
-        attention_bias=False,
-        attention_dropout=0.0,
-        rms_norm_eps=1e-5,
+        vocab_size: int = 50304,
+        hidden_size: int = 4096,
+        intermediate_size: int = 11008,
+        num_hidden_layers: int = 32,
+        num_attention_heads: int = 32,
+        num_key_value_heads: int | None = None,
+        hidden_act: str = "silu",
+        max_position_embeddings: int = 2048,
+        initializer_range: float = 0.02,
+        use_cache: bool = True,
+        pad_token_id: int = 1,
+        bos_token_id: int | None = None,
+        eos_token_id: int = 50279,
+        tie_word_embeddings: bool = False,
+        rope_theta: float = 10000.0,
+        rope_scaling: dict | None = None,
+        attention_bias: bool = False,
+        attention_dropout: float = 0.0,
+        rms_norm_eps: float = 1e-5,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         use_scan_mlp: bool = False,
         scan_mlp_chunk_size: int = 1024,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
-        """Initializes an Olmo2Config object.
-
-        Args:
-            vocab_size (int, optional): Vocabulary size. Defaults to 50304.
-            hidden_size (int, optional): Hidden size. Defaults to 4096.
-            intermediate_size (int, optional): Intermediate size of the feed-forward network. Defaults to 11008.
-            num_hidden_layers (int, optional): Number of hidden layers. Defaults to 32.
-            num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
-            num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to `num_attention_heads`.
-            hidden_act (str, optional): Activation function. Defaults to "silu".
-            max_position_embeddings (int, optional): Maximum sequence length. Defaults to 2048.
-            initializer_range (float, optional): Initializer range. Defaults to 0.02.
-            use_cache (bool, optional): Whether to use KV cache. Defaults to True.
-            pad_token_id (int, optional): Padding token ID. Defaults to 1.
-            bos_token_id (int, optional): Beginning-of-sequence token ID. Defaults to None.
-            eos_token_id (int, optional): End-of-sequence token ID. Defaults to 50279.
-            tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
-            rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
-            rope_scaling (dict, optional): RoPE scaling configuration. Defaults to None.
-            attention_bias (bool, optional): Whether to use bias in attention layers. Defaults to False.
-            attention_dropout (float, optional): Dropout probability for attention. Defaults to 0.0.
-            rms_norm_eps (float, optional): Epsilon for RMS normalization. Defaults to 1e-5.
-            gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
-                Defaults to EasyDeLGradientCheckPointers.NONE.
-            use_scan_mlp (bool, optional): Whether to use scan for MLP layers. Defaults to False.
-            scan_mlp_chunk_size (int, optional): Chunk size for scan MLP. Defaults to 1024.
-            bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
-            **kwargs: Additional keyword arguments.
-        """
         self.gradient_checkpointing = gradient_checkpointing
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
@@ -193,6 +165,9 @@ class Olmo2Config(EasyDeLBaseConfig):
         self.attention_dropout = attention_dropout
 
         self.rms_norm_eps = rms_norm_eps
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
 
     def _rope_scaling_validation(self):
         """
@@ -204,11 +179,17 @@ class Olmo2Config(EasyDeLBaseConfig):
         if self.rope_scaling is None:
             return
 
-        if not isinstance(self.rope_scaling, dict) or len(self.rope_scaling) != 2:
+        if not isinstance(self.rope_scaling, dict):
             raise ValueError(
                 f"`rope_scaling` must be a dictionary with two fields, `type` and `factor`, got {self.rope_scaling}"
             )
-        rope_scaling_type = self.rope_scaling.get("type", None)
+
+        rope_scaling_type = self.rope_scaling.get("type", self.rope_scaling.get("rope_type"))
+        # Base config compatibility can inject a default rope payload; treat it as no scaling.
+        if rope_scaling_type in (None, "default"):
+            self.rope_scaling = None
+            return
+
         rope_scaling_factor = self.rope_scaling.get("factor", None)
         if rope_scaling_type is None or rope_scaling_type not in ["linear", "dynamic"]:
             raise ValueError(
@@ -217,36 +198,15 @@ class Olmo2Config(EasyDeLBaseConfig):
         if rope_scaling_factor is None or not isinstance(rope_scaling_factor, float) or rope_scaling_factor <= 1.0:
             raise ValueError(f"`rope_scaling`'s factor field must be a float > 1, got {rope_scaling_factor}")
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"self_attn/(q_norm|k_norm)/kernel", pmag.resolve(Replicated)),
-            (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            (
-                r".*/(post_attention_layernorm|post_feedforward_layernorm|norm)/kernel",
-                pmag.resolve(Replicated),
-            ),
-            (
-                r".*/(post_attention_layernorm|post_feedforward_layernorm|norm)/scale",
-                pmag.resolve(Replicated),
-            ),
-            (
-                r".*/(post_attention_layernorm|post_feedforward_layernorm|norm)/bias",
-                pmag.resolve(Replicated),
-            ),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"score/kernel", pmag.resolve(RowWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None

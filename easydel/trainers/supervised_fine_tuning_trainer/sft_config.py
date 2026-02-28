@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,9 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import typing as tp
-from dataclasses import field
-
-from eformer.pytree import auto_pytree
+from dataclasses import dataclass, field
 
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
@@ -23,7 +21,7 @@ from ..training_configurations import TrainingArguments
 
 
 @Registry.register("trainer-arguments", "sft")
-@auto_pytree
+@dataclass
 class SFTConfig(TrainingArguments):
     r"""
     Configuration class for the [`SFTTrainer`].
@@ -54,7 +52,7 @@ class SFTConfig(TrainingArguments):
         metadata={"help": "default prefix name for trainer."},
     )
     dataset_text_field: str | None = field(
-        default=None,
+        default="text",
         metadata={"help": "Name of the text field of the dataset."},
     )
     add_special_tokens: bool = field(

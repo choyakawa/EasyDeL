@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,9 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from typing import ClassVar
+
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -82,6 +84,7 @@ class ExaoneConfig(EasyDeLBaseConfig):
     """
 
     model_type: str = "exaone"
+    attribute_map: ClassVar = {"num_hidden_layers": "num_layers"}
 
     def __init__(
         self,
@@ -90,24 +93,25 @@ class ExaoneConfig(EasyDeLBaseConfig):
         intermediate_size: int = 14336,
         num_layers: int = 32,
         num_attention_heads: int = 32,
-        num_key_value_heads: int = 8,
-        activation_function="silu",
-        max_position_embeddings=2048,
-        initializer_range=0.02,
-        layer_norm_epsilon=1e-5,
-        use_cache=True,
+        num_key_value_heads: int | None = 8,
+        activation_function: str = "silu",
+        max_position_embeddings: int = 2048,
+        initializer_range: float = 0.02,
+        layer_norm_epsilon: float = 1e-5,
+        use_cache: bool = True,
         embed_dropout: float = 0.0,
         pad_token_id: int | None = None,
         bos_token_id: int = 1,
         eos_token_id: int = 2,
-        tie_word_embeddings=False,
-        rope_theta=10000.0,
+        tie_word_embeddings: bool = False,
+        rope_theta: float = 10000.0,
         rope_scaling: dict[str, str | float] | None = None,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         attention_dropout: float = 0.0,
         use_scan_mlp: bool = False,
         scan_mlp_chunk_size: int = 1024,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initialize a new ExaoneConfig instance.
@@ -166,6 +170,9 @@ class ExaoneConfig(EasyDeLBaseConfig):
         self.gradient_checkpointing = gradient_checkpointing
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -178,27 +185,18 @@ class ExaoneConfig(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"wte/embedding", pmag.resolve(ColumnWise)),
-            (r"attention/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"attention/out_proj/kernel", pmag.resolve(RowWise)),
-            (r"attention/.*proj/bias", pmag.resolve(Replicated)),
-            (r"mlp/(c_fc_0|c_fc_1)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/c_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            (r".*/(ln_1|ln_2|ln_f)/kernel", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"score/kernel", pmag.resolve(RowWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
     @property
     def granted_freq_max_position_embedding(self) -> int:

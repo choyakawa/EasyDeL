@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,45 +14,44 @@
 
 
 from functools import cached_property, partial
+from typing import ClassVar
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
+from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
+from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.attention import UnifiedAttention
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import BaseCausalLMModule
 
 from .stablelm_configuration import StableLmConfig
 
 
 class StableLmMLP(nn.Module):
-    """Multi-Layer Perceptron (MLP) block for the StableLM model.
+    """Multi-Layer Perceptron module for StableLM models.
 
-    Attributes:
-        config (StableLmConfig): Configuration object for the model.
-        gate_proj (ParallelLinear): Linear layer for the gating mechanism.
-        down_proj (ParallelLinear): Linear layer for down-projection.
-        up_proj (ParallelLinear): Linear layer for up-projection.
-        act_fn (callable): Activation function (specified in config).
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+    Implements the feedforward network with SwiGLU activation function
+    for enhanced representation learning in StableLM architecture.
     """
 
     def __init__(
@@ -63,15 +62,18 @@ class StableLmMLP(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
-        """Initializes the StableLmMLP module.
+        """Initialize StableLM MLP block.
 
         Args:
-            config (StableLmConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (StableLmConfig): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
         """
         self.config = config
         self.dtype = dtype
@@ -84,7 +86,6 @@ class StableLmMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         row_parallel_linear = partial(
             RowParallelLinear,
@@ -93,7 +94,6 @@ class StableLmMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
         self.gate_proj = column_parallel_linear(
@@ -113,14 +113,16 @@ class StableLmMLP(nn.Module):
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
-        """Forward pass of the MLP block.
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply SwiGLU feedforward transformation.
 
         Args:
-            hidden_states (jnp.ndarray): Input hidden states.
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
 
         Returns:
-            jnp.ndarray: Output hidden states after MLP transformation.
+            Transformed hidden states [batch, seq_len, hidden_dim]
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -140,10 +142,10 @@ class StableLmMLP(nn.Module):
 
 
 class StableLmLayerNormPerHead(nn.Module):
-    """Applies Layer Normalization independently to each attention head's dimension.
+    """Layer normalization applied independently to each attention head.
 
-    Attributes:
-        norms (list[nn.LayerNorm]): List of LayerNorm modules, one per head.
+    This module normalizes each attention head separately, which can improve
+    training stability and model quality in certain architectures.
     """
 
     def __init__(
@@ -157,40 +159,41 @@ class StableLmLayerNormPerHead(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the StableLmLayerNormPerHead module.
+        """Initialize per-head layer normalization.
 
         Args:
-            head_dim (int): The dimension of each attention head.
-            num_heads (int): The number of attention heads.
-            eps (float): Epsilon value for LayerNorm (default: 1e-5).
-            bias (bool): Whether to include bias in LayerNorm (default: False).
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            rngs (nn.Rngs): Random number generators.
+            head_dim (int): Dimension of each attention head.
+            num_heads (int): Number of attention heads.
+            eps (float, optional): Epsilon for numerical stability. Defaults to 1e-5.
+            bias (bool, optional): Whether to include bias in LayerNorm. Defaults to False.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            rngs (nn.Rngs): Random number generator state.
         """
-        self.norms = [
-            nn.LayerNorm(
-                head_dim,
-                epsilon=eps,
-                use_bias=bias,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                rngs=rngs,
-            )
-            for idx in range(num_heads)
-        ]
+        self.norms = nn.List(
+            [
+                LayerNorm(
+                    head_dim,
+                    epsilon=eps,
+                    use_bias=bias,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    rngs=rngs,
+                )
+                for _ in range(num_heads)
+            ]
+        )
 
     def __call__(self, hidden_states):
-        """Applies LayerNorm per head.
+        """Apply layer normalization independently to each head.
 
         Args:
-            hidden_states (chex.Array): Input hidden states, expected shape (..., num_heads * head_dim).
+            hidden_states: Input tensor with shape (..., num_heads * head_dim)
 
         Returns:
-            chex.Array: Hidden states after applying LayerNorm per head, same shape as input.
+            Normalized hidden states with same shape as input
         """
         # hidden_states: [batch, seq_len, num_heads * head_dim]
-        # Reshape to [batch, seq_len, num_heads, head_dim]
         states_per_heads = jnp.split(hidden_states, 1, axis=1)
         # Normalize and merge the heads back together
         return jnp.concatenate(
@@ -199,34 +202,17 @@ class StableLmLayerNormPerHead(nn.Module):
         )
 
 
-class StableLmAttention(AttentionModule):
-    """StableLM Attention module with Rotary Position Embeddings and optional LayerNorm on QK.
+class StableLmAttention(UnifiedAttention):
+    """Multi-head attention layer with Q/K normalization for StableLM models.
 
-    Attributes:
-        config (StableLmConfig): Configuration object for the model.
-        hidden_size (int): Dimensionality of the hidden states.
-        num_heads (int): Number of attention heads.
-        head_dim (int): Dimensionality of each attention head.
-        num_key_value_heads (int): Number of key/value heads (for GQA).
-        num_key_value_groups (int): Number of query heads per key/value head.
-        max_position_embeddings (int): Maximum sequence length.
-        rope_theta (float): Base value for RoPE.
-        partial_rotary_factor (float): Factor determining the portion of head dimension subject to RoPE.
-        q_proj (ParallelLinear): Linear layer for query projection.
-        k_proj (ParallelLinear): Linear layer for key projection.
-        v_proj (ParallelLinear): Linear layer for value projection.
-        o_proj (ParallelLinear): Linear layer for output projection.
-        rotary_emb_dim (int): Dimensionality of the rotary embeddings.
-        attention_performer (FlexibleAttentionModule): Module for performing attention computation.
-        qk_layernorm (bool): Whether to apply LayerNorm to query and key states.
-        q_layernorm (StableLmLayerNormPerHead): LayerNorm for query states (if qk_layernorm is True).
-        k_layernorm (StableLmLayerNormPerHead): LayerNorm for key states (if qk_layernorm is True).
-        rotary (RotaryEmbedding): Rotary positional embedding module.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+    Implements attention with optional query/key normalization using per-head
+    LayerNorm and partial rotary position embeddings (RoPE).
     """
+
+    norms_mapping: ClassVar = {
+        "query_normalization": "q_layernorm",
+        "key_normalization": "k_layernorm",
+    }
 
     def __init__(
         self,
@@ -236,103 +222,94 @@ class StableLmAttention(AttentionModule):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
-        """Initializes the StableLmAttention module.
+        """Initialize StableLM attention layer with optional Q/K normalization.
 
         Args:
-            config (StableLmConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (StableLmConfig): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
         """
-        super().__init__(config=config)
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
+        self.qk_layernorm = config.qk_layernorm
         self.partial_rotary_factor = config.partial_rotary_factor
 
-        if self.num_key_value_groups == 1:
-            assert self.config.num_attention_heads == self.config.num_key_value_heads
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.rotary_emb_dim = int(config.partial_rotary_factor * self.head_dim)
 
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+            attention_type="standard",
+            causal=True,
+            use_qk_norm=config.qk_layernorm,
+        )
+
+    def _create_q_norm(self, config, dtype, param_dtype, rngs):
+        """Create query normalization layer using per-head LayerNorm.
+
+        Args:
+            config: Model configuration.
+            dtype: Data type for computation.
+            param_dtype: Data type for parameters.
+            rngs: Random number generator state.
+
+        Returns:
+            StableLmLayerNormPerHead if qk_layernorm enabled, None otherwise.
+        """
+        if not self.qk_layernorm:
+            return None
+        return StableLmLayerNormPerHead(
+            head_dim=self.head_dim,
+            num_heads=config.num_attention_heads,
+            eps=config.layer_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            rngs=rngs,
         )
-        row_parallel_linear = partial(
-            RowParallelLinear,
+
+    def _create_k_norm(self, config, dtype, param_dtype, rngs):
+        """Create key normalization layer using per-head LayerNorm.
+
+        Args:
+            config: Model configuration.
+            dtype: Data type for computation.
+            param_dtype: Data type for parameters.
+            rngs: Random number generator state.
+
+        Returns:
+            StableLmLayerNormPerHead if qk_layernorm enabled, None otherwise.
+        """
+        if not self.qk_layernorm:
+            return None
+        return StableLmLayerNormPerHead(
+            head_dim=self.head_dim,
+            num_heads=config.num_key_value_heads,
+            eps=config.layer_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        self.q_proj = column_parallel_linear(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            use_bias=self.config.use_qkv_bias,
-            rngs=rngs,
-        )
-        self.k_proj = column_parallel_linear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            use_bias=self.config.use_qkv_bias,
-            rngs=rngs,
-        )
-        self.v_proj = column_parallel_linear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            use_bias=self.config.use_qkv_bias,
-            rngs=rngs,
-        )
-        self.o_proj = row_parallel_linear(
-            config.num_attention_heads * self.head_dim,
-            config.hidden_size,
-            use_bias=False,
             rngs=rngs,
         )
 
-        self.rotary_emb_dim = int(self.config.partial_rotary_factor * self.head_dim)
-        self.attention_performer = FlexibleAttentionModule(
-            rngs=rngs,
-            base_config=config,
-            softmax_scale=self.head_dim**-0.5,
-            dropout_prob=config.attention_dropout,
-        )
+    def _create_rotary(self, config, dtype):
+        """Create partial rotary position embeddings.
 
-        self.qk_layernorm = config.qk_layernorm
-        if self.qk_layernorm:
-            self.q_layernorm = StableLmLayerNormPerHead(
-                head_dim=self.head_dim,
-                num_heads=config.num_attention_heads,
-                eps=config.layer_norm_eps,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-                rngs=rngs,
-            )
-            self.k_layernorm = StableLmLayerNormPerHead(
-                head_dim=self.head_dim,
-                num_heads=config.num_key_value_heads,
-                eps=config.layer_norm_eps,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-                rngs=rngs,
-            )
+        Args:
+            config: Model configuration with partial_rotary_factor.
+            dtype: Data type for computation.
 
-        self.rotary = self.config.get_basic_rope(
-            self.dtype,
+        Returns:
+            Rotary position embedding module with partial rotation.
+        """
+        return config.get_basic_rope(
+            dtype,
             head_size=int(config.partial_rotary_factor * (config.hidden_size // config.num_attention_heads)),
             rotary_dim=self.rotary_emb_dim,
             base=config.rope_theta,
@@ -340,44 +317,42 @@ class StableLmAttention(AttentionModule):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
-        fcm_mask: chex.Array | None = None,
-        frequencies: chex.Array | None = None,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
-        """Forward pass of the attention module.
+        """Forward pass through the attention layer with optional Q/K normalization.
+
+        Applies per-head LayerNorm to queries and keys when enabled, followed by
+        partial rotary position embeddings and standard attention computation.
 
         Args:
-            hidden_states (chex.Array): Input hidden states (batch, seq_len, hidden_size).
-            attention_mask (chex.Array): Mask to apply on the attention scores (batch, 1, seq_len, kv_seq_len).
-            position_ids (chex.Array): Position indices for the tokens (batch, seq_len).
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView]):
-                Cache view for key/value states (optional).
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]):
-                Metadata for paged attention (optional).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (bool): If True, outputs attention weights alongside the hidden states (default: False).
-            fcm_mask (tp.Optional[chex.Array]): Forward causal mask (FCM) mask (optional).
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequencies (optional).
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view
+                for key-value states. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
 
         Returns:
-            tp.Tuple[chex.Array, chex.Array | None]: A tuple containing the attention output
-                (batch, seq_len, hidden_size)
-                and optionally the attention weights (batch, num_heads, seq_len, kv_seq_len).
+            AttentionLayerOutput: Contains attention output, optional attention weights, and cache view.
         """
         batch_size, sequence_length = hidden_states.shape[:2]
+
+        # Project to Q/K/V
         query_states, key_states, value_states = (
-            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
-            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
-            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
+            checkpoint_name(self.query_projection(hidden_states), "attn_query"),
+            checkpoint_name(self.key_projection(hidden_states), "attn_key"),
+            checkpoint_name(self.value_projection(hidden_states), "attn_value"),
         )
 
         query_states = query_states.reshape(
@@ -400,21 +375,15 @@ class StableLmAttention(AttentionModule):
         )
 
         if self.qk_layernorm:
-            query_states = self.q_layernorm(query_states.transpose(0, 2, 1, 3)).transpose(0, 2, 1, 3)
-            key_states = self.k_layernorm(key_states.transpose(0, 2, 1, 3)).transpose(0, 2, 1, 3)
+            query_states = self.query_normalization(query_states.transpose(0, 2, 1, 3)).transpose(0, 2, 1, 3)
+            key_states = self.key_normalization(key_states.transpose(0, 2, 1, 3)).transpose(0, 2, 1, 3)
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
+        query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
 
         (
             key_states,
             value_states,
-            attention_mask,
+            mask_info,
             init_attention_bias,
             cache_view,
             cache_metadata,
@@ -424,9 +393,7 @@ class StableLmAttention(AttentionModule):
             value=value_states,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            fcm_mask=fcm_mask,
+            mask_info=mask_info,
         )
 
         attentions = self.attention_performer.forward(
@@ -438,13 +405,13 @@ class StableLmAttention(AttentionModule):
             cache_metadata=cache_metadata,
             cache_view=cache_view,
             init_bias=init_attention_bias,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
+            mask_info=mask_info,
             causal=True,
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
+        attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
+
         return AttentionLayerOutput(
             attention_output=attn_output,
             attention_weight=attentions.attention_weights if output_attentions else None,
@@ -453,22 +420,10 @@ class StableLmAttention(AttentionModule):
 
 
 class StableLmDecoderLayer(nn.Module):
-    """A single decoder layer for the StableLM model.
+    """Single decoder layer for StableLM models.
 
-    This layer combines self-attention, MLP, and residual connections with layer normalization.
-    It supports parallel residual connections.
-
-    Attributes:
-        config (StableLmConfig): Configuration object for the model.
-        self_attn (StableLmAttention): Self-attention module.
-        mlp (StableLmMLP): MLP module.
-        input_layernorm (nn.LayerNorm): Layer normalization applied before self-attention.
-        post_attention_layernorm (nn.LayerNorm): Layer normalization applied after self-attention and before the MLP.
-        dropout_rng_key (str): Name of the RNG key for dropout.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+    Combines multi-head attention and feedforward networks with
+    LayerNorm and residual connections. Supports parallel residual paths.
     """
 
     def __init__(
@@ -479,15 +434,17 @@ class StableLmDecoderLayer(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
-        """Initializes the StableLmDecoderLayer module.
+        """Initialize StableLM decoder layer.
 
         Args:
-            config (StableLmConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (StableLmConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
         """
         self.config = config
         self.dtype = dtype
@@ -509,6 +466,7 @@ class StableLmDecoderLayer(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
         self.mlp = mlp_block(
             config=config,
@@ -516,8 +474,9 @@ class StableLmDecoderLayer(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
-        self.input_layernorm = nn.LayerNorm(
+        self.input_layernorm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -525,7 +484,7 @@ class StableLmDecoderLayer(nn.Module):
             rngs=rngs,
         )
         if not self.use_parallel_residual:
-            self.post_attention_layernorm = nn.LayerNorm(
+            self.post_attention_layernorm = LayerNorm(
                 config.hidden_size,
                 epsilon=config.layer_norm_eps,
                 dtype=dtype,
@@ -536,38 +495,34 @@ class StableLmDecoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
-        fcm_mask: chex.Array | None = None,
-        frequencies: chex.Array | None = None,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
-        """Forward pass of the decoder layer.
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture with optional parallel residual paths:
+        either parallel (attn + mlp + residual) or sequential (attn → residual → mlp → residual).
 
         Args:
-            hidden_states (chex.Array): Input hidden states (batch, seq_len, hidden_size).
-            attention_mask (chex.Array): Attention mask (batch, 1, seq_len, kv_seq_len).
-            position_ids (chex.Array): Position IDs (batch, seq_len).
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView]):
-                Cache view for key/value states (optional).
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]):
-                Metadata for paged attention (optional).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (bool): Whether to output attention weights (default: False).
-            fcm_mask (tp.Optional[chex.Array]): Forward causal mask (FCM) mask (optional).
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequencies (optional).
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view
+                for key-value states. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
 
         Returns:
-            tp.Tuple[chex.Array, chex.Array | None]: A tuple containing:
-                - hidden_states (chex.Array): Output hidden states after the decoder layer.
-                - attention_outputs (chex.Array | None): Attention weights (if `output_attentions` is True).
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
         """
         assert hidden_states.ndim == 3, f"Input hidden_states should be 3 dimensions, got {hidden_states.ndim}"
 
@@ -580,15 +535,12 @@ class StableLmDecoderLayer(nn.Module):
         )
         attn_outputs = self.self_attn(
             hidden_states,
-            attention_mask,
+            mask_info,
             position_ids,
-            causal_mask,
             mode,
             cache_view,
             cache_metadata,
-            segment_ids,
             output_attentions,
-            fcm_mask,
             frequencies,
         )
 
@@ -627,21 +579,16 @@ class StableLmDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=StableLmConfig, model_type="stablelm")
 class StableLmModel(EasyDeLBaseModule):
-    """The base StableLM transformer model.
+    """StableLM base model implementation.
 
-    This class implements the core transformer architecture, including embedding layers,
-    decoder layers, and final normalization.
+    This implements the StableLM language model architecture with transformer blocks,
+    LayerNorm, partial rotary position embeddings, and optional Q/K normalization.
 
     Attributes:
-        config (StableLmConfig): Configuration object for the model.
-        embed_tokens (nn.Embed): Embedding layer for input tokens.
-        layers (nn.List[StableLmDecoderLayer]): List of decoder layers.
-        norm (nn.LayerNorm): Final layer normalization.
-        gradient_checkpointing (str): Gradient checkpointing strategy.
+        config (StableLmConfig): Configuration for the model.
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+        precision: Precision setting for JAX operations.
     """
 
     def __init__(
@@ -653,14 +600,14 @@ class StableLmModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the StableLmModel module.
+        """Initialize StableLM base model.
 
         Args:
-            config (StableLmConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (StableLmConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -673,31 +620,28 @@ class StableLmModel(EasyDeLBaseModule):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             config.vocab_size,
             config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = [
-            StableLmDecoderLayer(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for idx in range(config.num_hidden_layers)
-        ]
+        self.layers = nn.List(
+            [
+                StableLmDecoderLayer(
+                    config=config,
+                    layer_idx=idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for idx in range(config.num_hidden_layers)
+            ]
+        )
 
-        self.norm = nn.LayerNorm(
+        self.norm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -707,7 +651,11 @@ class StableLmModel(EasyDeLBaseModule):
 
     @cached_property
     def frequencies(self):
-        """Cached property for precomputed rotary frequencies."""
+        """Precomputed partial rotary position embedding frequencies.
+
+        Returns:
+            Frequency tensor for partial RoPE with dimension based on partial_rotary_factor.
+        """
         rotary_emb_dim = int(
             self.config.partial_rotary_factor * (self.config.hidden_size // self.config.num_attention_heads)
         )
@@ -718,41 +666,51 @@ class StableLmModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        apply_lm_head: bool = True,
     ) -> BaseModelOutput:
-        """Forward pass of the StableLM model.
+        """Forward pass through the StableLM base model.
+
+        Processes input tokens through embedding, all decoder layers with partial RoPE
+        and LayerNorm, and final normalization.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs (batch, seq_len).
-                Mutually exclusive with `inputs_embeds`.
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings (batch, seq_len, hidden_size).
-                Mutually exclusive with `input_ids`.
-            attention_mask (tp.Optional[chex.Array]): Attention mask (batch, seq_len). Usually used for padding tokens.
-            position_ids (tp.Optional[chex.Array]): Position IDs (batch, seq_len). If None, automatically generated.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (tp.Optional[bool]): Whether to output attention weights (default defined by config).
-            output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all layers
-                (default defined by config).
-            past_key_values (tp.Optional[TransformerCache | PagesCache]):
-                Precomputed key/value states for caching.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]):
-                Metadata for paged attention (optional).
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-            BaseModelOutput: The model output, either as a `BaseModelOutput` object or a tuple.
+            BaseModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                and updated past_key_values.
 
         Raises:
-            ValueError: If both `input_ids` and `inputs_embeds` are provided or neither is provided.
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -760,7 +718,7 @@ class StableLmModel(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -768,18 +726,15 @@ class StableLmModel(EasyDeLBaseModule):
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-        else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
-        if attention_mask.ndim == 2:
-            attention_mask = jnp.expand_dims(attention_mask, (1, 2))
+            position_ids = mask_info.q_position_ids
+
         hidden_states = inputs_embeds
 
         if mode is None:
@@ -802,14 +757,12 @@ class StableLmModel(EasyDeLBaseModule):
 
             layer_outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
-                causal_mask=self.causal_mask,
                 output_attentions=output_attentions,
-                segment_ids=segment_ids,
                 frequencies=self.frequencies,
             )
             hidden_states = layer_outputs.hidden_states
@@ -859,21 +812,22 @@ class StableLmModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=StableLmConfig, model_type="stablelm")
-class StableLmForCausalLM(EasyDeLBaseModule):
-    """StableLM model with a Causal Language Modeling (CLM) head.
+class StableLmForCausalLM(BaseCausalLMModule[StableLmModel, StableLmConfig]):
+    """StableLM model with a language modeling head for causal language modeling tasks.
 
-    This class wraps the base `StableLmModel` and adds a linear layer (language model head)
-    to predict the next token logits.
+    This model is a transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation.
 
     Attributes:
-        config (StableLmConfig): Configuration object for the model.
-        model (StableLmModel): The base StableLM model.
-        lm_head (ParallelLinear): The language model head (linear layer).
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+        config (StableLmConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
     """
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "stablelm"
+    _config_class = StableLmConfig
 
     def __init__(
         self,
@@ -884,86 +838,75 @@ class StableLmForCausalLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the StableLmForCausalLM module.
+        """Initialize StableLM model for causal language modeling.
 
         Args:
-            config (StableLmConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (StableLmConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
+            base_model_class=StableLmModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = StableLmModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.vocab_size = self.config.vocab_size
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
+            lm_head_bias=False,
         )
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> CausalLMOutput:
-        """Forward pass of the StableLM model for Causal Language Modeling.
+        """Forward pass through the StableLM model for causal language modeling.
+
+        Processes input through the base model and applies the language modeling head
+        to produce next-token predictions.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs (batch, seq_len).
-                Mutually exclusive with `inputs_embeds`.
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings (batch, seq_len, hidden_size).
-                Mutually exclusive with `input_ids`.
-            attention_mask (tp.Optional[chex.Array]): Attention mask (batch, seq_len). Usually used for padding tokens.
-            position_ids (tp.Optional[chex.Array]): Position IDs (batch, seq_len). If None, automatically generated.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (tp.Optional[bool]): Whether to output attention weights (default defined by config).
-            output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all
-                layers (default defined by config).
-            past_key_values (tp.Optional[TransformerCache | PagesCache]):
-                Precomputed key/value states for caching.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]):
-                Metadata for paged attention (optional).
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the language model head. Defaults to True.
 
         Returns:
-            CausalLMOutput: The model output, including logits, hidden states, and attentions.
+            CausalLMOutput: Contains logits, hidden states, attentions, and past_key_values.
         """
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -971,7 +914,6 @@ class StableLmForCausalLM(EasyDeLBaseModule):
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
             inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
         )
         hidden_states = outputs.last_hidden_state
 

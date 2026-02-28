@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from eformer.common_types import ColumnWise, ExpertColumnWiseAlt, ExpertRowWiseAlt, Replicated, RowWise
+
 from eformer.loggings import get_logger
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -24,37 +25,39 @@ logger = get_logger(__name__)
 
 @register_config("qwen3_moe")
 class Qwen3MoeConfig(EasyDeLBaseConfig):
+    """Configuration for the Qwen3-MoE variant with routed experts."""
+
     model_type = "qwen3_moe"
 
     def __init__(
         self,
-        vocab_size=151936,
-        hidden_size=2048,
-        intermediate_size=6144,
-        num_hidden_layers=24,
-        num_attention_heads=32,
-        num_key_value_heads=4,
-        hidden_act="silu",
-        max_position_embeddings=32768,
-        initializer_range=0.02,
-        rms_norm_eps=1e-6,
-        use_cache=True,
-        tie_word_embeddings=False,
-        rope_theta=10000.0,
-        rope_scaling=None,
-        attention_bias=False,
-        use_sliding_window=False,
-        sliding_window=4096,
-        max_window_layers=28,
-        attention_dropout=0.0,
-        decoder_sparse_step=1,
-        moe_intermediate_size=768,
-        num_experts_per_tok=8,
-        num_experts=128,
-        norm_topk_prob=False,
-        output_router_logits=False,
-        router_aux_loss_coef=0.001,
-        mlp_only_layers=None,
+        vocab_size: int = 151936,
+        hidden_size: int = 2048,
+        intermediate_size: int = 6144,
+        num_hidden_layers: int = 24,
+        num_attention_heads: int = 32,
+        num_key_value_heads: int = 4,
+        hidden_act: str = "silu",
+        max_position_embeddings: int = 32768,
+        initializer_range: float = 0.02,
+        rms_norm_eps: float = 1e-6,
+        use_cache: bool = True,
+        tie_word_embeddings: bool = False,
+        rope_theta: float = 10000.0,
+        rope_scaling: dict | None = None,
+        attention_bias: bool = False,
+        use_sliding_window: bool = False,
+        sliding_window: int = 4096,
+        max_window_layers: int = 28,
+        attention_dropout: float = 0.0,
+        decoder_sparse_step: int = 1,
+        moe_intermediate_size: int = 768,
+        num_experts_per_tok: int = 8,
+        num_experts: int = 128,
+        norm_topk_prob: bool = False,
+        output_router_logits: bool = False,
+        router_aux_loss_coef: float = 0.001,
+        mlp_only_layers: list[int] | None = None,
         layer_types: list[str] | None = None,
         **kwargs,
     ):
@@ -91,42 +94,27 @@ class Qwen3MoeConfig(EasyDeLBaseConfig):
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = [
-                "sliding_attention"
-                if self.sliding_window is not None and i >= self.max_window_layers
-                else "full_attention"
+                (
+                    "sliding_attention"
+                    if self.sliding_window is not None and i >= self.max_window_layers
+                    else "full_attention"
+                )
                 for i in range(self.num_hidden_layers)
             ]
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"self_attn/(q_norm|k_norm)/kernel", pmag.resolve(Replicated)),
-            (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            (r"mlp/gate/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/gate/bias", pmag.resolve(Replicated)),
-            (r"mlp/experts/(gate_proj|up_proj)/kernel", pmag.resolve(ExpertColumnWiseAlt)),
-            (r"mlp/experts/down_proj/kernel", pmag.resolve(ExpertRowWiseAlt)),
-            (r"mlp/experts/.*bias", pmag.resolve(Replicated)),
-            (r".*/(input_layernorm|post_attention_layernorm)/kernel", pmag.resolve(Replicated)),
-            (r"norm/scale", pmag.resolve(Replicated)),
-            (r"norm/bias", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"score/kernel", pmag.resolve(RowWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
         """Retrieve attention mask details for each layer in the model.

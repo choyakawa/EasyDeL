@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,7 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import collections.abc
+import inspect
 import typing as tp
+import warnings
 
 import jax
 from jax import lax
@@ -25,6 +28,256 @@ from easydel.utils.helpers import check_bool_flag
 
 SCAN_TRAINER = check_bool_flag("SCAN_TRAINER")
 FAST_COMPILE = check_bool_flag("FAST_COMPILE")
+
+QuantizationMode = tp.Literal[
+    "nf4",
+    "affine",
+    "mxfp8",
+    "nvfp8",
+    "mxfp4",
+    "nvfp4",
+]
+AFFINE_SUPPORTED_BITS = frozenset({2, 3, 4, 5, 6, 7, 8})
+FIXED_QUANTIZATION_BITS_BY_MODE: dict[QuantizationMode, int] = {
+    "nf4": 4,
+    "mxfp4": 4,
+    "nvfp4": 4,
+    "mxfp8": 8,
+    "nvfp8": 8,
+}
+
+
+def filter_kwargs_for_callable(
+    callable_obj: tp.Callable[..., tp.Any],
+    kwargs: collections.abc.Mapping[str, tp.Any],
+) -> dict[str, tp.Any]:
+    """Filter kwargs so only parameters accepted by ``callable_obj`` are forwarded.
+
+    This prevents runtime failures when dataset batches carry auxiliary metadata
+    fields (for example preference scores) that a model forward signature does
+    not accept.
+    """
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return dict(kwargs)
+
+    parameters = signature.parameters
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return dict(kwargs)
+
+    accepted_keys = set(parameters.keys())
+    return {key: value for key, value in kwargs.items() if key in accepted_keys}
+
+
+def sanitize_model_call_kwargs(kwargs: collections.abc.Mapping[str, tp.Any]) -> dict[str, tp.Any]:
+    """Normalize model call kwargs to avoid known incompatible combinations.
+
+    Causal LM forwards generally accept either ``input_ids`` or ``inputs_embeds``,
+    but not both at the same time. Prefer token IDs when both are present.
+    """
+    normalized_kwargs = dict(kwargs)
+    if normalized_kwargs.get("input_ids", None) is not None and normalized_kwargs.get("inputs_embeds", None) is not None:
+        normalized_kwargs.pop("inputs_embeds", None)
+    return normalized_kwargs
+
+
+def _ste(x: jax.Array, q: jax.Array) -> jax.Array:
+    q = q.astype(x.dtype)
+    return x + lax.stop_gradient(q - x)
+
+
+def make_default_tensor_straight_through(
+    quantization_mode: QuantizationMode,
+    quantization_group_size: int | None = None,
+    quantization_bits: int | None = None,
+    *,
+    quantization_block: int | None = None,
+) -> tp.Callable[[jax.Array], jax.Array]:
+    """Create a per-tensor STE quantization function.
+
+    Forward path uses a quantize->dequantize simulation, while gradients flow as
+    if the transform is identity (STE).
+
+    Notes:
+        - `quantization_group_size` controls group-wise quantization where relevant.
+        - `quantization_bits` controls bit-width for configurable formats (for example `affine`).
+    """
+    if quantization_block is not None:
+        warnings.warn(
+            "`quantization_block` is deprecated; use `quantization_group_size` instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        if quantization_group_size is None:
+            quantization_group_size = quantization_block
+        elif quantization_group_size != quantization_block:
+            warnings.warn(
+                f"Both `quantization_group_size` ({quantization_group_size}) and "
+                f"`quantization_block` ({quantization_block}) are set; ignoring `quantization_block`.",
+                FutureWarning,
+                stacklevel=2,
+            )
+
+    if quantization_bits is not None:
+        quantization_bits = int(quantization_bits)
+        if quantization_bits <= 0:
+            raise ValueError(f"`quantization_bits` must be > 0 when specified, got {quantization_bits}.")
+        if quantization_mode == "affine" and quantization_bits not in AFFINE_SUPPORTED_BITS:
+            bits_values = ", ".join(str(v) for v in sorted(AFFINE_SUPPORTED_BITS))
+            raise ValueError(
+                f"`quantization_bits` for `affine` must be one of {{{bits_values}}}, got {quantization_bits}."
+            )
+        required_bits = FIXED_QUANTIZATION_BITS_BY_MODE.get(quantization_mode, None)
+        if required_bits is not None and quantization_bits != required_bits:
+            raise ValueError(
+                f"`quantization_bits` for `{quantization_mode}` must be {required_bits}, got {quantization_bits}."
+            )
+
+    from ejkernel.quantization import dequantize as ej_dequantize  # pyright: ignore[reportMissingTypeStubs]
+    from ejkernel.quantization import quantize as ej_quantize  # pyright: ignore[reportMissingTypeStubs]
+
+    from easydel.layers.quantization import QuantizationConfig
+    from easydel.layers.quantization._configs import resolve_ejkernel_quant_params
+
+    quantization_config = QuantizationConfig(
+        dtype=quantization_mode,
+        group_size=quantization_group_size,
+        bits=quantization_bits,
+    )
+    mode, group_size, bits, needs_biases = resolve_ejkernel_quant_params(quantization_config)
+
+    def _quantize_dequantize(y: jax.Array) -> jax.Array:
+        input_dtype = y.dtype
+        if y.ndim == 0:
+            # Scalar leaves can appear in graphstate pytrees; keep them unchanged.
+            return y.astype(input_dtype)
+        was_vector = y.ndim == 1
+        if was_vector:
+            # ejkernel quantize expects rank >= 2.
+            y = y[None, :]
+        original_last_dim = y.shape[-1]
+        if original_last_dim % group_size != 0:
+            pad_amount = group_size - (original_last_dim % group_size)
+            pad_width = [(0, 0)] * (y.ndim - 1) + [(0, pad_amount)]
+            y = jnp.pad(y, pad_width, mode="constant", constant_values=0)
+
+        if needs_biases:
+            wq, scales, biases = ej_quantize(y, group_size=group_size, bits=bits, mode=mode, axis="col")
+        else:
+            wq, scales = ej_quantize(y, group_size=group_size, bits=bits, mode=mode, axis="col")
+            biases = None
+        dequantized = ej_dequantize(
+            wq,
+            scales,
+            biases,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+            axis="col",
+        )
+        if dequantized.shape[-1] != original_last_dim:
+            dequantized = dequantized[..., :original_last_dim]
+        if was_vector:
+            dequantized = jnp.squeeze(dequantized, axis=0)
+        return dequantized.astype(input_dtype)
+
+    def tensor_straight_through(x: jax.Array) -> jax.Array:
+        if not jnp.issubdtype(x.dtype, jnp.floating):
+            return x
+        return _ste(x, _quantize_dequantize(x))
+
+    return tensor_straight_through
+
+
+def resolve_straight_through_emulator(
+    *,
+    quantization_mode: QuantizationMode | None,
+    quantization_group_size: int | None = None,
+    quantization_bits: int | None = None,
+    tensor_straight_through: tp.Callable[[jax.Array], jax.Array] | None,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None,
+    quantization_block: int | None = None,
+) -> tp.Callable[[tp.Any], tp.Any] | None:
+    """Resolve the graphstate-level straight-through emulator callable.
+
+    Priority:
+      1) `straight_through_emulator` (user-provided)
+      2) `tensor_straight_through` mapped over graphstate
+      3) default tensor STE built from (`quantization_mode`, `quantization_group_size`, `quantization_bits`) and
+         mapped over graphstate
+      4) None (disabled)
+    """
+    if quantization_block is not None:
+        warnings.warn(
+            "`quantization_block` is deprecated; use `quantization_group_size` instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        if quantization_group_size is None:
+            quantization_group_size = quantization_block
+        elif quantization_group_size != quantization_block:
+            warnings.warn(
+                f"Both `quantization_group_size` ({quantization_group_size}) and "
+                f"`quantization_block` ({quantization_block}) are set; ignoring `quantization_block`.",
+                FutureWarning,
+                stacklevel=2,
+            )
+
+    if straight_through_emulator is not None:
+        return straight_through_emulator
+
+    if tensor_straight_through is None and quantization_mode is None:
+        return None
+
+    if tensor_straight_through is None:
+        tensor_straight_through = make_default_tensor_straight_through(
+            quantization_mode,
+            quantization_group_size=quantization_group_size,
+            quantization_bits=quantization_bits,
+        )
+
+    def _default_emulator(graphstate: tp.Any) -> tp.Any:
+        return tu.tree_map(tensor_straight_through, graphstate)
+
+    return _default_emulator
+
+
+def resolve_total_steps(
+    *,
+    forced_steps: int | None,
+    total_data_len: int | None,
+    batch_size: int,
+    num_epochs: int,
+    gradient_accumulation_steps: int,
+    is_train: bool,
+) -> int:
+    """Resolve total train/eval steps from config and dataset length.
+
+    Notes:
+        - `forced_steps` is interpreted as *optimizer update* steps for training (i.e., after gradient accumulation).
+        - When `forced_steps` is not provided, training steps are derived from dataset length and then divided by
+          `gradient_accumulation_steps` to convert micro-batches into optimizer updates.
+    """
+    if forced_steps is not None:
+        return int(forced_steps)
+
+    if total_data_len is None:
+        raise ValueError("`total_data_len` must be provided when `forced_steps` is None.")
+    if batch_size <= 0:
+        raise ValueError("`batch_size` must be > 0.")
+    if num_epochs <= 0:
+        return 0
+
+    steps_per_epoch = (total_data_len + batch_size - 1) // batch_size
+    steps = steps_per_epoch * num_epochs
+
+    if is_train:
+        if gradient_accumulation_steps <= 0:
+            raise ValueError("`gradient_accumulation_steps` must be > 0.")
+        steps //= gradient_accumulation_steps
+
+    return int(steps)
 
 
 def make_assertions_and_get_sizes(
@@ -50,10 +303,20 @@ def make_assertions_and_get_sizes(
             ValueError: If the batch size is not divisible by the gradient accumulation steps.
     """
 
-    batch_size = batch[next(iter(batch.keys()))].shape[0]
+    if gradient_accumulation_steps <= 0:
+        raise ValueError("`gradient_accumulation_steps` must be greater than 0.")
+
+    batch_size = None
+    for leaf in tu.tree_leaves(batch):
+        if hasattr(leaf, "shape") and len(getattr(leaf, "shape", ())) >= 1:
+            batch_size = leaf.shape[0]
+            break
+    if batch_size is None:
+        raise ValueError(
+            "Unable to infer batch size from `batch`; expected at least one array leaf with a leading batch dimension."
+        )
+
     minibatch_size = batch_size // gradient_accumulation_steps
-    if not gradient_accumulation_steps > 0:
-        ValueError("`gradient_accumulation_steps` must be greater than 0.")
     if minibatch_size * gradient_accumulation_steps != batch_size:
         raise ValueError("Batch size must be divisible by gradient accumulation steps.")
     if batch_partition_spec is None:
@@ -94,7 +357,7 @@ def update_metrics(
 def update_state_respectfully(
     state: EasyDeLState,
     gradients: jax.Array,
-    loss_config: LossConfig,
+    loss_config: LossConfig | None,
     metrics: LossMetrics,
 ) -> EasyDeLState:
     """
@@ -148,13 +411,42 @@ def minibatch_call(
     Processes batch in smaller chunks for gradient accumulation using jax.lax.scan.
     Uses eval_shape to initialize accumulator structures efficiently.
     """
-    num_accum_steps = len(next(iter(batch.values()))) // minibatch_size
+    batch_size = None
+    for leaf in tu.tree_leaves(batch):
+        if hasattr(leaf, "shape") and len(getattr(leaf, "shape", ())) >= 1:
+            batch_size = leaf.shape[0]
+            break
+    if batch_size is None:
+        raise ValueError(
+            "Unable to infer batch size from `batch`; expected at least one array leaf with a leading batch dimension."
+        )
+    if minibatch_size <= 0:
+        raise ValueError(f"`minibatch_size` must be > 0, got {minibatch_size}.")
+
+    num_accum_steps = batch_size // minibatch_size
+    if num_accum_steps * minibatch_size != batch_size:
+        raise ValueError(
+            f"Batch size ({batch_size}) must be divisible by minibatch_size "
+            f"({minibatch_size}) for gradient accumulation."
+        )
     if num_accum_steps > 1:
 
         def reshape_to_minibatches(arr):
-            """Reshape the batch into minibatches for accumulation."""
-            batch_shape = (num_accum_steps, minibatch_size, *arr.shape[1:])
-            return jnp.reshape(arr, batch_shape)
+            """Reshape leaves for gradient accumulation.
+
+            Leaves that already carry the batch dimension are split into
+            `(num_accum_steps, minibatch_size, ...)`.
+            Scalar/global leaves are broadcast across accumulation steps so
+            every scanned minibatch receives the same value.
+            """
+            if not hasattr(arr, "shape"):
+                return arr
+            if arr.ndim == 0:
+                return jnp.broadcast_to(arr, (num_accum_steps,))
+            if arr.shape[0] == batch_size:
+                batch_shape = (num_accum_steps, minibatch_size, *arr.shape[1:])
+                return jnp.reshape(arr, batch_shape)
+            return jnp.broadcast_to(arr, (num_accum_steps, *arr.shape))
 
         batch = jax.tree_util.tree_map(reshape_to_minibatches, batch)
 
@@ -178,7 +470,7 @@ def minibatch_call(
             }
             return new_acc, step_aux
 
-        final_acc, aux = jax.lax.scan(
+        final_acc, _aux = jax.lax.scan(
             accumulate_gradients,
             init_acc,
             batch,
@@ -190,4 +482,4 @@ def minibatch_call(
     else:
         (_, metrics), gradients = grad_fn(state.graphstate, batch)
 
-    return gradients, metrics
+    return gradients, metrics  # type: ignore[return-value]

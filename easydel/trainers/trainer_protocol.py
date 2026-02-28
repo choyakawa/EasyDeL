@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,18 +13,19 @@
 # limitations under the License.
 from __future__ import annotations
 
+import collections.abc
 import os
 import typing as tp
 from abc import ABCMeta, abstractmethod
 
 import jax
 import numpy as np
-import optax
+import optax  # pyright: ignore[reportMissingTypeStubs]
 from eformer.paths import ePathLike
 from eformer.pytree import auto_pytree
 from eformer.serialization import AsyncCheckpointManager
 from jax.sharding import Mesh
-from optax import GradientTransformation, Schedule
+from optax import GradientTransformation, Schedule  # pyright: ignore[reportMissingTypeStubs]
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossMetrics
@@ -44,11 +45,22 @@ from easydel.utils import Timers
 from .metrics import BaseProgressBar, MetricsTracker, StepMetrics
 from .training_configurations import MetricsType, TrainingArguments
 
+__all__ = [
+    "BaseProgressBar",
+    "BaseTrainerProtocol",
+    "MetricsTracker",
+    "StepMetrics",
+    "TrainerConfigureDataloaderOutput",
+    "TrainerConfigureFunctionOutput",
+    "TrainerConfigureModelOutput",
+    "TrainerOutput",
+]
+
 if tp.TYPE_CHECKING:
     pass
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset
+    from datasets import Dataset  # pyright: ignore[reportMissingTypeStubs]
     from jax._src.pjit import JitWrapped
 else:
     JitWrapped = tp.Any
@@ -72,9 +84,9 @@ class TrainerConfigureDataloaderOutput:
         max_evaluation_steps: Optional total number of evaluation steps
     """
 
-    dataloader_train: tp.Iterator[np.ndarray]
+    dataloader_train: collections.abc.Iterator[np.ndarray]
     max_training_steps: int
-    dataloader_eval: tp.Iterator[np.ndarray] | None = None
+    dataloader_eval: collections.abc.Iterator[np.ndarray] | None = None
     max_evaluation_steps: int | None = None
 
 
@@ -168,12 +180,12 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 
     timer: Timers
     wandb_runtime: tp.Any  # wandb runtime
-    dataloader_train: tp.Iterator[np.ndarray]
-    dataloader_eval: tp.Iterator[np.ndarray] | None
-    max_training_steps: int
+    dataloader_train: collections.abc.Iterator[np.ndarray] | None
+    dataloader_eval: collections.abc.Iterator[np.ndarray] | None
+    max_training_steps: int | None
     max_evaluation_steps: int
     _model: EasyDeLBaseModule
-    config: EasyDeLBaseConfig
+    config: EasyDeLBaseConfig | None
     scheduler: optax.Schedule
     tx: optax.GradientTransformation
     model_state: EasyDeLState
@@ -561,13 +573,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def _manage_checkpoint_limit(self, checkpoint_dir):
-        """
-        Manages the checkpoint limit by deleting old checkpoints.
-        """
-        ...
-
-    @abstractmethod
     def _save_readme(self, checkpoint_dir):
         """
         Saves a README file with model and training information.
@@ -603,7 +608,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         self,
         state: EasyDeLState,
         save_directory: str | None = None,
-        gather_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None = None,
+        gather_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None = None,
         to_torch: bool = False,
         easystate_to_huggingface_model_kwargs: dict | None = None,
         torch_save_pretrained_kwargs: dict | None = None,
@@ -682,23 +687,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def _should_save_checkpoint(self, current_step):
-        """
-        Determine if checkpoint should be saved at current step.
-
-        Args:
-            current_step: The current training step number.
-
-        Returns:
-            bool: True if checkpoint should be saved, False otherwise.
-
-        Note:
-            Based on save_steps configuration in training arguments.
-            Only saves if current_step > 0 and divisible by save_steps.
-        """
-        ...
-
-    @abstractmethod
     def _should_run_evaluation(self, current_step):
         """
         Determine if evaluation should be run at current step.
@@ -745,8 +733,8 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         self,
         state: EasyDeLState,
         exception: Exception,
-        shard_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None,
-        gather_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None,
+        shard_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
+        gather_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
     ):
         """
         Handle training interruption gracefully.
@@ -872,8 +860,8 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         metrics_tracker: MetricsTracker,
         step_metrics: StepMetrics,
         start_time: float,
-        shard_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None,
-        gather_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None,
+        shard_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
+        gather_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
     ):
         """
         Execute the core training loop.
@@ -1104,7 +1092,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def eval(self, model_state: EasyDeLState) -> tp.Iterator[dict]:
+    def eval(self, model_state: EasyDeLState) -> collections.abc.Iterator[dict]:
         """
         Evaluate the model on the evaluation dataset.
 
@@ -1188,58 +1176,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def _try_resume_from_checkpoint(self, current_state: EasyDeLState) -> EasyDeLState | None:
-        """
-        Try to resume from the latest checkpoint if available.
-
-        Args:
-            current_state: The current model state (used as fallback if no checkpoint found)
-
-        Returns:
-            The resumed state if a checkpoint was found and loaded, None otherwise
-        """
-        ...
-
-    @abstractmethod
     def calculate_number_total_flops(self, params, is_training=True):
         """Calculate total FLOPs for the model."""
-        ...
-
-    @classmethod
-    @abstractmethod
-    def load_trainer_state(
-        cls,
-        load_directory: str | os.PathLike,
-        dataset_train: Dataset | None = None,
-        dataset_eval: Dataset | None = None,
-        data_collator: tp.Callable | None = None,
-        device: tp.Any | None = "cpu",
-        dtype: tp.Any = None,
-        param_dtype: tp.Any = None,
-        precision: tp.Any | None = None,
-        sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1, 1),
-        sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
-        sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
-        partition_axis: tp.Any | None = None,
-        shard_attention_computation: bool = True,
-        shard_fns: tp.Mapping[tuple, tp.Callable] | dict | None = None,
-        backend: tp.Any | None = None,
-        platform: tp.Any | None = None,
-        config_kwargs: tp.Any | None = None,
-        model_task: tp.Any = None,
-        auto_shard_model: bool = True,
-        partition_rules: tuple[tuple[str, tp.Any], ...] | None = None,
-        quantization_platform: tp.Any | None = None,
-        quantization_method: tp.Any | None = None,
-        quantization_block_size: int = 128,
-        quantization_pattern: str | None = None,
-        quantize_tensors: bool = True,
-        verbose: bool = True,
-        base_state: type[EasyDeLState] | None = None,
-        trainer_init_arguments: dict[str, tp.Any] | None = None,
-        **kwargs,
-    ):
-        """
-        Load a trainer state from a saved checkpoint.
-        """
         ...

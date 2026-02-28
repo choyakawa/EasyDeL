@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -53,6 +53,7 @@ References:
       Secretly a Reward Model" (https://arxiv.org/abs/2305.18290)
 """
 
-from .dpo_trainer import DPOConfig, DPOTrainer
+from .dpo_config import DPOConfig
+from .dpo_trainer import DPOTrainer
 
 __all__ = "DPOConfig", "DPOTrainer"

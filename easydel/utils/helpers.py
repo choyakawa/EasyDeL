@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -59,10 +59,13 @@ from pathlib import Path
 
 from eformer.loggings import get_logger
 
+warnings.filterwarnings("ignore", message=".*'repr' attribute.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*'frozen' attribute.*", category=UserWarning)
+
 if tp.TYPE_CHECKING:
     from flax.metrics.tensorboard import SummaryWriter
 try:
-    import wandb  # type: ignore
+    import wandb
 except ModuleNotFoundError:
     wandb = None
 

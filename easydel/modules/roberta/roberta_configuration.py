@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -74,25 +74,26 @@ class RobertaConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vocab_size=50265,
-        hidden_size=768,
-        num_hidden_layers=12,
-        num_attention_heads=12,
-        intermediate_size=3072,
-        hidden_act="gelu",
-        hidden_dropout_prob=0.1,
-        attention_probs_dropout_prob=0.1,
-        max_position_embeddings=514,
-        type_vocab_size=1,
-        initializer_range=0.02,
-        layer_norm_eps=1e-5,
-        pad_token_id=1,
-        bos_token_id=0,
-        eos_token_id=2,
-        position_embedding_type="absolute",
-        use_cache=True,
-        classifier_dropout=None,
-        gradient_checkpointing="nothing_saveable",
+        vocab_size: int = 50265,
+        hidden_size: int = 768,
+        num_hidden_layers: int = 12,
+        num_attention_heads: int = 12,
+        intermediate_size: int = 3072,
+        hidden_act: str = "gelu",
+        hidden_dropout_prob: float = 0.1,
+        attention_probs_dropout_prob: float = 0.1,
+        max_position_embeddings: int = 514,
+        type_vocab_size: int = 1,
+        initializer_range: float = 0.02,
+        layer_norm_eps: float = 1e-5,
+        pad_token_id: int = 1,
+        bos_token_id: int = 0,
+        eos_token_id: int = 2,
+        position_embedding_type: str = "absolute",
+        use_cache: bool = True,
+        classifier_dropout: float | None = None,
+        gradient_checkpointing: str = "nothing_saveable",
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -111,6 +112,9 @@ class RobertaConfig(EasyDeLBaseConfig):
         self.use_cache = use_cache
         self.classifier_dropout = classifier_dropout
         self.gradient_checkpointing = gradient_checkpointing
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -118,33 +122,15 @@ class RobertaConfig(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the RoBERTa model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embeddings/word_embeddings/embedding", pmag.resolve(ColumnWise)),
-            (r"embeddings/position_embeddings/embedding", pmag.resolve(Replicated)),
-            (r"embeddings/token_type_embeddings/embedding", pmag.resolve(Replicated)),
-            (r"attention/self/(query|key|value)/kernel", pmag.resolve(ColumnWise)),
-            (r"attention/output/dense/kernel", pmag.resolve(RowWise)),
-            (r"intermediate/dense/kernel", pmag.resolve(ColumnWise)),
-            (r"output/dense/kernel", pmag.resolve(RowWise)),
-            (r"pooler/dense/kernel", pmag.resolve(ColumnWise)),
-            (r"lm_head/dense/kernel", pmag.resolve(ColumnWise)),
-            (r"lm_head/decoder/kernel", pmag.resolve(ColumnWise)),
-            (r"classifier/dense/kernel", pmag.resolve(ColumnWise)),
-            (r"classifier/out_proj/kernel", pmag.resolve(RowWise)),
-            (r"qa_outputs/kernel", pmag.resolve(RowWise)),
-            (r".*LayerNorm/scale", pmag.resolve(Replicated)),
-            (r".*LayerNorm/bias", pmag.resolve(Replicated)),
-            (
-                r".*/(query|key|value|dense|fc1|fc2|c_attn|q_attn|c_proj|c_fc|lm_head|classifier|qa_outputs)/bias",
-                pmag.resolve(Replicated),
-            ),
-            (r"lm_head/bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None

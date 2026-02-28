@@ -1,4 +1,5 @@
 """Test eSurge streaming responses."""
+# pyright: reportPrivateLocalImportUsage=false
 
 import json
 
@@ -177,7 +178,7 @@ def main():
     if chat_passed and completion_passed:
         print("✅ All streaming format tests passed!")
         print("\nThe streaming responses now properly use Pydantic models")
-        print("and match the vSurge/OAI server pattern.")
+        print("and match the OpenAI-compatible server pattern.")
     else:
         print("❌ Some tests failed")
 

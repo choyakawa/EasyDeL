@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@
 
 import typing
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -113,43 +112,43 @@ class WhisperConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vocab_size=51865,
-        num_mel_bins=80,
-        encoder_layers=4,
-        encoder_attention_heads=6,
-        decoder_layers=4,
-        decoder_attention_heads=6,
-        decoder_ffn_dim=1536,
-        encoder_ffn_dim=1536,
-        encoder_layerdrop=0.0,
-        decoder_layerdrop=0.0,
-        decoder_start_token_id=50257,
-        use_cache=True,
-        is_encoder_decoder=True,
-        activation_function="gelu",
-        d_model=384,
-        dropout=0.0,
-        attention_dropout=0.0,
-        activation_dropout=0.0,
-        init_std=0.02,
-        scale_embedding=False,
-        max_source_positions=1500,
-        max_target_positions=448,
-        pad_token_id=50256,
-        bos_token_id=50256,
-        eos_token_id=50256,
-        suppress_tokens=None,
-        begin_suppress_tokens=[220, 50256],  # noqa: B006
-        use_weighted_layer_sum=False,
-        classifier_proj_size=256,
-        apply_spec_augment=False,
-        mask_time_prob=0.05,
-        mask_time_length=10,
-        mask_time_min_masks=2,
-        mask_feature_prob=0.0,
-        mask_feature_length=10,
-        mask_feature_min_masks=0,
-        median_filter_width=7,
+        vocab_size: int = 51865,
+        num_mel_bins: int = 80,
+        encoder_layers: int = 4,
+        encoder_attention_heads: int = 6,
+        decoder_layers: int = 4,
+        decoder_attention_heads: int = 6,
+        decoder_ffn_dim: int = 1536,
+        encoder_ffn_dim: int = 1536,
+        encoder_layerdrop: float = 0.0,
+        decoder_layerdrop: float = 0.0,
+        decoder_start_token_id: int = 50257,
+        use_cache: bool = True,
+        is_encoder_decoder: bool = True,
+        activation_function: str = "gelu",
+        d_model: int = 384,
+        dropout: float = 0.0,
+        attention_dropout: float = 0.0,
+        activation_dropout: float = 0.0,
+        init_std: float = 0.02,
+        scale_embedding: bool = False,
+        max_source_positions: int = 1500,
+        max_target_positions: int = 448,
+        pad_token_id: int = 50256,
+        bos_token_id: int = 50256,
+        eos_token_id: int = 50256,
+        suppress_tokens: list[int] | None = None,
+        begin_suppress_tokens: list[int] | None = None,
+        use_weighted_layer_sum: bool = False,
+        classifier_proj_size: int = 256,
+        apply_spec_augment: bool = False,
+        mask_time_prob: float = 0.05,
+        mask_time_length: int = 10,
+        mask_time_min_masks: int = 2,
+        mask_feature_prob: float = 0.0,
+        mask_feature_length: int = 10,
+        mask_feature_min_masks: int = 0,
+        median_filter_width: int = 7,
         bits: int | None = None,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         **kwargs,
@@ -237,6 +236,8 @@ class WhisperConfig(EasyDeLBaseConfig):
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing
         self.max_position_embeddings = max(max_source_positions, max_target_positions)
+        if begin_suppress_tokens is None:
+            begin_suppress_tokens = [220, 50256]
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -248,52 +249,15 @@ class WhisperConfig(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs):
-        """Returns the partition rules for the Whisper model. Arguments are ignored.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
 
         Returns:
-            tuple: Partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            ("model/encoder/conv[12]/kernel", PartitionSpec(None, "tp", ("fsdp", "sp"))),
-            (r"encoder/embed_positions/embedding", pmag.resolve(Replicated)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/out_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"fc1/kernel", pmag.resolve(ColumnWise)),
-            (r"fc2/kernel", pmag.resolve(RowWise)),
-            (r"fc(1|2)/bias", pmag.resolve(Replicated)),
-            (r"(self_attn_layer_norm|final_layer_norm)/scale", pmag.resolve(Replicated)),
-            (r"(self_attn_layer_norm|final_layer_norm)/bias", pmag.resolve(Replicated)),
-            (r"encoder/layer_norm/scale", pmag.resolve(Replicated)),
-            (r"encoder/layer_norm/bias", pmag.resolve(Replicated)),
-            (r"decoder/embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"decoder/embed_positions/embedding", pmag.resolve(Replicated)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/out_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"encoder_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"encoder_attn/out_proj/kernel", pmag.resolve(RowWise)),
-            (r"encoder_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"fc1/kernel", pmag.resolve(ColumnWise)),
-            (r"fc2/kernel", pmag.resolve(RowWise)),
-            (r"fc(1|2)/bias", pmag.resolve(Replicated)),
-            (
-                r"(self_attn_layer_norm|encoder_attn_layer_norm|final_layer_norm)/scale",
-                pmag.resolve(Replicated),
-            ),
-            (
-                r"(self_attn_layer_norm|encoder_attn_layer_norm|final_layer_norm)/bias",
-                pmag.resolve(Replicated),
-            ),
-            (r"decoder/layer_norm/scale", pmag.resolve(Replicated)),
-            (r"decoder/layer_norm/bias", pmag.resolve(Replicated)),
-            (r"proj_out/kernel", pmag.resolve(ColumnWise)),
-            (r"projector/kernel", pmag.resolve(ColumnWise)),
-            (r"projector/bias", pmag.resolve(Replicated)),
-            (r"classifier/kernel", pmag.resolve(RowWise)),
-            (r"classifier/bias", pmag.resolve(Replicated)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None

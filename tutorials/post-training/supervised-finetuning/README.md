@@ -36,7 +36,7 @@ The provided script relies on a setup script from EasyDeL to prepare the TPU env
 2. **Run the EasyDeL setup script:**
 
     ```bash
-    bash <(curl -sL https://raw.githubusercontent.com/erfanzar/EasyDeL/refs/heads/main/tpu_setup.sh)
+    bash <(curl -sL https://raw.githubusercontent.com/erfanzar/EasyDeL/refs/heads/main/scripts/tpu_setup.sh)
     ```
 
     This command downloads and executes a script that installs required packages such as JAX, EasyDeL, Ray, Hugging Face libraries, and other Python dependencies optimized for TPU operation. This process might take several minutes.
@@ -74,7 +74,7 @@ The provided script relies on a setup script from EasyDeL to prepare the TPU env
 Save the provided Python script as `sft_finetune.py` (or any other `.py` name) on your TPU VM. Let's walk through its key components, focusing on what makes SFT unique.
 
 ```python
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 # ... (license header) ...
 
 import os
@@ -155,12 +155,10 @@ def main():
         config_kwargs=ed.EasyDeLBaseConfigDict(
             freq_max_position_embeddings=max_length,
             mask_max_position_embeddings=max_length,
-            kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
             attn_mechanism=ed.AttentionMechanisms.AUTO,
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE, # change this if u go OOM
         ),
         partition_axis=ed.PartitionAxis(kv_head_axis="tp"),
-        quantization_method=ed.EasyDeLQuantizationMethods.NONE,
     )
     logger.info("Model loaded successfully.")
 
@@ -178,7 +176,7 @@ def main():
         use_wandb=WANDB_ENTITY is not None,
         wandb_entity=WANDB_ENTITY,
         do_last_save=True,
-        max_sequence_length=max_length,
+        max_length=max_length,
         learning_rate=1e-5,
         learning_rate_end=7e-6,
         optimizer=ed.EasyDeLOptimizers.ADAMW,
@@ -268,7 +266,7 @@ if __name__ == "__main__":
     )
     ```
 
-* **`packing=True` for Efficiency:** If your dataset contains many short examples (e.g., single-turn Q&A), setting `packing=True` in `SFTConfig` can significantly speed up training. It works by concatenating multiple short examples into a single sequence of `max_sequence_length`, separated by an EOS token. This ensures the model is always processing full-length sequences, maximizing TPU utilization.
+* **`packing=True` for Efficiency:** If your dataset contains many short examples (e.g., single-turn Q&A), setting `packing=True` in `SFTConfig` can significantly speed up training. It works by concatenating multiple short examples into a single sequence of `max_length`, separated by an EOS token. This ensures the model is always processing full-length sequences, maximizing TPU utilization.
 * **Evaluation Dataset:** For a more meaningful evaluation of how your model is learning to generalize, you should always use a separate validation or test split.
 
     ```python

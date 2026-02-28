@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -655,7 +655,7 @@ class PresencePenaltyLogitsProcessor(LogitsProcessor):
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         def _apply(x, ids, presence_penalty):
             org_dtype = x.dtype
-            batch_size, vocab_size = x.shape
+            _batch_size, vocab_size = x.shape
             one_hot_presence = jax.nn.one_hot(ids, num_classes=vocab_size, dtype=x.dtype)
             presence_mask = jnp.sum(one_hot_presence, axis=1) > 0
             penalty_values = jnp.where(presence_mask, presence_penalty, 0.0)
@@ -692,7 +692,7 @@ class FrequencyPenaltyLogitsProcessor(LogitsProcessor):
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         def _apply(x, ids, frequency_penalty):
             org_dtype = x.dtype
-            batch_size, vocab_size = x.shape
+            _batch_size, vocab_size = x.shape
             one_hot_counts = jax.nn.one_hot(ids, num_classes=vocab_size, dtype=x.dtype)
             token_counts = jnp.sum(one_hot_counts, axis=1)
             penalty_values = token_counts * frequency_penalty
@@ -737,7 +737,7 @@ class RepetitionPenaltyLogitsProcessor(LogitsProcessor):
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         def _apply(x, ids, repetition_penalty):
             org_dtype = x.dtype
-            batch_size, vocab_size = x.shape
+            _batch_size, vocab_size = x.shape
             one_hot_presence = jax.nn.one_hot(ids, num_classes=vocab_size, dtype=x.dtype)
             presence_mask = jnp.sum(one_hot_presence, axis=1) > 0
             positive_penalized_scores = x / repetition_penalty

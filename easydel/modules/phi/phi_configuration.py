@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,9 +13,7 @@
 # limitations under the License.
 
 
-import typing
-
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -69,9 +67,15 @@ class PhiConfig(EasyDeLBaseConfig):
         rope_scaling (`tp.Dict[str, tp.Union[str, float]]`, *optional*):
             The configuration for rope scaling.
         partial_rotary_factor (`float`, *optional*, defaults to 0.5):
-            The factor for partial rotary embeddings.
+            Fraction of attention head dimension to apply rotary position embeddings to.
+            For example, with head_dim=64 and partial_rotary_factor=0.5, only the first
+            32 dimensions receive rotary embeddings while the remaining 32 use standard
+            attention. This reduces computation while maintaining positional awareness.
         qk_layernorm (`bool`, *optional*, defaults to `False`):
-            Whether to apply layer normalization to the query and key tensors.
+            Whether to apply LayerNorm to query and key projections before attention computation.
+            When enabled, normalizes Q and K tensors independently, improving training stability
+            and model quality especially in larger models. This is applied at the full hidden_size
+            dimension before splitting into heads.
         bos_token_id (`int`, *optional*, defaults to 1):
             The id of the *beginning-of-sequence* token.
         eos_token_id (`int`, *optional*, defaults to 2):
@@ -83,12 +87,6 @@ class PhiConfig(EasyDeLBaseConfig):
     """
 
     model_type: str = "phi"
-    attribute_map: typing.ClassVar = {
-        "max_position_embeddings": "n_positions",
-        "hidden_size": "n_embd",
-        "num_attention_heads": "num_attention_heads",
-        "num_hidden_layers": "num_hidden_layers",
-    }
 
     def __init__(
         self,
@@ -115,37 +113,9 @@ class PhiConfig(EasyDeLBaseConfig):
         eos_token_id=2,
         bits: int | None = None,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
+        layer_types: list[str] | None = None,
         **kwargs,
     ) -> None:
-        """Initializes a PhiConfig object.
-
-        Args:
-            vocab_size (int, optional): Vocabulary size. Defaults to 51200.
-            hidden_size (int, optional): Dimensionality of the embeddings and hidden states. Defaults to 2048.
-            intermediate_size (int, optional): Dimensionality of the intermediate layer in MLP. Defaults to 8192.
-            num_hidden_layers (int, optional): Number of hidden layers. Defaults to 24.
-            num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
-            num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to `num_attention_heads`.
-            resid_pdrop (float, optional): Dropout probability for residual connections. Defaults to 0.0.
-            embd_pdrop (float, optional): Dropout probability for embeddings. Defaults to 0.0.
-            attention_dropout (float, optional): Dropout probability for attention scores. Defaults to 0.0.
-            hidden_act (str, optional): Activation function name. Defaults to "gelu_new".
-            max_position_embeddings (int, optional): Maximum sequence length. Defaults to 2048.
-            initializer_range (float, optional): Standard deviation for weight initialization. Defaults to 0.02.
-            layer_norm_eps (float, optional): Epsilon for layer normalization. Defaults to 1e-5.
-            use_cache (bool, optional): Whether to use KV cache. Defaults to True.
-            tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
-            rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
-            rope_scaling (dict, optional): RoPE scaling configuration. Defaults to None.
-            partial_rotary_factor (float, optional): Factor for partial RoPE application. Defaults to 0.5.
-            qk_layernorm (bool, optional): Whether to apply LayerNorm to QK projections. Defaults to False.
-            bos_token_id (int, optional): Beginning-of-sequence token ID. Defaults to 1.
-            eos_token_id (int, optional): End-of-sequence token ID. Defaults to 2.
-            bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
-            gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
-                Defaults to EasyDeLGradientCheckPointers.NONE.
-            **kwargs: Additional keyword arguments passed to the parent class.
-        """
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -170,6 +140,9 @@ class PhiConfig(EasyDeLBaseConfig):
         self.qk_layernorm = qk_layernorm
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -178,30 +151,18 @@ class PhiConfig(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/dense/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/(q_layernorm|k_layernorm)/scale", pmag.resolve(Replicated)),
-            (r"self_attn/(q_layernorm|k_layernorm)/bias", pmag.resolve(Replicated)),
-            (r"mlp/fc1/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/fc2/kernel", pmag.resolve(RowWise)),
-            (r".*/(input_layernorm|final_layernorm)/scale", pmag.resolve(Replicated)),
-            (r".*/(input_layernorm|final_layernorm)/bias", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (
-                r".*(q_proj|k_proj|v_proj|dense|fc1|fc2|lm_head)/bias",
-                pmag.resolve(Replicated),
-            ),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
     @property
     def granted_freq_max_position_embedding(self) -> int:

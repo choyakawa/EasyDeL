@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -45,22 +45,32 @@ Example:
 
 from __future__ import annotations
 
+import collections.abc
 import copy
+import hashlib
 import inspect
+import pprint
 import typing as tp
 import warnings
 from functools import cached_property, partial
 
-import chex
 import jax
 import numpy as np
+from eformer.escale import PartitionAxis
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import lax
 from jax import numpy as jnp
-from jax.sharding import PartitionSpec
+from jaxtyping import Array
 from transformers.generation.configuration_utils import GenerationConfig
 
+from easydel.caching import (
+    RaggedPagesCache,
+    RaggedPagesCacheConfig,
+    UnifiedAttentionCache,
+    UnifiedAttentionCacheConfig,
+)
 from easydel.inference.logits_process import (
     ForcedBOSTokenLogitsProcessor,
     ForcedEOSTokenLogitsProcessor,
@@ -74,15 +84,15 @@ from easydel.inference.logits_process import (
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
-from easydel.layers.caching import PagesCache, PagesCacheMetaData
 
 from ..base_config import EasyDeLBaseConfig
 from ..modeling_outputs import BeamSearchOutput, GreedySearchOutput, SampleOutput
 
 if tp.TYPE_CHECKING:
-    from easydel.inference import vInference, vInferenceConfig, vInferencePreCompileConfig
-    from easydel.infra.utils import ProcessingClassType
-    from easydel.layers.caching import TransformerCache, TransformerCacheMetaData
+    from transformers import PreTrainedTokenizerBase
+
+    from easydel.caching import OperationsMetadata
+    from easydel.inference.sampling_params import SamplingParams
 
 logger = get_logger(__name__)
 
@@ -102,11 +112,11 @@ class GreedyState:
         model_kwargs: Additional model-specific arguments.
     """
 
-    cur_len: chex.Array
-    sequences: chex.Array
-    running_token: chex.Array
-    is_sent_finished: chex.Array
-    model_kwargs: dict[str, chex.Array]
+    cur_len: Array
+    sequences: Array
+    running_token: Array
+    is_sent_finished: Array
+    model_kwargs: dict[str, Array]
 
 
 @auto_pytree
@@ -125,12 +135,12 @@ class SampleState:
         model_kwargs: Additional model-specific arguments.
     """
 
-    cur_len: chex.Array
-    sequences: chex.Array
-    running_token: chex.Array
-    is_sent_finished: chex.Array
-    prng_key: chex.Array
-    model_kwargs: dict[str, chex.Array]
+    cur_len: Array
+    sequences: Array
+    running_token: Array
+    is_sent_finished: Array
+    prng_key: Array
+    model_kwargs: dict[str, Array]
 
 
 @auto_pytree
@@ -139,25 +149,42 @@ class BeamSearchState:
     State for beam search generation.
 
     Attributes:
-        cur_len (chex.Array): Current length of the generated sequence.
-        running_sequences (chex.Array): Generated sequences being tracked in the beam.
-        running_scores (chex.Array): Scores of the sequences being tracked in the beam.
-        sequences (chex.Array): Best generated sequences.
-        scores (chex.Array): Scores of the best generated sequences.
-        is_sent_finished (chex.Array): Boolean array indicating if a sequence is finished.
-        model_kwargs (tp.Dict[str, chex.Array]): Model specific keyword arguments.
+        cur_len (Array): Current length of the generated sequence.
+        running_sequences (Array): Generated sequences being tracked in the beam.
+        running_scores (Array): Scores of the sequences being tracked in the beam.
+        sequences (Array): Best generated sequences.
+        scores (Array): Scores of the best generated sequences.
+        is_sent_finished (Array): Boolean array indicating if a sequence is finished.
+        model_kwargs (tp.Dict[str, Array]): Model specific keyword arguments.
     """
 
-    cur_len: chex.Array
-    running_sequences: chex.Array
-    running_scores: chex.Array
-    sequences: chex.Array
-    scores: chex.Array
-    is_sent_finished: chex.Array
-    model_kwargs: dict[str, chex.Array]
+    cur_len: Array
+    running_sequences: Array
+    running_scores: Array
+    sequences: Array
+    scores: Array
+    is_sent_finished: Array
+    model_kwargs: dict[str, Array]
 
 
-def _safepick(config, pickname):
+def _safepick(config, pickname):  # pyright: ignore[reportUnusedFunction]
+    """Safely retrieve an attribute from a config, falling back to text_config.
+
+    This utility function attempts to get an attribute from the given config object.
+    If the attribute is None or doesn't exist, it tries to retrieve it from the
+    config's text_config attribute (if present), which is common in multimodal models.
+
+    Args:
+        config: The configuration object to retrieve the attribute from.
+        pickname: The name of the attribute to retrieve.
+
+    Returns:
+        The attribute value if found, None otherwise.
+
+    Example:
+        >>> vocab_size = _safepick(model_config, "vocab_size")
+        >>> # If model_config.vocab_size is None, tries model_config.text_config.vocab_size
+    """
     vari = getattr(config, pickname, None)
     if vari is None and hasattr(config, "text_config"):
         vari = getattr(config.text_config, pickname, None)
@@ -165,159 +192,177 @@ def _safepick(config, pickname):
 
 
 class EasyGenerationMixin:
+    """Mixin class providing text generation capabilities for EasyDeL models.
+
+    This mixin adds comprehensive text generation functionality to model classes,
+    supporting multiple generation strategies including greedy search, sampling,
+    and beam search. It provides integration with HuggingFace's GenerationConfig
+    and includes specialized support for the eSurge high-performance inference engine.
+
+    The mixin handles:
+    - KV cache initialization and management for efficient autoregressive generation
+    - Multiple cache types: TransformerCache, HybridCache, RaggedPagesCache, UnifiedAttentionCache
+    - Logits processing and warping (temperature, top-k, top-p, etc.)
+    - Generation constraints (min/max length, forced tokens, n-gram repetition)
+    - Encoder-decoder model support
+    - eSurge continuous-batching inference engine integration
+
+    Attributes:
+        config_class: The configuration class type for this model.
+        config: The model's configuration instance.
+        base_model_prefix: The prefix used for the base model in state dicts.
+        _model_task: Optional task identifier for the model.
+        _model_type: Optional model type identifier.
+
+    Example:
+        >>> # Model class inherits from EasyGenerationMixin
+        >>> class MyModel(EasyGenerationMixin, nn.Module):
+        ...     pass
+        >>>
+        >>> # Generate text using the model
+        >>> output = model.generate(
+        ...     input_ids=input_ids,
+        ...     max_length=100,
+        ...     temperature=0.8,
+        ...     top_p=0.95,
+        ...     do_sample=True
+        ... )
+        >>> print(output.sequences)
+
+    Note:
+        This mixin expects the model to have a `__call__` method that accepts
+        `input_ids` and returns logits, as well as a `config` attribute.
+    """
+
     config_class: type[EasyDeLBaseConfig]
     config: EasyDeLBaseConfig
     base_model_prefix: str
     _model_task: str | None = None
     _model_type: str | None = None
 
-    def create_paged_metadata(
+    def init_ragged_pages(
         self,
-        hbm_utilization: float,
-        page_size: int,
-        max_model_length: int,
-    ) -> PagesCacheMetaData:
-        """
-        Creates the static configuration metadata required for initializing a Paged KV Cache.
-
-        This method gathers necessary parameters from the model's configuration
-        (like number of layers, heads, dimensions) and combines them with the provided
-        arguments to instantiate and return a `PagesCacheMetaData` object.
-        This metadata object defines the structure and allocation parameters for the paged cache.
-
-        Returns:
-            PagesCacheMetaData: An initialized metadata object containing the
-                static configuration for the paged cache.
-        """
-        num_hidden_layers = _safepick(self.config, "num_hidden_layers")
-
-        num_key_value_heads = _safepick(self.config, "num_key_value_heads")
-        num_attention_heads = _safepick(self.config, "num_attention_heads")
-
-        hidden_size = _safepick(self.config, "hidden_size")
-
-        if num_key_value_heads is None:
-            num_key_value_heads = num_attention_heads
-
-        head_dim = _safepick(self.config, "head_dim")
-        if head_dim is None:
-            head_dim = hidden_size // num_attention_heads
-
-        return PagesCacheMetaData.create(
-            mesh=self.mesh,
-            partition_manager=self.config.partition_manager,
-            kvdtype=self.config.kvdtype,
-            max_model_length=max_model_length,
-            num_hidden_layers=num_hidden_layers,
-            num_kv_heads=num_key_value_heads,
-            kv_head_dim_size=head_dim,
-            k_headdim=None,
-            v_headdim=None,
-            hbm_utilization=hbm_utilization,
-            page_size=page_size,
-        )
-
-    def create_cache_metadata(
-        self,
-        batch_size: int,
-        max_length: int,
-        pad_token_id: int | None = None,
-    ) -> TransformerCacheMetaData:
-        """
-        Creates the metadata required for initializing a standard (non-paged) KV Cache.
-
-        This method gathers parameters like layer count, head dimensions, and determines
-        the appropriate padding token ID to instantiate and return a
-        `TransformerCacheMetaData` object suitable for a standard sequential KV cache.
-
-        Args:
-            batch_size (int): The batch size for which the cache is being configured.
-            max_length (int): The maximum sequence length the cache needs to support.
-            pad_token_id (int | None): The ID of the padding token. If None, it attempts
-                to find it from `self.generation_config` or `self.config`, defaulting to 0.
-
-        Returns:
-            TransformerCacheMetaData: An initialized metadata object for a standard KV cache.
-        """
-        if pad_token_id is None:
-            if hasattr(self, "generation_config"):
-                pad_token_id = self.generation_config.pad_token_id
-            elif hasattr(self.config, "pad_token_id"):
-                pad_token_id = self.config.pad_token_id
-            else:
-                pad_token_id = 0
-        head_dim = getattr(self.config, "head_dim", None)
-        if head_dim is None:
-            head_dim = self.config.hidden_size // self.config.num_attention_heads
-        num_key_value_heads = getattr(self.config, "num_key_value_heads", None)
-        if num_key_value_heads is None:
-            num_key_value_heads = self.config.num_attention_heads
-
-        from easydel.layers.caching import TransformerCacheMetaData
-
-        return TransformerCacheMetaData.create(
-            num_hidden_layers=self.config.num_hidden_layers,
-            pad_token_id=pad_token_id,
-            batch_size=batch_size,
-            sequence_length=max_length,
-            num_heads=num_key_value_heads,
-            head_dim=head_dim,
-        )
-
-    def init_pages(
-        self,
-        metadata: PagesCacheMetaData | None = None,
+        config: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig | None = None,
         page_size: int | None = None,
         hbm_utilization: float | None = None,
         max_model_length: int | None = None,
-    ) -> PagesCache:
+    ) -> RaggedPagesCache | UnifiedAttentionCache:
         """
         Initializes and returns the actual Paged Attention KV Cache tensors.
 
-        This method orchestrates the creation of the `PagesCache`. It either uses
-        a pre-existing `PagesCacheMetaData` object passed via the `metadata`
-        argument, or if `metadata` is None, it first creates the metadata by calling
-        `self.create_paged_metadata` using the other provided arguments (page_size,
+        This method orchestrates the creation of the `RaggedPagesCache`. It either uses
+        a pre-existing `RaggedPagesCacheConfig` object passed via the `config`
+        argument, or if `config` is None, it first creates the config by calling
+        `self.create_ragged_page_cache_config` using the other provided arguments (page_size,
         batch_size, etc.).
 
-        Finally, it calls `PagesCache.init_cache` to allocate the necessary
+        Finally, it calls `RaggedPagesCache.init_cache` to allocate the necessary
         paged tensors (`key_pages`, `value_pages` for each layer) based on the
-        metadata, model's mesh, dtype, partition manager, and quantization settings.
+        config, model's mesh, dtype, partition manager, and quantization settings.
 
         Args:
-            metadata (tp.Optional[PagesCacheMetaData]): An optional pre-configured
-                metadata object. If provided, other arguments like page_size, batch_size etc.,
-                are ignored for metadata creation.
-            page_size (tp.Optional[int]): Number of tokens per page. Required if `metadata` is None.
-            hbm_utilization (tp.Optional[float]): Target HBM usage. Required if `metadata` is None.
+            config (tp.Optional[RaggedPagesCacheConfig]): An optional pre-configured
+                config object. If provided, other arguments like page_size, batch_size etc.,
+                are ignored for config creation.
+            page_size (tp.Optional[int]): Number of tokens per page. Required if `config` is None.
+            hbm_utilization (tp.Optional[float]): Target HBM usage. Required if `config` is None.
 
         Returns:
-            PagesCache: An initialized PagesCache object containing the allocated
+            RaggedPagesCache: An initialized RaggedPagesCache object containing the allocated
                 cache tensors (views) for all layers.
 
         Raises:
-            AssertionError: If `metadata` is None and any of the required arguments
+            AssertionError: If `config` is None and any of the required arguments
                 (page_size, batch_size, max_sequences, dtype, hbm_utilization) are also None.
         """
-        if metadata is None:
-            assert page_size is not None, "if your not passing metadata you should pass `page_size`"
-            assert hbm_utilization is not None, "if your not passing metadata you should pass `hbm_utilization`"
-            assert max_model_length is not None, "if your not passing metadata you should pass `max_model_length`"
+        text_config = self.config.get_text_config()
+        if config is None:
+            assert page_size is not None, "if your not passing config you should pass `page_size`"
+            assert hbm_utilization is not None, "if your not passing config you should pass `hbm_utilization`"
+            assert max_model_length is not None, "if your not passing config you should pass `max_model_length`"
 
-            metadata = self.create_paged_metadata(
+            config = self.create_ragged_page_cache_config(
+                max_length=max_model_length,
                 hbm_utilization=hbm_utilization,
                 page_size=page_size,
-                max_model_length=max_model_length,
             )
-        return PagesCache.init_cache(
-            mesh=self.config.mesh,
-            metadata=metadata,
-            partition_manager=self.config.partition_manager,
-            quantizer=self._quant_class(
-                quantization_method=self.config.kv_cache_quantization_method,
-                block_size=self.config.kv_cache_quantization_blocksize,
-                quantization_platform=self.config.platform,
-            ),
+        quantizer = self._quant_class(
+            quantization_config=text_config.kv_cache_quantization_config,
+        )
+
+        if isinstance(config, UnifiedAttentionCacheConfig):
+            return UnifiedAttentionCache.init_cache(
+                mesh=text_config.mesh,
+                config=config,
+                partition_manager=text_config.partition_manager,
+                quantizer=quantizer,
+            )
+
+        return RaggedPagesCache.init_cache(
+            mesh=text_config.mesh,
+            config=config,
+            partition_manager=text_config.partition_manager,
+            quantizer=quantizer,
+        )
+
+    def init_unified_attention_cache(
+        self,
+        config: UnifiedAttentionCacheConfig | None = None,
+        page_size: int | None = None,
+        hbm_utilization: float | None = None,
+        max_model_length: int | None = None,
+    ) -> UnifiedAttentionCache:
+        """Initialize and return the unified-attention paged KV cache tensors.
+
+        Creates a UnifiedAttentionCache for use with vLLM-style unified attention
+        kernels. The cache layout matches ejkernel's Triton UnifiedAttention kernel:
+        `[num_blocks, block_size, num_kv_heads, head_dim]` for both K and V.
+
+        This method either uses a pre-existing UnifiedAttentionCacheConfig or creates
+        one using the provided parameters.
+
+        Args:
+            config: Optional pre-configured cache config. If provided, other
+                arguments are ignored.
+            page_size: Number of tokens per page. Required if config is None.
+            hbm_utilization: Target HBM memory utilization (0.0-1.0). Required
+                if config is None.
+            max_model_length: Maximum sequence length. Required if config is None.
+
+        Returns:
+            UnifiedAttentionCache: Initialized cache with allocated tensors.
+
+        Raises:
+            AssertionError: If config is None and required parameters are missing.
+
+        Example:
+            >>> cache = model.init_unified_attention_cache(
+            ...     page_size=128,
+            ...     hbm_utilization=0.9,
+            ...     max_model_length=4096
+            ... )
+        """
+        text_config = self.config.get_text_config()
+        if config is None:
+            assert page_size is not None, "if your not passing config you should pass `page_size`"
+            assert hbm_utilization is not None, "if your not passing config you should pass `hbm_utilization`"
+            assert max_model_length is not None, "if your not passing config you should pass `max_model_length`"
+
+            config = self.create_unified_attention_cache_config(
+                max_length=max_model_length,
+                hbm_utilization=hbm_utilization,
+                page_size=page_size,
+            )
+
+        quantizer = self._quant_class(
+            quantization_config=text_config.kv_cache_quantization_config,
+        )
+
+        return UnifiedAttentionCache.init_cache(
+            mesh=text_config.mesh,
+            config=config,
+            partition_manager=text_config.partition_manager,
+            quantizer=quantizer,
         )
 
     def init_cache(
@@ -327,14 +372,14 @@ class EasyGenerationMixin:
         starts: int | None = None,
         shardings: dict | None = None,
         pad_token_id: int | None = None,
-    ) -> TransformerCache:
+    ):
         """
-        Initializes and returns a standard (non-paged) Key-Value cache.
+        Initializes and returns the appropriate cache type for this model.
 
-        This method first creates the necessary metadata using `create_cache_metadata`
-        and then calls `TransformerCache.init_cache` to allocate and initialize
-        the cache tensors based on the model's configuration, dtype, sharding,
-        quantization settings, and provided batch size and maximum length.
+        This method automatically detects the cache type needed based on the model's
+        operations and creates the appropriate cache:
+        - For pure transformer models: Returns TransformerCache
+        - For hybrid/recurrent models: Returns HybridCache via init_operations_cache
 
         Args:
             batch_size (int): The batch size for the cache.
@@ -342,31 +387,914 @@ class EasyGenerationMixin:
             starts (int | None): Optional starting positions for the cache sequences.
                 If provided, influences the initial state. Defaults to None (usually 0).
             shardings (dict | None): Optional dictionary specifying sharding configurations.
-                (Note: This argument appears unused in the current implementation shown).
             pad_token_id (int | None): The ID of the padding token. If None, it's inferred.
 
         Returns:
-            TransformerCache: An initialized standard TransformerCache object.
+            TransformerCache or HybridCache depending on the model type.
         """
+        from easydel.caching import TransformerCache
 
-        from easydel.layers.caching import TransformerCache
+        text_config = self.config.get_text_config()
+        cache_type = self.get_inference_cache_type()
 
-        return TransformerCache.init_cache(
-            dtype=self.config.kvdtype,
-            partition_manager=self.config.partition_manager,
-            metadata=self.create_cache_metadata(
+        if cache_type == "transformer":
+            return TransformerCache.init_cache(
+                mesh=text_config.mesh,
+                config=self.create_transformer_cache_config(
+                    batch_size=batch_size,
+                    max_length=max_length,
+                    pad_token_id=pad_token_id,
+                ),
+                partition_manager=text_config.partition_manager,
+                dtype=text_config.kvdtype,
+                starts=starts,
+                quantizer=self._quant_class(
+                    quantization_config=text_config.kv_cache_quantization_config,
+                ),
+                mask_type_details=text_config.get_mask_details(),
+            )
+        else:
+            # For hybrid/recurrent models, use init_operations_cache
+            return self.init_operations_cache(
                 batch_size=batch_size,
                 max_length=max_length,
-                pad_token_id=pad_token_id,
-            ),
-            quantizer=self._quant_class(
-                quantization_method=self.config.kv_cache_quantization_method,
-                block_size=self.config.kv_cache_quantization_blocksize,
-                quantization_platform=self.config.platform,
-            ),
-            mesh=self.config.mesh,
+                starts=starts,
+                dtype=text_config.kvdtype,
+                quantizer=self._quant_class(
+                    quantization_config=text_config.kv_cache_quantization_config,
+                ),
+                masking_details=text_config.get_mask_details() if cache_type != "ragged" else None,
+            )
+
+    def get_inference_cache_type(self) -> str:
+        """Determine the appropriate cache type for inference based on model operations.
+
+        This method uses dynamic discovery to inspect the actual operations and
+        determine the best cache type:
+        - "hybrid": For models with recurrent layers (e.g., Qwen3Next with attention + linear)
+        - "transformer": For pure attention models using TransformerCache
+        - "ragged": For models that only support RaggedPagesCache
+
+        The returned cache type is used by execution managers to initialize the
+        appropriate cache and metadata structures.
+
+        Returns:
+            str: "hybrid", "transformer", or "ragged" based on model operations.
+
+        Example:
+            >>> cache_type = model.get_inference_cache_type()
+            >>> if cache_type == "ragged":
+            ...     cache = model.init_ragged_pages(...)
+            ... else:
+            ...     cache = model.init_operations_cache(...)
+        """
+        cache_info = self.get_operations_cache_info()
+        return cache_info.get_recommended_cache_type()
+
+    def create_transformer_cache_config(
+        self,
+        batch_size: int,
+        max_length: int,
+        pad_token_id: int | None = None,
+    ):
+        """Create TransformerCacheConfig from model configuration.
+
+        Args:
+            batch_size: Batch size for inference.
+            max_length: Maximum sequence length.
+            pad_token_id: Optional pad token id override.
+
+        Returns:
+            TransformerCacheConfig configured for the model.
+        """
+        from easydel.caching import TransformerCacheConfig
+
+        text_config = self.config.get_text_config()
+
+        if pad_token_id is None:
+            pad_token_id = getattr(text_config, "pad_token_id", 0)
+
+        num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
+
+        # Some configs (e.g. OpenELM) store per-layer KV head counts in `num_kv_heads`.
+        # Generation cache configs currently expect a single KV head count, so we
+        # use the first layer's value when a list/tuple is provided.
+        num_kv_heads = getattr(text_config, "num_kv_heads", None)
+        if isinstance(num_kv_heads, (list, tuple)):
+            num_kv_heads = int(num_kv_heads[0]) if len(num_kv_heads) > 0 else None
+        if num_kv_heads is None:
+            num_kv_heads = getattr(text_config, "num_key_value_heads", None)
+        if num_kv_heads is None:
+            num_kv_heads = getattr(text_config, "num_attention_heads", None)
+
+        head_dim = getattr(text_config, "head_dim", None)
+        if head_dim is None:
+            hidden_size = getattr(text_config, "hidden_size", None)
+            num_heads = getattr(text_config, "num_attention_heads", None)
+            if hidden_size and num_heads:
+                head_dim = hidden_size // num_heads
+
+        if num_kv_heads is None:
+            raise ValueError(
+                "Could not infer number of KV heads for TransformerCacheConfig; "
+                "expected `num_key_value_heads` or `num_attention_heads` on config."
+            )
+        if head_dim is None:
+            raise ValueError(
+                "Could not infer head_dim for TransformerCacheConfig; "
+                "expected `head_dim` or (`hidden_size` and `num_attention_heads`) on config."
+            )
+
+        # MLA-style attention (e.g., Kimi Linear / DeepSeek): KV head dims may differ
+        # from `head_dim` and K/V dims may differ from each other.
+        qk_nope_head_dim = getattr(text_config, "qk_nope_head_dim", None)
+        qk_rope_head_dim = getattr(text_config, "qk_rope_head_dim", None)
+        v_head_dim = getattr(text_config, "v_head_dim", None)
+        if qk_nope_head_dim is not None and qk_rope_head_dim is not None and v_head_dim is not None:
+            key_dim = int(qk_nope_head_dim + qk_rope_head_dim)
+            value_dim = int(v_head_dim)
+            if key_dim != head_dim or value_dim != head_dim:
+                # MLA forward path constructs KV with `num_attention_heads` heads (not GQA/MQA),
+                # so the cache must match that head count.
+                mla_heads = int(getattr(text_config, "num_attention_heads", num_kv_heads) or num_kv_heads)
+                return TransformerCacheConfig.create(
+                    batch_size=batch_size,
+                    sequence_length=max_length,
+                    num_hidden_layers=num_hidden_layers,
+                    pad_token_id=pad_token_id,
+                    num_heads=mla_heads,
+                    head_dim=None,
+                    key_dim=key_dim,
+                    value_dim=value_dim,
+                )
+
+        return TransformerCacheConfig.create(
+            batch_size=batch_size,
+            sequence_length=max_length,
+            num_hidden_layers=num_hidden_layers,
+            pad_token_id=pad_token_id,
+            num_heads=num_kv_heads,
+            head_dim=head_dim,
+        )
+
+    def create_recurrent_cache_config(self, batch_size: int):
+        """Create RecurrentCacheConfig from model configuration.
+
+        This method automatically detects the recurrent architecture type (Qwen3-Next,
+        FalconH1, Mamba2, Mamba) and creates the appropriate cache configuration.
+
+        Args:
+            batch_size (int): Batch size for inference.
+
+        Returns:
+            RecurrentCacheConfig: Cache configuration appropriate for the model's
+                recurrent layer architecture.
+
+        Raises:
+            ValueError: If intermediate_size cannot be inferred for certain architectures.
+        """
+        from easydel.caching import RecurrentCacheConfig
+
+        text_config = self.config.get_text_config()
+
+        partition_axis = getattr(text_config, "partition_axis", None)
+        if partition_axis is None:
+            partition_axis = PartitionAxis()
+
+        num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
+
+        # 1) Qwen3-Next / GatedDeltaRule-style linear attention
+        has_linear_attn_fields = any(
+            hasattr(text_config, name)
+            for name in (
+                "linear_num_value_heads",
+                "linear_num_key_heads",
+                "linear_key_head_dim",
+                "linear_value_head_dim",
+                "linear_conv_kernel_dim",
+            )
+        )
+        if has_linear_attn_fields:
+            conv_dim = getattr(text_config, "linear_d_inner", None)
+            if conv_dim is None:
+                num_k_heads = getattr(text_config, "linear_num_key_heads", None)
+                head_k_dim = getattr(text_config, "linear_key_head_dim", None)
+                num_v_heads = getattr(text_config, "linear_num_value_heads", None)
+                head_v_dim = getattr(text_config, "linear_value_head_dim", None)
+                if num_k_heads and head_k_dim and num_v_heads and head_v_dim:
+                    key_dim = num_k_heads * head_k_dim
+                    value_dim = num_v_heads * head_v_dim
+                    conv_dim = key_dim * 2 + value_dim
+                elif num_k_heads and head_k_dim:
+                    conv_dim = num_k_heads * head_k_dim
+                else:
+                    conv_dim = getattr(text_config, "intermediate_size", 2048)
+
+            conv_kernel_size = getattr(text_config, "linear_conv_kernel_dim", None)
+            if conv_kernel_size is None:
+                conv_kernel_size = getattr(text_config, "d_conv", 4)
+
+            num_heads = getattr(text_config, "linear_num_value_heads", None) or getattr(
+                text_config, "linear_num_key_heads", None
+            )
+            head_dim = getattr(text_config, "linear_key_head_dim", None)
+            d_state = getattr(text_config, "linear_d_state", None)
+            if d_state is None:
+                d_state = getattr(text_config, "linear_value_head_dim", None) or 64
+
+            recurrent_shape: tuple[int, ...]
+            if num_heads is not None and head_dim is not None:
+                # GDR/KDA-style recurrent state: [batch, num_heads, head_dim(key), d_state(value)]
+                recurrent_shape = (int(num_heads), int(head_dim), int(d_state))
+            else:
+                # Fallback: Mamba-style recurrent state
+                recurrent_shape = (int(conv_dim), int(d_state))
+
+            return RecurrentCacheConfig.create(
+                num_hidden_layers=num_hidden_layers,
+                partition_axis=partition_axis,
+                batch_size=batch_size,
+                conv_dim=int(conv_dim),
+                conv_kernel_size=int(conv_kernel_size),
+                recurrent_state_shape=recurrent_shape,
+            )
+
+        # 2) FalconH1-style (mamba_* prefixed attributes)
+        is_falcon_h1 = all(
+            hasattr(text_config, name)
+            for name in (
+                "mamba_n_heads",
+                "mamba_d_head",
+                "mamba_n_groups",
+                "mamba_d_state",
+                "mamba_d_conv",
+            )
+        )
+        if is_falcon_h1:
+            # FalconH1 uses mamba_intermediate_size property or mamba_d_ssm
+            intermediate_size = getattr(text_config, "mamba_intermediate_size", None)
+            if intermediate_size is None:
+                mamba_d_ssm = getattr(text_config, "mamba_d_ssm", None)
+                if mamba_d_ssm is not None:
+                    intermediate_size = mamba_d_ssm
+                else:
+                    hidden_size = getattr(text_config, "hidden_size", None)
+                    mamba_expand = getattr(text_config, "mamba_expand", 2)
+                    if hidden_size is None:
+                        raise ValueError("Could not infer intermediate_size for FalconH1 recurrent cache config.")
+                    intermediate_size = int(mamba_expand * hidden_size)
+
+            state_size = int(text_config.mamba_d_state)
+            n_groups = int(text_config.mamba_n_groups)
+            conv_dim = int(intermediate_size + 2 * n_groups * state_size)
+            conv_kernel_size = int(text_config.mamba_d_conv)
+            recurrent_shape = (int(text_config.mamba_n_heads), int(text_config.mamba_d_head), state_size)
+
+            return RecurrentCacheConfig.create(
+                num_hidden_layers=num_hidden_layers,
+                partition_axis=partition_axis,
+                batch_size=batch_size,
+                conv_dim=conv_dim,
+                conv_kernel_size=conv_kernel_size,
+                recurrent_state_shape=recurrent_shape,
+            )
+
+        # 3) Mamba2-style state space models (standard naming)
+        is_mamba2 = all(
+            hasattr(text_config, name)
+            for name in (
+                "num_heads",
+                "head_dim",
+                "n_groups",
+                "state_size",
+                "conv_kernel",
+            )
+        )
+        if is_mamba2:
+            intermediate_size = getattr(text_config, "intermediate_size", None)
+            if intermediate_size is None:
+                hidden_size = getattr(text_config, "hidden_size", None)
+                expand = getattr(text_config, "expand", 2)
+                if hidden_size is None:
+                    raise ValueError("Could not infer intermediate_size for Mamba2 recurrent cache config.")
+                intermediate_size = int(expand * hidden_size)
+
+            state_size = int(text_config.state_size)
+            n_groups = int(text_config.n_groups)
+            conv_dim = int(intermediate_size + 2 * n_groups * state_size)
+            conv_kernel_size = int(text_config.conv_kernel)
+            recurrent_shape = (int(text_config.num_heads), int(text_config.head_dim), state_size)
+
+            return RecurrentCacheConfig.create(
+                num_hidden_layers=num_hidden_layers,
+                partition_axis=partition_axis,
+                batch_size=batch_size,
+                conv_dim=conv_dim,
+                conv_kernel_size=conv_kernel_size,
+                recurrent_state_shape=recurrent_shape,
+            )
+
+        # 4) Mamba-style state space models
+        is_mamba = all(hasattr(text_config, name) for name in ("state_size", "conv_kernel", "intermediate_size"))
+        if is_mamba:
+            intermediate_size = int(text_config.intermediate_size)
+            state_size = int(text_config.state_size)
+            conv_kernel_size = int(text_config.conv_kernel)
+            recurrent_shape = (intermediate_size, state_size)
+
+            return RecurrentCacheConfig.create(
+                num_hidden_layers=num_hidden_layers,
+                partition_axis=partition_axis,
+                batch_size=batch_size,
+                conv_dim=intermediate_size,
+                conv_kernel_size=conv_kernel_size,
+                recurrent_state_shape=recurrent_shape,
+            )
+
+        # 5) Generic fallback
+        conv_dim = getattr(text_config, "intermediate_size", 2048)
+        conv_kernel_size = getattr(text_config, "d_conv", 4)
+        d_state = getattr(text_config, "state_size", 64)
+        return RecurrentCacheConfig.create(
+            num_hidden_layers=num_hidden_layers,
+            partition_axis=partition_axis,
+            batch_size=batch_size,
+            conv_dim=int(conv_dim),
+            conv_kernel_size=int(conv_kernel_size),
+            recurrent_state_shape=(int(conv_dim), int(d_state)),
+        )
+
+    def create_kda_cache_config(self, batch_size: int):
+        """Create KDACacheConfig from model configuration.
+
+        Creates cache configuration for models using Key-Dependent Attention (KDA)
+        mechanisms like certain linear attention variants.
+
+        Args:
+            batch_size (int): Batch size for inference.
+
+        Returns:
+            KDACacheConfig: Cache configuration for KDA-style attention layers.
+
+        Raises:
+            ValueError: If num_heads cannot be inferred from the model configuration.
+        """
+        from easydel.caching import KDACacheConfig
+
+        text_config = self.config.get_text_config()
+
+        partition_axis = getattr(text_config, "partition_axis", None)
+        if partition_axis is None:
+            partition_axis = PartitionAxis()
+
+        num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
+
+        linear_config = getattr(text_config, "linear_attn_config", None) or {}
+
+        num_heads = int(linear_config.get("num_heads", getattr(text_config, "num_attention_heads", 0) or 0))
+        head_k_dim = int(linear_config.get("head_k_dim", 128))
+        head_v_dim = int(linear_config.get("head_v_dim", 128))
+        d_conv = int(linear_config.get("d_conv", getattr(text_config, "d_conv", 4)))
+
+        if num_heads <= 0:
+            raise ValueError(
+                "Could not infer `num_heads` for KDACacheConfig; "
+                "expected `linear_attn_config['num_heads']` or `num_attention_heads`."
+            )
+
+        key_dim = num_heads * head_k_dim
+        value_dim = num_heads * head_v_dim
+        recurrent_shape = (num_heads, head_k_dim, head_v_dim)
+
+        return KDACacheConfig.create(
+            num_hidden_layers=num_hidden_layers,
+            partition_axis=partition_axis,
+            batch_size=batch_size,
+            key_dim=key_dim,
+            value_dim=value_dim,
+            d_conv=d_conv,
+            recurrent_state_shape=recurrent_shape,
+        )
+
+    def create_lightning_cache_config(self, batch_size: int):
+        """Create LightningCacheConfig from model configuration.
+
+        Creates cache configuration for models using Lightning Attention mechanisms.
+
+        Args:
+            batch_size (int): Batch size for inference.
+
+        Returns:
+            LightningCacheConfig: Cache configuration for Lightning Attention layers.
+        """
+
+        from easydel.caching import LightningCacheConfig
+
+        text_config = self.config.get_text_config()
+
+        partition_axis = getattr(text_config, "partition_axis", None)
+        if partition_axis is None:
+            partition_axis = PartitionAxis()
+
+        # Get heads/dims from config
+        num_heads = getattr(text_config, "num_attention_heads", None)
+        head_dim = getattr(text_config, "head_dim", None)
+        if head_dim is None:
+            hidden_size = getattr(text_config, "hidden_size", None)
+            if hidden_size and num_heads:
+                head_dim = hidden_size // num_heads
+
+        # Key/value heads for MQA/GQA
+        key_heads = getattr(text_config, "num_key_value_heads", num_heads)
+        value_heads = getattr(text_config, "num_key_value_heads", num_heads)
+
+        # Key/value dims (can be different from head_dim in some architectures)
+        key_dim = getattr(text_config, "key_dim", head_dim)
+        value_dim = getattr(text_config, "value_dim", head_dim)
+
+        return LightningCacheConfig.create(
+            partition_axis=partition_axis,
+            batch_size=batch_size,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            key_heads=key_heads,
+            value_heads=value_heads,
+            key_dim=key_dim,
+            value_dim=value_dim,
+        )
+
+    def create_ragged_page_cache_config(
+        self,
+        max_length: int,
+        *,
+        page_size: int = 128,
+        hbm_utilization: float = 0.9,
+        dtype: jnp.dtype | None = None,
+    ):
+        """Create RaggedPagesCacheConfig from model configuration.
+
+        Creates cache configuration for Paged Attention (vLLM-style) with ragged
+        page management. The batch size is determined dynamically based on HBM
+        utilization.
+
+        Args:
+            max_length (int): Maximum sequence length (max_model_length).
+            page_size (int): Number of tokens per page. Defaults to 128.
+            hbm_utilization (float): Target HBM memory utilization fraction (0.0-1.0).
+                Defaults to 0.9.
+            dtype (jnp.dtype | None): Data type for cache tensors. If None, uses
+                the model's kvdtype. Defaults to None.
+
+        Returns:
+            RaggedPagesCacheConfig: Cache configuration for paged attention.
+        """
+        from easydel.caching import RaggedPagesCacheConfig
+
+        text_config = self.config.get_text_config()
+
+        if dtype is None:
+            dtype = getattr(text_config, "kvdtype", jnp.bfloat16)
+            if isinstance(dtype, str):
+                dtype = getattr(jnp, dtype, jnp.bfloat16)
+
+        num_kv_heads = getattr(text_config, "num_key_value_heads", None)
+        head_dim = getattr(text_config, "head_dim", None)
+        if head_dim is None:
+            hidden_size = getattr(text_config, "hidden_size", None)
+            num_heads = getattr(text_config, "num_attention_heads", None)
+            if hidden_size and num_heads:
+                head_dim = hidden_size // num_heads
+
+        num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
+        if self.config.get_text_config().attn_mechanism == "ragged_page_attention_v3":
+            version = "v3"
+        elif self.config.get_text_config().attn_mechanism == "ragged_page_attention_v2":
+            version = "v2"
+        else:
+            version = "v3"
+        return RaggedPagesCacheConfig.create(
+            mesh=text_config.mesh,
+            partition_manager=text_config.partition_manager,
+            kvdtype=dtype,
+            num_hidden_layers=num_hidden_layers,
+            num_kv_heads=num_kv_heads,
+            max_model_length=max_length,
+            kv_head_dim_size=head_dim,
+            hbm_utilization=hbm_utilization,
+            page_size=page_size,
+            version=version,
+        )
+
+    def create_unified_attention_cache_config(
+        self,
+        max_length: int,
+        *,
+        page_size: int = 128,
+        hbm_utilization: float = 0.9,
+        dtype: jnp.dtype | None = None,
+    ):
+        """Create UnifiedAttentionCacheConfig for vLLM-style unified attention.
+
+        This cache layout matches ejkernel's Triton UnifiedAttention kernel:
+        `[num_blocks, block_size, num_kv_heads, head_dim]` for both K and V.
+        """
+        from easydel.caching import UnifiedAttentionCacheConfig
+
+        text_config = self.config.get_text_config()
+
+        if dtype is None:
+            dtype = getattr(text_config, "kvdtype", jnp.bfloat16)
+            if isinstance(dtype, str):
+                dtype = getattr(jnp, dtype, jnp.bfloat16)
+
+        num_kv_heads = getattr(text_config, "num_key_value_heads", None)
+        head_dim = getattr(text_config, "head_dim", None)
+        if head_dim is None:
+            hidden_size = getattr(text_config, "hidden_size", None)
+            num_heads = getattr(text_config, "num_attention_heads", None)
+            if hidden_size and num_heads:
+                head_dim = hidden_size // num_heads
+
+        num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
+        return UnifiedAttentionCacheConfig.create(
+            mesh=text_config.mesh,
+            partition_manager=text_config.partition_manager,
+            kvdtype=dtype,
+            num_hidden_layers=num_hidden_layers,
+            num_kv_heads=num_kv_heads,
+            max_model_length=max_length,
+            head_dim=head_dim,
+            hbm_utilization=hbm_utilization,
+            page_size=page_size,
+        )
+
+    def init_operations_cache_config(
+        self,
+        batch_size: int,
+        max_length: int,
+        *,
+        page_size: int = 128,
+        hbm_utilization: float = 0.9,
+        dtype: jnp.dtype | None = None,
+        ragged_config=None,
+        unified_config=None,
+    ):
+        """Initialize cache configurations for each layer based on operation types.
+
+        This method creates a list of cache configurations, one per layer, based on
+        the cache view type determined by `get_operations_cache_view()`. Each layer
+        gets the appropriate config type for its operation (attention, recurrent, etc.).
+
+        Args:
+            batch_size: Batch size for inference.
+            max_length: Maximum sequence length.
+            page_size: Page size for RaggedPagesCache. Defaults to 128.
+            hbm_utilization: HBM utilization for paged caches. Defaults to 0.9.
+            dtype: Data type for cache tensors. If None, uses model's kvdtype.
+            ragged_config: Optional pre-configured RaggedPagesCacheConfig. If None
+                and needed, one will be created.
+            unified_config: Optional pre-configured UnifiedAttentionCacheConfig.
+                If None and needed, one will be created.
+
+        Returns:
+            list: List of cache configurations, one per layer. Each element is either
+                a single config or a tuple (transformer_config, recurrent_config)
+                for parallel hybrid layers.
+
+        Raises:
+            TypeError: If provided config has wrong type.
+            ValueError: If cache view class is unknown or missing for a layer.
+
+        Example:
+            >>> configs = model.init_operations_cache_config(
+            ...     batch_size=8,
+            ...     max_length=2048,
+            ... )
+            >>> # configs[0] might be TransformerCacheConfig
+            >>> # configs[3] might be RecurrentCacheConfig
+        """
+        from easydel.caching import (
+            KDACacheView,
+            LightningCacheView,
+            ParallelHybridCacheView,
+            RaggedPagesCacheView,
+            RecurrentCacheView,
+            TransformerCacheView,
+            UnifiedAttentionCacheView,
+        )
+
+        text_config = self.config.get_text_config()
+        cache_view_mapping = self.get_operations_cache_view()
+
+        # Resolve dtype
+        if dtype is None:
+            dtype = getattr(text_config, "kvdtype", jnp.bfloat16)
+            if isinstance(dtype, str):
+                dtype = getattr(jnp, dtype, jnp.bfloat16)
+
+        # Check if any layer needs paged caches and create shared configs.
+        shared_ragged_config = None
+        shared_unified_config = None
+        needs_ragged = any(view_class is RaggedPagesCacheView for view_class in cache_view_mapping.values())
+        needs_unified = any(view_class is UnifiedAttentionCacheView for view_class in cache_view_mapping.values())
+
+        if needs_ragged:
+            from easydel.caching import RaggedPagesCacheConfig
+
+            if ragged_config is not None and not isinstance(ragged_config, RaggedPagesCacheConfig):
+                raise TypeError(f"`ragged_config` must be a RaggedPagesCacheConfig, got {type(ragged_config)}")
+            shared_ragged_config = ragged_config or self.create_ragged_page_cache_config(
+                max_length=max_length,
+                page_size=page_size,
+                hbm_utilization=hbm_utilization,
+                dtype=dtype,
+            )
+
+        if needs_unified:
+            from easydel.caching import UnifiedAttentionCacheConfig
+
+            if unified_config is not None and not isinstance(unified_config, UnifiedAttentionCacheConfig):
+                raise TypeError(f"`unified_config` must be a UnifiedAttentionCacheConfig, got {type(unified_config)}")
+            shared_unified_config = unified_config or self.create_unified_attention_cache_config(
+                max_length=max_length,
+                page_size=page_size,
+                hbm_utilization=hbm_utilization,
+                dtype=dtype,
+            )
+        with self.mesh:
+            num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
+            if num_hidden_layers is None:
+                num_hidden_layers = (max(cache_view_mapping.keys(), default=-1) + 1) if cache_view_mapping else 0
+
+            views_config = [None] * num_hidden_layers
+
+            for idx in range(num_hidden_layers):
+                view_class = cache_view_mapping.get(idx)
+                if view_class is None:
+                    raise ValueError(
+                        f"Missing cache view class for layer {idx}. "
+                        "Operation discovery did not return a cache view for every layer."
+                    )
+
+                if view_class is ParallelHybridCacheView:
+                    t_config = self.create_transformer_cache_config(batch_size=batch_size, max_length=max_length)
+                    r_config = self.create_recurrent_cache_config(batch_size=batch_size)
+                    views_config[idx] = (t_config, r_config)
+                elif view_class is TransformerCacheView:
+                    config = self.create_transformer_cache_config(batch_size=batch_size, max_length=max_length)
+                    views_config[idx] = config
+                elif view_class is RecurrentCacheView:
+                    config = self.create_recurrent_cache_config(batch_size=batch_size)
+                    views_config[idx] = config
+                elif view_class is KDACacheView:
+                    config = self.create_kda_cache_config(batch_size=batch_size)
+                    views_config[idx] = config
+                elif view_class is RaggedPagesCacheView:
+                    views_config[idx] = shared_ragged_config
+                elif view_class is UnifiedAttentionCacheView:
+                    views_config[idx] = shared_unified_config
+                elif view_class is LightningCacheView:
+                    config = self.create_lightning_cache_config(batch_size=batch_size)
+                    views_config[idx] = config
+                else:
+                    raise ValueError(f"Unknown cache view class: {view_class}")
+        return views_config
+
+    def init_operations_cache(
+        self,
+        batch_size: int,
+        max_length: int,
+        *,
+        # RaggedPagesCache args (for ragged page attention)
+        page_size: int = 128,
+        hbm_utilization: float = 0.9,
+        dtype: jnp.dtype | None = None,
+        quantizer=None,
+        masking_details=None,
+        starts: jnp.array | None = None,
+        ragged_config=None,
+        unified_config=None,
+    ):
+        """Initialize cache using HybridCache as the universal per-layer container.
+
+        This method uses HybridCache to hold per-layer cache views, where each
+        layer gets the appropriate view type based on its operation:
+        - Attention operations -> TransformerCacheView
+        - GatedDeltaRule operations -> RecurrentCacheView
+        - KDA operations -> KDACacheView
+        - RaggedPageAttention operations -> RaggedPagesCacheView
+        - UnifiedAttention operations -> UnifiedAttentionCacheView
+        - Lightning attention operations -> LightningCacheView
+
+        Args:
+            batch_size (int): Batch size for inference.
+            max_length (int): Maximum sequence length.
+            page_size (int): Page size for RaggedPagesCache. Defaults to 128.
+            hbm_utilization (float): HBM utilization for RaggedPagesCache. Defaults to 0.9.
+            dtype (jnp.dtype | None): Data type for cache tensors. Defaults to model's kvdtype.
+            quantizer: Optional quantizer for KV cache compression.
+            masking_details: Optional masking details for attention operations.
+            starts (jnp.array | None): Optional starting positions for sequences.
+                Used to initialize cache state for pre-filled prompts. Defaults to None.
+
+        Returns:
+            HybridCache: Cache with per-layer views appropriate for each operation.
+
+        Example:
+            >>> # Standard usage - automatically creates appropriate views per layer
+            >>> cache = model.init_operations_cache(batch_size=1, max_length=2048)
+            >>> # cache.views[0] might be RecurrentCacheView (for linear attention layer)
+            >>> # cache.views[3] might be TransformerCacheView (for full attention layer)
+        """
+        from easydel.caching import (
+            HybridCache,
+            KDACacheView,
+            LightningCacheView,
+            ParallelHybridCacheView,
+            RaggedPagesCacheView,
+            RecurrentCacheView,
+            TransformerCacheView,
+            UnifiedAttentionCacheView,
+        )
+
+        views_config = self.init_operations_cache_config(
+            batch_size=batch_size,
+            max_length=max_length,
+            page_size=page_size,
+            hbm_utilization=hbm_utilization,
+            dtype=dtype,
+            ragged_config=ragged_config,
+            unified_config=unified_config,
+        )
+        text_config = self.config.get_text_config()
+        cache_view_mapping = self.get_operations_cache_view()
+
+        if dtype is None:
+            dtype = getattr(text_config, "kvdtype", jnp.bfloat16)
+            if isinstance(dtype, str):
+                dtype = getattr(jnp, dtype, jnp.bfloat16)
+
+        with self.mesh:
+            num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
+            if num_hidden_layers is None:
+                num_hidden_layers = (max(cache_view_mapping.keys(), default=-1) + 1) if cache_view_mapping else 0
+
+            views = [None] * num_hidden_layers
+
+            for idx, config_classes in zip(range(num_hidden_layers), views_config, strict=False):
+                view_class = cache_view_mapping.get(idx)
+                if view_class is None:
+                    raise ValueError(
+                        f"Missing cache view class for layer {idx}. "
+                        "Operation discovery did not return a cache view for every layer."
+                    )
+                assert config_classes is not None, f"Missing config for layer {idx}"
+
+                if view_class is ParallelHybridCacheView:
+                    # Parallel hybrid layer: needs BOTH KV-cache and recurrent/SSM state.
+                    transformer_view = TransformerCacheView.init(
+                        config=config_classes[0],
+                        layer_index=idx,
+                        mesh=text_config.mesh,
+                        dtype=dtype,
+                        partition_manager=text_config.partition_manager,
+                        quantizer=quantizer,
+                        masking_details=masking_details,
+                        starts=starts,
+                    )
+
+                    recurrent_view = RecurrentCacheView.init(
+                        config=config_classes[1],
+                        layer_index=idx,
+                        dtype=dtype,
+                    )
+
+                    view = ParallelHybridCacheView(
+                        transformer=transformer_view,
+                        recurrent=recurrent_view,
+                        layer_index=idx,
+                    )
+                elif view_class is TransformerCacheView:
+                    view = view_class.init(
+                        config=config_classes,
+                        layer_index=idx,
+                        mesh=text_config.mesh,
+                        dtype=dtype,
+                        partition_manager=text_config.partition_manager,
+                        quantizer=quantizer,
+                        masking_details=masking_details,
+                        starts=starts,
+                    )
+                elif view_class is RecurrentCacheView:
+                    view = view_class.init(
+                        config=config_classes,
+                        layer_index=idx,
+                        dtype=dtype,
+                    )
+                elif view_class is KDACacheView:
+                    view = view_class.init(
+                        config=config_classes,
+                        layer_index=idx,
+                        dtype=dtype,
+                    )
+                elif view_class is RaggedPagesCacheView:
+                    view = view_class.init(
+                        config=config_classes,
+                        layer_index=idx,
+                        mesh=text_config.mesh,
+                        partition_manager=text_config.partition_manager,
+                        quantizer=quantizer,
+                    )
+                elif view_class is UnifiedAttentionCacheView:
+                    view = view_class.init(
+                        config=config_classes,
+                        layer_index=idx,
+                        mesh=text_config.mesh,
+                        partition_manager=text_config.partition_manager,
+                        quantizer=quantizer,
+                    )
+                elif view_class is LightningCacheView:
+                    view = view_class.init(
+                        config=config_classes,
+                        layer_index=idx,
+                        dtype=dtype,
+                    )
+                else:
+                    raise ValueError(f"Unknown cache view class: {view_class}")
+
+                views[idx] = view
+
+            return HybridCache(views=views)
+
+    def create_operations_metadata(
+        self,
+        *,
+        postpadded: bool = False,
+        starts: jnp.ndarray | None = None,
+        indexs: jnp.ndarray | None = None,
+        pages_tables: jnp.ndarray | None = None,
+        context_lens: jnp.ndarray | None = None,
+        query_start_loc: jnp.ndarray | None = None,
+        num_seqs: jnp.ndarray | None = None,
+        slot_mapping: jnp.ndarray | None = None,
+        position_ids: jnp.ndarray | None = None,
+        page_size: int = 128,
+    ) -> "OperationsMetadata":
+        """Create OperationsMetadata for use with cache operations.
+
+        This method creates OperationsMetadata that works with either:
+        - HybridCache: Uses HybridMetadata with embedded transformer fields
+        - RaggedPagesCache: Uses RaggedPagesMetadata (when ragged params provided)
+
+        For HybridCache (the default), the metadata includes fields needed by
+        TransformerCacheView layers (postpadded, starts, indexs). Recurrent
+        layers use their own internal state management.
+
+        Args:
+            postpadded: Whether sequences are post-padded (for transformer views).
+            starts: Starting positions for sequences (for transformer views).
+            indexs: Current position indices (for transformer views).
+            pages_tables: Page tables mapping (for ragged pages).
+            context_lens: Context lengths per sequence (for ragged pages).
+            query_start_loc: Query start locations (for ragged pages).
+            num_seqs: Number of sequences (for ragged pages).
+            slot_mapping: Slot mapping (for ragged pages).
+            position_ids: Position IDs (for ragged pages).
+            page_size: Page size (for ragged pages).
+
+        Returns:
+            OperationsMetadata configured for the cache type.
+
+        Example:
+            >>> # For HybridCache (default)
+            >>> metadata = model.create_operations_metadata(
+            ...     starts=jnp.zeros((batch_size,), dtype=jnp.int32)
+            ... )
+            >>>
+            >>> # For RaggedPagesCache
+            >>> metadata = model.create_operations_metadata(
+            ...     pages_tables=..., context_lens=...
+            ... )
+        """
+        from easydel.caching import OperationsMetadata
+
+        # Check if ragged pages metadata is requested
+        if pages_tables is not None and context_lens is not None:
+            return OperationsMetadata.for_ragged(
+                pages_tables=pages_tables,
+                context_lens=context_lens,
+                query_start_loc=query_start_loc,
+                num_seqs=num_seqs,
+                slot_mapping=slot_mapping,
+                position_ids=position_ids,
+                page_size=page_size,
+            )
+
+        # Default to hybrid metadata (works with HybridCache)
+        return OperationsMetadata.for_hybrid(
+            postpadded=postpadded,
             starts=starts,
-            mask_type_details=self.config.get_mask_details(),
+            indexs=indexs,
         )
 
     @cached_property
@@ -379,12 +1307,12 @@ class EasyGenerationMixin:
         Returns:
             type: The EasyQuantizer class.
         """
-        from easydel.layers.quantization.quantizers import EasyQuantizer
+        from easydel.layers.quantization._quants import EasyQuantizer
 
         return EasyQuantizer
 
     @staticmethod
-    def compute_prefill_length(array, padding_id) -> chex.Array:
+    def compute_prefill_length(array, padding_id) -> Array:
         """
         Calculates the number of padding tokens at the beginning of each sequence.
 
@@ -392,28 +1320,86 @@ class EasyGenerationMixin:
         dealing with left-padded inputs.
 
         Args:
-            array (chex.Array): The input token ID array, typically shape (batch_size, sequence_length).
+            array (Array): The input token ID array, typically shape (batch_size, sequence_length).
             padding_id (int): The token ID used for padding.
 
         Returns:
-            chex.Array: An array of shape (batch_size,) containing the number of leading
+            Array: An array of shape (batch_size,) containing the number of leading
                 padding tokens for each sequence in the batch.
         """
-        return jnp.sum(jnp.cumsum(array == padding_id, axis=-1) == 0, axis=-1)
+        valid = array != padding_id
+        return jnp.sum(jnp.cumsum(valid, axis=-1) == 0, axis=-1)
 
     @staticmethod
-    def compute_prefill_length_from_mask(mask) -> chex.Array:
-        """
-        Calculates the number of padding tokens at the beginning of each sequence.
+    def compute_prefill_length_from_mask(mask) -> Array:
+        """Calculate the number of leading padding tokens from an attention mask.
 
-        This is useful for determining the actual starting position in a KV cache when
-        dealing with left-padded inputs.
+        This is similar to `compute_prefill_length` but works directly with an
+        attention mask where 1 indicates valid tokens and 0 indicates padding.
+
+        Args:
+            mask: Attention mask array of shape (batch_size, sequence_length).
+                Values should be 0 for padding, 1 (or True) for valid tokens.
 
         Returns:
-            chex.Array: An array of shape (batch_size,) containing the number of leading
-                padding tokens for each sequence in the batch.
+            Array: Shape (batch_size,) containing the count of leading padding
+                tokens for each sequence.
+
+        Example:
+            >>> mask = jnp.array([[0, 0, 1, 1, 1], [0, 1, 1, 1, 1]])
+            >>> prefill_len = EasyGenerationMixin.compute_prefill_length_from_mask(mask)
+            >>> # prefill_len = [2, 1]
         """
+        mask = mask.astype(jnp.bool_)
         return jnp.sum(jnp.cumsum(mask, axis=-1) == 0, axis=-1)
+
+    def _make_mask_info(
+        self,
+        attention_mask: jax.Array | None,
+        q_segment_ids: jax.Array | None,
+        kv_segment_ids: jax.Array | None,
+        q_positions: jax.Array | None,
+        kv_positions: jax.Array | None,
+        is_self_attn: bool = True,
+    ) -> MaskInfo:
+        """Creates a MaskInfo object from attention masks or segment IDs.
+
+        This method prefers explicit segment IDs over attention masks when both
+        are provided, as segment-based masking is more flexible and supports
+        document-level boundaries.
+
+        Args:
+            attention_mask (jax.Array | None): Optional attention mask of shape
+                (B, L) or (B, 1, Q, K).
+            q_segment_ids (jax.Array | None): Optional query segment IDs for
+                document-aware masking.
+            kv_segment_ids (jax.Array | None): Optional key/value segment IDs.
+                If None and is_self_attn=True, uses q_segment_ids.
+            q_positions (jax.Array | None): Optional query position indices.
+            kv_positions (jax.Array | None): Optional key/value position indices.
+            is_self_attn (bool): Whether this is self-attention (vs cross-attention).
+                Defaults to True.
+
+        Returns:
+            MaskInfo: A MaskInfo object configured for the attention operation.
+
+        Raises:
+            ValueError: If neither segment_ids nor attention_mask is provided.
+        """
+        # Prefer explicit segment IDs over masks
+        if q_segment_ids is not None:
+            return MaskInfo.from_segments(
+                q_segment_ids=q_segment_ids,
+                kv_segment_ids=kv_segment_ids
+                if kv_segment_ids is not None
+                else (q_segment_ids if is_self_attn else None),
+                q_positions=q_positions,
+                kv_positions=kv_positions,
+            )
+        if attention_mask is not None:
+            # Works for (B,1,1,L), (B,1,Q,K) etc. Your MaskInfo handles 3D/4D gracefully.
+            return MaskInfo.from_attention_mask(attention_mask, q_positions=q_positions, kv_positions=kv_positions)
+        raise ValueError("Need either segment_ids (preferred) or attention_mask to build MaskInfo.")
 
     def prepare_inputs_for_generation(
         self,
@@ -422,8 +1408,9 @@ class EasyGenerationMixin:
         pad_token_id: int,
         starts: int | None = None,
         shardings: int | None = None,
-        attention_mask: chex.Array | None = None,
-        token_type_ids: chex.Array | None = None,
+        attention_mask: jax.Array | None = None,
+        token_type_ids: jax.Array | None = None,
+        mask_info: MaskInfo | None = None,  # NEW
     ) -> dict[str, tp.Any]:
         """
         Sets up the initial inputs required for starting autoregressive generation.
@@ -434,20 +1421,25 @@ class EasyGenerationMixin:
         suitable for caching. It ensures inputs are placed on the correct devices/shards.
 
         Args:
-            input_ids (chex.Array): The initial sequence of token IDs. Shape (batch_size, seq_length).
+            input_ids (Array): The initial sequence of token IDs. Shape (batch_size, seq_length).
             max_length (int): The maximum sequence length that the KV cache should support.
             pad_token_id (int): The ID used for padding tokens. Used to calculate `starts` if not provided.
             starts (int | None): Optional pre-calculated starting positions (number of leading pads).
-                If None, calculated using `compute_prefill_length`.
+                If None, calculated using `compute_prefill_length`. Defaults to None.
             shardings (dict | None): Optional sharding configuration passed to `init_cache`.
-            attention_mask (tp.Optional[chex.Array]): An optional mask indicating which tokens
-                should be attended to. Shape (batch_size, seq_length).
-            token_type_ids (tp.Optional[chex.Array]): Optional segment IDs for models that use them.
+                Defaults to None.
+            attention_mask (Array | None): An optional mask indicating which tokens
+                should be attended to. Shape (batch_size, seq_length). Defaults to None.
+            token_type_ids (Array | None): Optional segment IDs for models that use them.
+                Defaults to None.
+            mask_info (MaskInfo | None): Optional pre-computed MaskInfo object for attention.
+                If provided, used directly instead of computing from attention_mask.
+                Defaults to None.
 
         Returns:
             dict: A dictionary containing the prepared inputs, typically including:
                 - "past_key_values": The initialized KV cache.
-                - "attention_mask": The extended attention mask for generation.
+                - "mask_info": The MaskInfo object for attention masking.
                 - "position_ids": The calculated initial position IDs.
                 - "token_type_ids": (Optional) Prepared token type IDs.
                 This dictionary is then passed through `prepare_inputs_for_call`.
@@ -455,45 +1447,88 @@ class EasyGenerationMixin:
         batch_size, seq_length = input_ids.shape
         if starts is None:
             if attention_mask is not None:
-                starts = self.compute_prefill_length_from_mask(attention_mask)
+                starts = self.compute_prefill_length_from_mask(attention_mask.astype(jnp.bool_))
             else:
                 starts = self.compute_prefill_length(input_ids, pad_token_id)
-        past_key_values = self.init_cache(
-            batch_size,
-            max_length,
-            starts,
-            shardings,
-            pad_token_id,
+
+        past_key_values = self.init_operations_cache(
+            batch_size=batch_size,
+            max_length=max_length,
+            starts=starts,
         )
-        sharding = input_ids.sharding if hasattr(input_ids, "sharding") else None
-        extended_attention_mask = jnp.ones((batch_size, max_length), dtype="b1")
+
+        if mask_info is None:
+            if attention_mask is None:
+                if hasattr(self, "generation_config") and self.generation_config.pad_token_id is not None:
+                    pad_id = self.generation_config.pad_token_id
+                else:
+                    pad_id = pad_token_id
+                valid = input_ids != pad_id
+                seg = jnp.where(valid, jnp.int32(0), jnp.int32(-1))
+                mask_info = MaskInfo.from_segments(seg)
+            else:
+                mask_info = MaskInfo.from_attention_mask(attention_mask)
+
+        mask_info = self._pad_maskinfo_to_maxlen(mask_info, max_length=max_length, make_causal=True)
+
         if attention_mask is not None:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = attention_mask.astype("b1")
-            position_ids = attention_mask.cumsum(axis=-1) - 1
-            extended_attention_mask = lax.dynamic_update_slice(
-                extended_attention_mask,
-                attention_mask,
-                (0, 0),
-            )
+            am = attention_mask.astype(jnp.bool_)
+            position_ids = jnp.where(am, am.astype(jnp.int32).cumsum(axis=-1) - 1, 0)
         else:
-            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length))
+            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype=jnp.int32)[None, :], (batch_size, seq_length))
+
+        calldict = dict(past_key_values=past_key_values, mask_info=mask_info, position_ids=position_ids)
+
         if token_type_ids is not None:
-            token_type_ids = lax.dynamic_update_slice(
-                jnp.zeros((batch_size, max_length), dtype="i4"),
-                token_type_ids,
-                (0, 0),
-            )
-            token_type_ids = jax.device_put(token_type_ids, device=sharding)
-        calldict = {
-            "past_key_values": past_key_values,
-            "attention_mask": jax.device_put(extended_attention_mask, device=sharding),
-            "position_ids": jax.device_put(position_ids, device=sharding),
-        }
-        if token_type_ids is not None:
-            calldict.update({"token_type_ids": token_type_ids})
+            calldict["token_type_ids"] = token_type_ids
 
         return self.prepare_inputs_for_call(**calldict)
+
+    def _pad_maskinfo_to_maxlen(
+        self,
+        mask_info: MaskInfo,
+        max_length: int,
+        make_causal: bool,
+    ) -> MaskInfo:
+        """Pad or truncate MaskInfo segment IDs to a target maximum length.
+
+        This method ensures that the MaskInfo's segment IDs have the correct
+        dimensions for cache operations during generation. It pads with zeros
+        if the current length is less than max_length, or truncates if longer.
+
+        Args:
+            mask_info: The MaskInfo object to pad/truncate.
+            max_length: The target length for segment IDs.
+            make_causal: Whether to apply causal masking after padding.
+
+        Returns:
+            MaskInfo: A new MaskInfo with padded/truncated segment IDs and
+                optionally applied causal mask.
+        """
+        # Ensure we have segment ids; prefer seg-ids to avoid stale masks
+        if mask_info.q_segment_ids is None or mask_info.kv_segment_ids is None:
+            mask_info = mask_info.materialize_segment_ids()
+
+        q_ids = jnp.asarray(mask_info.q_segment_ids, jnp.int32)  # (B, Q0)
+        kv_ids = jnp.asarray(mask_info.kv_segment_ids, jnp.int32)  # (B, K0)
+        B, Q0 = q_ids.shape
+        K0 = kv_ids.shape[-1]
+
+        if Q0 < max_length:
+            q_pad = jnp.full((B, max_length - Q0), 0)
+            q_ids = jnp.concatenate([q_ids, q_pad], axis=-1)
+        else:
+            q_ids = q_ids[:, :max_length]
+        if K0 < max_length:
+            kv_pad = jnp.full((B, max_length - K0), 0)
+            kv_ids = jnp.concatenate([kv_ids, kv_pad], axis=-1)
+        else:
+            kv_ids = kv_ids[:, :max_length]
+
+        base = MaskInfo.from_segments(q_ids, kv_ids)
+        if make_causal:
+            base = base.apply_causal(offset=0)
+        return base
 
     def update_inputs_for_generation(
         self,
@@ -516,15 +1551,13 @@ class EasyGenerationMixin:
         Returns:
             dict: The updated `model_kwargs` dictionary ready for the next generation step.
         """
-
         model_kwargs["past_key_values"] = model_outputs.past_key_values
         model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
         return model_kwargs
 
     def _create_required_props_from_kwargs(
-        self,
-        model_kwargs: dict[str, chex.Array],
-    ) -> tp.Mapping[str, dict[str, tp.Any]] | None:
+        self, model_kwargs: dict[str, Array]
+    ) -> collections.abc.Mapping[str, dict[str, tp.Any]] | None:
         """
         Placeholder method to extract or create properties required for specific model types
         from keyword arguments. Intended to be overridden by subclasses if needed.
@@ -537,52 +1570,6 @@ class EasyGenerationMixin:
                 Defaults to returning None.
         """
         return None
-
-    def _get_compile_model_kwargs(
-        self,
-        batch_size: int,
-        input_tokens_length: int,
-        input_sharding: jax.sharding.PartitionSpec,
-        rngs: jax.random.PRNGKey,
-        vision_included: bool = False,
-        vision_batch_size: int = 1,
-        vision_channels: int = 3,
-        vision_height: int | None = None,
-        vision_width: int | None = None,
-        required_props: tp.Mapping[str, dict[str, tp.Any]] | None = None,
-        **kwargs,
-    ) -> dict[str, tp.Any]:
-        """
-        Generates a dictionary of placeholder keyword arguments needed for model compilation.
-
-        Creates dummy tensors (like `input_ids`, `attention_mask`) with the specified shapes
-        and sharding, along with necessary RNGs, to allow JAX to trace and compile the
-        model's forward pass without needing real data. This is often used for AOT compilation
-        or initialization checks. Specific models might override this to add more required inputs.
-
-        Args:
-            batch_size (int): The batch size for the dummy inputs.
-            input_tokens_length (int): The sequence length for the dummy inputs.
-            input_sharding (jax.sharding.PartitionSpec): Sharding for the dummy inputs.
-            rngs (jax.random.PRNGKey): RNG keys required by the model (e.g., for dropout).
-            vision_included (bool): Flag indicating if vision inputs are needed (for multimodal).
-            vision_batch_size (int): Batch size for dummy vision inputs.
-            vision_channels (int): Channels for dummy vision inputs.
-            vision_height (tp.Optional[int]): Height for dummy vision inputs.
-            vision_width (tp.Optional[int]): Width for dummy vision inputs.
-            required_props (tp.Optional[tp.Mapping[str, tp.Dict[str, tp.Any]]]): Optional
-                additional properties extracted by `_create_required_props_from_kwargs`.
-            **kwargs: Additional keyword arguments.
-
-        Returns:
-            dict: A dictionary containing dummy keyword arguments suitable for model compilation.
-        """
-        deteshape = (batch_size, input_tokens_length)
-        return dict(
-            input_ids=jnp.ones(deteshape, dtype="i4", device=input_sharding),
-            attention_mask=jnp.ones(deteshape, dtype="b1", device=input_sharding),
-            rng=rngs,
-        )
 
     def _validate_signature(
         self,
@@ -628,7 +1615,7 @@ class EasyGenerationMixin:
                 param = valid_params[name]
                 if param.annotation != inspect.Parameter.empty:
                     try:
-                        if getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None:
+                        if getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None:  # pyright: ignore[reportDeprecated]
                             expected_type = param.annotation.__args__[0]
                             if not isinstance(value, expected_type):
                                 print(
@@ -683,7 +1670,7 @@ class EasyGenerationMixin:
         This pre-computes the encoder representation needed by the decoder during generation.
 
         Args:
-            input_ids (chex.Array): The input token IDs for the encoder.
+            input_ids (Array): The input token IDs for the encoder.
             model_kwargs (dict): The dictionary of keyword arguments. Encoder-specific
                 arguments will be used, and `encoder_outputs` will be added.
 
@@ -703,8 +1690,8 @@ class EasyGenerationMixin:
         batch_size: int,
         decoder_start_token_id: int | None = None,
         bos_token_id: int | None = None,
-        model_kwargs: dict[str, chex.Array] | None = None,
-    ) -> chex.Array:
+        model_kwargs: dict[str, Array | None] | None = None,
+    ) -> Array:
         """
         Creates the initial `decoder_input_ids` tensor for encoder-decoder generation.
 
@@ -721,14 +1708,14 @@ class EasyGenerationMixin:
                 "decoder_input_ids", those are returned directly and removed from the dict.
 
         Returns:
-            chex.Array: The initial `decoder_input_ids` tensor, shape (batch_size, 1).
+            Array: The initial `decoder_input_ids` tensor, shape (batch_size, 1).
         """
         if model_kwargs is not None and "decoder_input_ids" in model_kwargs:
-            decoder_input_ids = model_kwargs.pop("decoder_input_ids")
+            decoder_input_ids: Array | None = model_kwargs.pop("decoder_input_ids")
             if decoder_input_ids is not None:
                 return decoder_input_ids
         decoder_start_token_id = self._get_decoder_start_token_id(decoder_start_token_id, bos_token_id)
-        return jnp.array(decoder_start_token_id, dtype="i4").reshape(1, -1).repeat(batch_size, axis=0)
+        return jnp.array(decoder_start_token_id, dtype=jnp.int32).reshape(1, -1).repeat(batch_size, axis=0)
 
     def _get_decoder_start_token_id(
         self,
@@ -788,23 +1775,43 @@ class EasyGenerationMixin:
         (batch_size, seq_len, ...) becomes (batch_size, num_beams, seq_len, ...).
 
         Args:
-            tensor (chex.Array): The tensor to expand. Assumed to have batch size as the first dimension.
+            tensor (Array): The tensor to expand. Assumed to have batch size as the first dimension.
             num_beams (int): The number of beams to expand to.
 
         Returns:
-            chex.Array: The tensor expanded for beam search.
+            Array: The tensor expanded for beam search.
         """
         return jnp.broadcast_to(tensor[:, None], (tensor.shape[0], num_beams, *tensor.shape[1:]))
 
     def _adapt_logits_for_beam_search(self, logits):
-        """
-        This function can be overwritten in the specific modeling_flax_<model-name>.py classes to allow for custom beam
-        search behavior. Note that the only model that overwrites this method is [`~transformes.FlaxMarianMTModel`].
+        """Adapts logits for beam search, allowing model-specific customization.
+
+        This hook can be overridden in specific model classes to implement custom
+        beam search behavior. The base implementation returns logits unchanged.
+
+        Args:
+            logits: The raw logits from the model.
+
+        Returns:
+            The adapted logits for beam search.
+
+        Note:
+            Currently only FlaxMarianMTModel overrides this method.
         """
         return logits
 
     def _validate_model_kwargs(self, model_kwargs: dict[str, tp.Any]):
-        """Validates model kwargs for generation. Generate argument typos will also be caught here."""
+        """Validates model kwargs for generation.
+
+        Checks that all provided kwargs are recognized by the model's generation
+        methods. This helps catch typos in generation arguments.
+
+        Args:
+            model_kwargs: Dictionary of keyword arguments to validate.
+
+        Raises:
+            ValueError: If any kwargs are not recognized by the model.
+        """
         unused_model_args = []
         model_args = set(inspect.signature(self.prepare_inputs_for_generation).parameters)
 
@@ -826,7 +1833,26 @@ class EasyGenerationMixin:
         is_encoder_decoder: bool = False,
         input_ids: jnp.ndarray | None = None,
         **model_kwargs,
-    ) -> tuple[jnp.ndarray, dict[str, tp.Any]]:
+    ) -> tuple[jnp.ndarray | None, dict[str, tp.Any]]:
+        """Expands input tensors for generation with multiple return sequences.
+
+        Repeats input_ids and all array-valued model_kwargs along the batch dimension
+        to support generating multiple sequences per input (e.g., for beam search or
+        multiple return sequences).
+
+        Args:
+            expand_size (int): Number of times to repeat each input. Defaults to 1.
+            is_encoder_decoder (bool): Whether the model is encoder-decoder. If True,
+                also expands encoder_outputs. Defaults to False.
+            input_ids (jnp.ndarray | None): Input token IDs to expand. Defaults to None.
+            **model_kwargs: Additional model kwargs. Array values will be repeated.
+
+        Returns:
+            tuple[jnp.ndarray, dict[str, Any]]: Tuple of (expanded_input_ids, expanded_model_kwargs).
+
+        Raises:
+            ValueError: If is_encoder_decoder=True but encoder_outputs is not in model_kwargs.
+        """
         if expand_size == 1:
             return input_ids, model_kwargs
 
@@ -854,9 +1880,9 @@ class EasyGenerationMixin:
 
     def generate(
         self,
-        input_ids: chex.Array,
+        input_ids: Array,
         generation_config: GenerationConfig | None = None,
-        prng_key: chex.Array | None = None,
+        prng_key: Array | None = None,
         trace: bool = True,
         logits_processor: LogitsProcessorList | None = None,
         **kwargs,
@@ -865,7 +1891,7 @@ class EasyGenerationMixin:
         Generates sequences of token ids for models with a language modeling head.
 
         Parameters:
-            input_ids (`chex.Array` of shape `(batch_size, sequence_length)`):
+            input_ids (`Array` of shape `(batch_size, sequence_length)`):
                 The sequence used as a prompt for the generation.
             generation_config (`~generation.GenerationConfig`, *optional*):
                 The generation configuration to be used as base parametrization for the generation call. `**kwargs`
@@ -909,6 +1935,17 @@ class EasyGenerationMixin:
         generation_config = copy.deepcopy(generation_config)
         model_kwargs = generation_config.update(**kwargs)
         self._validate_model_kwargs(model_kwargs.copy())
+
+        # Newer Transformers may leave generation fields as None by default.
+        # Normalize to the canonical greedy defaults expected by this mixin.
+        if generation_config.do_sample is None:
+            generation_config.do_sample = False
+        if generation_config.num_beams is None:
+            generation_config.num_beams = 1
+        if generation_config.num_beam_groups is None:
+            generation_config.num_beam_groups = 1
+        if generation_config.num_return_sequences is None:
+            generation_config.num_return_sequences = 1
 
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
 
@@ -1043,7 +2080,13 @@ class EasyGenerationMixin:
                 model_kwargs=model_kwargs,
             )
         elif not generation_config.do_sample and generation_config.num_beams > 1:
-            # broadcast input_ids & encoder_outputs
+
+            def _repeat_mask_info(mi: MaskInfo, repeats: int) -> MaskInfo:
+                return jax.tree_util.tree_map(
+                    lambda x: jnp.repeat(x, repeats=repeats, axis=0) if isinstance(x, jax.Array) else x,
+                    mi,
+                )
+
             input_ids = self._expand_to_num_beams(input_ids, num_beams=generation_config.num_beams)
 
             if "encoder_outputs" in model_kwargs:
@@ -1052,11 +2095,8 @@ class EasyGenerationMixin:
                     num_beams=generation_config.num_beams,
                 )
 
-            for kwarg in ["attention_mask", "decoder_attention_mask"]:
-                if kwarg in model_kwargs:
-                    model_kwargs[kwarg] = self._expand_to_num_beams(
-                        model_kwargs[kwarg], num_beams=generation_config.num_beams
-                    )
+            if "mask_info" in model_kwargs:
+                model_kwargs["mask_info"] = _repeat_mask_info(model_kwargs["mask_info"], generation_config.num_beams)
 
             return self._beam_search(
                 input_ids,
@@ -1077,9 +2117,22 @@ class EasyGenerationMixin:
         self,
         generation_config: GenerationConfig,
     ) -> LogitsProcessorList:
-        """
-        This class returns a [`LogitsProcessorList`] list object that contains all relevant [`LogitsWarper`]
-        instances used for multinomial sampling.
+        """Build a LogitsProcessorList containing warpers for multinomial sampling.
+
+        This method constructs the chain of logits warpers based on the generation
+        configuration. Warpers modify the probability distribution for sampling,
+        including temperature scaling, top-k filtering, and top-p (nucleus) sampling.
+
+        Args:
+            generation_config: The generation configuration containing warper settings.
+
+        Returns:
+            LogitsProcessorList: List of logits warpers to apply during sampling.
+                May include TemperatureLogitsWarper, TopKLogitsWarper, and/or
+                TopPLogitsWarper depending on the configuration.
+
+        Note:
+            Warpers are applied in order: temperature -> top_k -> top_p.
         """
         warpers = LogitsProcessorList()
 
@@ -1098,9 +2151,27 @@ class EasyGenerationMixin:
         input_ids_seq_length: int,
         logits_processor: LogitsProcessorList | None,
     ) -> LogitsProcessorList:
-        """
-        This class returns a [`LogitsProcessorList`] list object that contains all relevant [`LogitsProcessor`]
-        instances used to modify the scores of the language model head.
+        """Build a LogitsProcessorList with all processors for generation.
+
+        Constructs the chain of logits processors based on generation configuration.
+        Processors can enforce constraints like minimum length, forced tokens,
+        suppressed tokens, and n-gram repetition penalties.
+
+        Args:
+            generation_config: The generation configuration with processor settings.
+            input_ids_seq_length: Length of the input sequence, used to calculate
+                positions for forced tokens and begin suppress tokens.
+            logits_processor: Optional custom processors to merge with default ones.
+
+        Returns:
+            LogitsProcessorList: Combined list of default and custom processors.
+
+        Raises:
+            ValueError: If a custom processor duplicates a default processor type.
+
+        Note:
+            Processors are applied in order: min_length -> forced_bos -> forced_eos
+            -> suppress_tokens -> begin_suppress -> force_tokens -> no_repeat_ngram.
         """
         processors = LogitsProcessorList()
 
@@ -1148,6 +2219,23 @@ class EasyGenerationMixin:
         default_list: LogitsProcessorList,
         custom_list: LogitsProcessorList,
     ) -> LogitsProcessorList:
+        """Merge default and custom logits processor lists with conflict detection.
+
+        Ensures that custom processors don't duplicate default processors of the
+        same type, which could lead to unexpected behavior (e.g., applying
+        temperature twice).
+
+        Args:
+            default_list: The default processors created from generation config.
+            custom_list: User-provided custom processors.
+
+        Returns:
+            LogitsProcessorList: Merged list with custom processors appended
+                to default processors.
+
+        Raises:
+            ValueError: If a custom processor has the same type as a default one.
+        """
         if len(custom_list) == 0:
             return default_list
         for default in default_list:
@@ -1172,16 +2260,47 @@ class EasyGenerationMixin:
         eos_token_id: int | None = None,
         logits_processor: LogitsProcessorList | None = None,
         trace: bool = True,
-        model_kwargs: dict[str, chex.Array] | None = None,
+        model_kwargs: dict[str, Array] | None = None,
     ):
+        """Perform greedy decoding to generate token sequences.
+
+        In greedy search, the token with the highest probability is selected at
+        each step. This is deterministic and fast but may not produce the most
+        globally optimal sequences.
+
+        Args:
+            input_ids: Initial input token IDs of shape (batch_size, seq_length).
+            max_length: Maximum length of generated sequences. Defaults to
+                generation_config.max_length.
+            pad_token_id: Token ID used for padding. Defaults to
+                generation_config.pad_token_id.
+            eos_token_id: End-of-sequence token ID(s). Generation stops when this
+                token is generated. Can be int or list of ints. Defaults to
+                generation_config.eos_token_id.
+            logits_processor: Optional processors to apply to logits at each step.
+            trace: If True, uses JAX's traced while_loop for efficiency. If False,
+                uses Python loop for debugging. Defaults to True.
+            model_kwargs: Additional keyword arguments passed to the model.
+
+        Returns:
+            GreedySearchOutput: Object containing the generated sequences.
+
+        Example:
+            >>> output = model._greedy_search(
+            ...     input_ids=tokens,
+            ...     max_length=50,
+            ...     pad_token_id=0,
+            ...     eos_token_id=2
+            ... )
+            >>> print(output.sequences)
+        """
         max_length = max_length if max_length is not None else self.generation_config.max_length
         pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
         eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
 
         batch_size, cur_len = input_ids.shape
 
-        eos_token_id = jnp.array(eos_token_id, dtype=jnp.int32 if eos_token_id is not None else None)
-        pad_token_id = jnp.array(pad_token_id, dtype=jnp.int32)
+        pad_token_id = jnp.array(pad_token_id, jnp.int32)
         cur_len = jnp.array(cur_len)
 
         sequences = jnp.full((batch_size, max_length), pad_token_id, dtype=jnp.int32)
@@ -1207,25 +2326,46 @@ class EasyGenerationMixin:
         )
 
         def greedy_search_cond_fn(state):
-            """state termination condition fn."""
+            """Check if greedy search should continue.
+
+            Returns True if generation should continue, False to stop.
+            Stops when max_length is reached or all sequences have finished.
+            """
             has_reached_max_length = state.cur_len == max_length
             all_sequence_finished = jnp.all(state.is_sent_finished)
             finish_generation = jnp.logical_or(has_reached_max_length, all_sequence_finished)
             return ~finish_generation
 
         def greedy_search_body_fn(state):
-            """state update fn."""
-            model_outputs = model(state.running_token, **state.model_kwargs)
+            """Perform one step of greedy decoding.
+
+            Runs the model, selects the highest probability token,
+            updates sequences and finished flags.
+            """
+            call_kwargs = dict(state.model_kwargs)
+            running_len = state.running_token.shape[1]
+            for mask_key in ("attention_mask", "decoder_attention_mask"):
+                mask = call_kwargs.get(mask_key, None)
+                if mask is None:
+                    continue
+                if hasattr(mask, "shape") and len(mask.shape) > 0 and mask.shape[-1] != running_len:
+                    call_kwargs.pop(mask_key, None)
+            model_outputs = model(state.running_token, **call_kwargs)
             logits = model_outputs.logits[:, -1]
 
             logits = logits_processor(state.sequences, logits, state.cur_len)
 
             next_token = jnp.argmax(logits, axis=-1)
             next_token = next_token * ~state.is_sent_finished + pad_token_id * state.is_sent_finished
-            next_is_sent_finished = state.is_sent_finished | jnp.isin(
-                next_token,
-                eos_token_id,
-            )
+            if eos_token_id is not None:
+                eos_arr = jnp.atleast_1d(jnp.array(eos_token_id, jnp.int32))
+            else:
+                eos_arr = None
+            if eos_arr is not None:
+                next_is_sent_finished = state.is_sent_finished | jnp.isin(next_token, eos_arr)
+            else:
+                next_is_sent_finished = state.is_sent_finished
+
             next_token = next_token[:, None]
             next_sequences = lax.dynamic_update_slice(
                 state.sequences,
@@ -1257,12 +2397,49 @@ class EasyGenerationMixin:
         max_length: int | None = None,
         pad_token_id: int | None = None,
         eos_token_id: int | None = None,
-        prng_key: chex.Array | None = None,
+        prng_key: Array | None = None,
         logits_processor: LogitsProcessorList | None = None,
         logits_warper: LogitsProcessorList | None = None,
         trace: bool = True,
-        model_kwargs: dict[str, chex.Array] | None = None,
+        model_kwargs: dict[str, Array] | None = None,
     ):
+        """Perform sampling-based decoding to generate token sequences.
+
+        In sampling, tokens are randomly selected from the probability distribution
+        (after applying warpers like temperature, top-k, top-p). This produces more
+        diverse and creative outputs compared to greedy search.
+
+        Args:
+            input_ids: Initial input token IDs of shape (batch_size, seq_length).
+            max_length: Maximum length of generated sequences. Defaults to
+                generation_config.max_length.
+            pad_token_id: Token ID used for padding. Defaults to
+                generation_config.pad_token_id.
+            eos_token_id: End-of-sequence token ID(s). Generation stops when this
+                token is generated. Can be int or list of ints. Defaults to
+                generation_config.eos_token_id.
+            prng_key: JAX PRNG key for random sampling. Defaults to PRNGKey(0).
+            logits_processor: Optional processors to apply to logits (constraints).
+            logits_warper: Optional warpers to apply to logits (temperature, top-k, etc.).
+            trace: If True, uses JAX's traced while_loop. If False, uses Python
+                loop for debugging. Defaults to True.
+            model_kwargs: Additional keyword arguments passed to the model.
+
+        Returns:
+            SampleOutput: Object containing the generated sequences.
+
+        Example:
+            >>> output = model._sample(
+            ...     input_ids=tokens,
+            ...     max_length=100,
+            ...     prng_key=jax.random.PRNGKey(42),
+            ...     logits_warper=LogitsProcessorList([
+            ...         TemperatureLogitsWarper(0.8),
+            ...         TopPLogitsWarper(0.95)
+            ...     ])
+            ... )
+            >>> print(output.sequences)
+        """
         # init values
         max_length = max_length if max_length is not None else self.generation_config.max_length
         pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
@@ -1270,15 +2447,9 @@ class EasyGenerationMixin:
         prng_key = prng_key if prng_key is not None else jax.random.PRNGKey(0)
 
         batch_size, cur_len = input_ids.shape
-
-        eos_token_id = jnp.array(
-            eos_token_id,
-            dtype=jnp.int32 if eos_token_id is not None else None,
-        )
-        pad_token_id = jnp.array(pad_token_id, dtype=jnp.int32)
+        pad_token_id = jnp.array(pad_token_id, jnp.int32)
         cur_len = jnp.array(cur_len)
 
-        # per batch-item holding current token in loop.
         sequences = jnp.full((batch_size, max_length), pad_token_id, dtype=jnp.int32)
         sequences = lax.dynamic_update_slice(sequences, input_ids, (0, 0))
         is_sent_finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
@@ -1301,37 +2472,57 @@ class EasyGenerationMixin:
         )
 
         def sample_search_cond_fn(state):
-            """state termination condition fn."""
+            """Check if sampling should continue.
+
+            Returns True if generation should continue, False to stop.
+            Stops when max_length is reached or all sequences have finished.
+            """
             has_reached_max_length = state.cur_len == max_length
             all_sequence_finished = jnp.all(state.is_sent_finished)
             finish_generation = jnp.logical_or(has_reached_max_length, all_sequence_finished)
             return ~finish_generation
 
         def sample_search_body_fn(state):
-            """state update fn."""
+            """Perform one step of sampling-based decoding.
+
+            Runs the model, applies warpers, samples from the distribution,
+            updates sequences and finished flags, and advances PRNG state.
+            """
             prng_key, prng_key_next = jax.random.split(state.prng_key)
-            model_outputs = model(state.running_token, **state.model_kwargs)
+
+            call_kwargs = dict(state.model_kwargs)
+            running_len = state.running_token.shape[1]
+            for mask_key in ("attention_mask", "decoder_attention_mask"):
+                mask = call_kwargs.get(mask_key, None)
+                if mask is None:
+                    continue
+                if hasattr(mask, "shape") and len(mask.shape) > 0 and mask.shape[-1] != running_len:
+                    call_kwargs.pop(mask_key, None)
+            model_outputs = model(state.running_token, **call_kwargs)
+
             logits = model_outputs.logits[:, -1]
             logits = logits_processor(state.sequences, logits, state.cur_len)
-            logits = logits_warper(logits, logits, state.cur_len)
+            logits = logits_warper(state.sequences, logits, state.cur_len)
             next_token = (
                 jax.random.categorical(prng_key, logits, axis=-1) * ~state.is_sent_finished
                 + pad_token_id * state.is_sent_finished
             )
-            next_is_sent_finished = state.is_sent_finished | jnp.isin(
-                next_token,
-                eos_token_id,
-            )
+            if eos_token_id is not None:
+                eos_arr = jnp.atleast_1d(jnp.array(eos_token_id, jnp.int32))
+            else:
+                eos_arr = None
+            if eos_arr is not None:
+                next_is_sent_finished = state.is_sent_finished | jnp.isin(next_token, eos_arr)
+            else:
+                next_is_sent_finished = state.is_sent_finished
+
             next_token = next_token[:, None]
             next_sequences = lax.dynamic_update_slice(
                 state.sequences,
                 next_token,
                 (0, state.cur_len),
             )
-            next_model_kwargs = self.update_inputs_for_generation(
-                model_outputs,
-                state.model_kwargs,
-            )
+            next_model_kwargs = self.update_inputs_for_generation(model_outputs, state.model_kwargs)
 
             return SampleState(
                 cur_len=state.cur_len + 1,
@@ -1367,30 +2558,128 @@ class EasyGenerationMixin:
         logits_processor: LogitsProcessorList | None = None,
         trace: bool = True,
         num_return_sequences: int | None = None,
-        model_kwargs: dict[str, chex.Array] | None = None,
+        model_kwargs: dict[str, Array] | None = None,
     ):
-        """
-        This beam search function is heavily inspired by Flax's official example:
+        """Perform beam search decoding to generate token sequences.
+
+        Beam search maintains multiple candidate sequences (beams) at each step,
+        keeping the top-k highest scoring partial sequences. This explores more
+        of the sequence space than greedy search while remaining computationally
+        tractable.
+
+        This implementation is inspired by Flax's official beam search example:
         https://github.com/google/flax/blob/main/examples/wmt/decode.py
+
+        Args:
+            input_ids: Initial input token IDs of shape (batch_size, num_beams, seq_length).
+                The input should already be expanded for beam search.
+            max_length: Maximum length of generated sequences. Defaults to
+                generation_config.max_length.
+            pad_token_id: Token ID used for padding. Defaults to
+                generation_config.pad_token_id.
+            eos_token_id: End-of-sequence token ID(s). Beams are considered finished
+                when this token is generated. Defaults to generation_config.eos_token_id.
+            length_penalty: Exponential penalty to sequence length. Values > 1.0
+                favor longer sequences; < 1.0 favor shorter. Defaults to
+                generation_config.length_penalty.
+            early_stopping: Controls when beam search stops:
+                - True: Stop when num_beams complete sentences are found
+                - False: Apply heuristic to stop when unlikely to find better
+                - "never": Only stop at max_length
+                Defaults to generation_config.early_stopping.
+            logits_processor: Optional processors to apply to log probabilities.
+            trace: If True, uses JAX's traced while_loop. If False, uses Python
+                loop for debugging. Defaults to True.
+            num_return_sequences: Number of best sequences to return per batch item.
+                Must be <= num_beams. Defaults to generation_config.num_return_sequences.
+            model_kwargs: Additional keyword arguments passed to the model.
+
+        Returns:
+            BeamSearchOutput: Object containing:
+                - sequences: Generated sequences of shape (batch_size * num_return_sequences, max_length)
+                - scores: Log probability scores of shape (batch_size * num_return_sequences,)
+
+        Example:
+            >>> # Expand input for beam search
+            >>> expanded_input = model._expand_to_num_beams(input_ids, num_beams=4)
+            >>> output = model._beam_search(
+            ...     input_ids=expanded_input,
+            ...     max_length=50,
+            ...     length_penalty=1.2,
+            ...     early_stopping=True,
+            ...     num_return_sequences=2
+            ... )
+            >>> print(output.sequences.shape)  # (batch_size * 2, max_length)
         """
 
         def flatten_beam_dim(tensor):
-            """Flattens the first two dimensions of a non-scalar array."""
+            """Flatten batch and beam dimensions into a single dimension.
+
+            Converts shape (batch_size, num_beams, ...) to (batch_size * num_beams, ...).
+            Scalar tensors (e.g., cache indices) are returned unchanged.
+
+            Args:
+                tensor: Array with at least 2 dimensions, or a scalar.
+
+            Returns:
+                Array with batch and beam dims merged, or unchanged scalar.
+            """
             # ignore scalars (e.g. cache index)
             if tensor.ndim == 0:
                 return tensor
             return tensor.reshape((tensor.shape[0] * tensor.shape[1], *tensor.shape[2:]))
 
+        def flatten_mask_info(mi: MaskInfo, batch_size, num_beams):  # pyright: ignore[reportUnusedFunction]
+            """Flatten MaskInfo arrays for flattened beam dimension processing.
+
+            Args:
+                mi: MaskInfo object with arrays to flatten.
+                batch_size: Original batch size.
+                num_beams: Number of beams.
+
+            Returns:
+                MaskInfo with flattened arrays.
+            """
+            return jax.tree_util.tree_map(
+                lambda t: (
+                    t.reshape((batch_size * num_beams, *t.shape[2:])) if isinstance(t, jax.Array) and t.ndim >= 2 else t
+                ),
+                mi,
+            )
+
         def unflatten_beam_dim(tensor, batch_size, num_beams):
-            """Unflattens the first, flat batch*beam dimension of a non-scalar array."""
+            """Restore separate batch and beam dimensions from flattened array.
+
+            Converts shape (batch_size * num_beams, ...) to (batch_size, num_beams, ...).
+            Scalar tensors are returned unchanged.
+
+            Args:
+                tensor: Array with merged batch/beam dimension, or scalar.
+                batch_size: Target batch size.
+                num_beams: Target number of beams.
+
+            Returns:
+                Array with separate batch and beam dims, or unchanged scalar.
+            """
             # ignore scalars (e.g. cache index)
             if tensor.ndim == 0:
                 return tensor
             return tensor.reshape((batch_size, num_beams, *tensor.shape[1:]))
 
         def gather_beams(nested, beam_indices, batch_size, new_num_beams):
-            """
-            Gathers the beam slices indexed by beam_indices into new beam array.
+            """Gather beam slices from nested structure using beam indices.
+
+            Reorders beams according to the provided indices, used for selecting
+            the top-k beams after scoring.
+
+            Args:
+                nested: Pytree of arrays with beam dimension.
+                beam_indices: Indices of beams to gather, shape (batch_size, new_num_beams).
+                batch_size: Batch size.
+                new_num_beams: Number of beams to gather (may differ from original).
+
+            Returns:
+                Pytree with same structure, containing gathered beams.
             """
             batch_indices = jnp.reshape(
                 jnp.arange(batch_size * new_num_beams) // new_num_beams,
@@ -1418,11 +2707,8 @@ class EasyGenerationMixin:
 
         batch_size, num_beams, cur_len = input_ids.shape
 
-        eos_token_id = jnp.array(eos_token_id, dtype=jnp.int32 if eos_token_id is not None else None)
-        pad_token_id = jnp.array(pad_token_id, dtype=jnp.int32)
+        pad_token_id = jnp.array(pad_token_id, jnp.int32)
         cur_len = jnp.array(cur_len)
-
-        # record the prompt length of decoder
         decoder_prompt_len = input_ids.shape[-1]
 
         # per batch,beam-item holding current token in loop.
@@ -1442,6 +2728,7 @@ class EasyGenerationMixin:
         model = self.decode if self.config.is_encoder_decoder else self
 
         # flatten beam dim
+        assert model_kwargs is not None, "model_kwargs must not be None for beam search"
         if "encoder_outputs" in model_kwargs:
             model_kwargs["encoder_outputs"]["last_hidden_state"] = flatten_beam_dim(
                 model_kwargs["encoder_outputs"]["last_hidden_state"]
@@ -1450,7 +2737,6 @@ class EasyGenerationMixin:
             if kwarg in model_kwargs:
                 model_kwargs[kwarg] = flatten_beam_dim(model_kwargs[kwarg])
 
-        # initialize model specific kwargs
         model_kwargs = self.prepare_inputs_for_generation(
             flatten_beam_dim(input_ids),
             max_length=max_length,
@@ -1471,15 +2757,21 @@ class EasyGenerationMixin:
         )
 
         def beam_search_cond_fn(state):
-            """beam search state termination condition fn."""
+            """Check if beam search should continue.
+
+            Returns True if generation should continue, considering:
+            - Whether max_length has been reached
+            - Whether all beams have finished (if early_stopping=True)
+            - Whether the best running beam could potentially beat finished beams
+            """
             not_max_length_yet = state.cur_len < max_length
 
             if early_stopping == "never" and length_penalty > 0.0:
                 best_running_score = state.running_scores[:, :1] / ((max_length - decoder_prompt_len) ** length_penalty)
             else:
-                best_running_score = state.running_scores[:, :1] / (
-                    (state.cur_len - decoder_prompt_len) ** length_penalty
-                )
+                denom = jnp.maximum(state.cur_len - decoder_prompt_len, 1)
+                best_running_score = state.running_scores[:, :1] / (denom**length_penalty)
+
             worst_finished_score = jnp.where(
                 state.is_sent_finished,
                 jnp.min(state.scores, axis=1, keepdims=True),
@@ -1487,13 +2779,24 @@ class EasyGenerationMixin:
             )
             improvement_still_possible = jnp.any(best_running_score > worst_finished_score)
 
-            # 3. is there still a beam that has not finished?
             still_open_beam = ~(jnp.all(state.is_sent_finished) & (early_stopping is True))
 
             return not_max_length_yet & still_open_beam & improvement_still_possible
 
         def beam_search_body_fn(state, input_ids_length=1):
-            """beam search state update fn."""
+            """Perform one step of beam search decoding.
+
+            Runs the model for all beams, computes log probabilities, selects
+            top 2*num_beams candidates, then narrows to num_beams best running
+            sequences while tracking finished sequences separately.
+
+            Args:
+                state: Current BeamSearchState.
+                input_ids_length: Length of input tokens to process (for prefill).
+
+            Returns:
+                Updated BeamSearchState with next token predictions.
+            """
 
             input_token = flatten_beam_dim(
                 lax.dynamic_slice(
@@ -1502,6 +2805,7 @@ class EasyGenerationMixin:
                     (batch_size, num_beams, input_ids_length),
                 )
             )
+            # Leave mask_info as the base; cache layer will compute step-specific mask
             model_outputs = model(input_token, **state.model_kwargs)
 
             logits = unflatten_beam_dim(model_outputs.logits[:, -1], batch_size, num_beams)
@@ -1529,8 +2833,10 @@ class EasyGenerationMixin:
             topk_running_sequences = gather_beams(state.running_sequences, topk_beam_indices, batch_size, beams_to_keep)
             topk_ids = jnp.expand_dims(topk_indices % vocab_size, axis=2)
             topk_sequences = lax.dynamic_update_slice(topk_running_sequences, topk_ids, (0, 0, state.cur_len))
-
-            did_topk_just_finished = topk_sequences[:, :, state.cur_len] == eos_token_id
+            if eos_token_id is None:
+                did_topk_just_finished = jnp.zeros_like(topk_sequences[:, :, state.cur_len], dtype=jnp.bool_)
+            else:
+                did_topk_just_finished = jnp.isin(topk_sequences[:, :, state.cur_len], eos_token_id)
             running_topk_log_probs = topk_log_probs + did_topk_just_finished * np.array(-1.0e7)
 
             next_topk_indices = lax.top_k(running_topk_log_probs, k=num_beams)[1]
@@ -1590,55 +2896,699 @@ class EasyGenerationMixin:
 
         return BeamSearchOutput(sequences=sequences, scores=scores)
 
-    def create_vinference(
-        self,
-        processor: ProcessingClassType,
-        generation_config: vInferenceConfig,
-        compile_config: vInferencePreCompileConfig | None = None,
-        input_partition_spec: PartitionSpec | None = None,
-        seed: int | None = None,
-    ) -> vInference:
-        from easydel import SamplingParams, vInference, vInferenceConfig
+    @property
+    def esurge_graphdef(self):
+        """Returns a graph definition compatible with eSurge inference engine.
 
-        if hasattr(self, "generation_config"):
-            if self.generation_config is not None:
-                sampling_params = generation_config.sampling_params
-                generation_config = vInferenceConfig(
-                    bos_token_id=generation_config.bos_token_id or self.generation_config.bos_token_id,
-                    eos_token_id=generation_config.eos_token_id or self.generation_config.eos_token_id,
-                    pad_token_id=generation_config.pad_token_id or self.generation_config.pad_token_id,
-                    max_new_tokens=generation_config.max_new_tokens or self.generation_config.max_new_tokens,
-                    streaming_chunks=generation_config.streaming_chunks or 64,
-                    sampling_params=SamplingParams(
-                        max_tokens=sampling_params.max_tokens or self.generation_config.max_new_tokens,
-                        temperature=sampling_params.temperature or self.generation_config.temperature,
-                        top_k=sampling_params.top_k or self.generation_config.top_k,
-                        top_p=sampling_params.top_p or self.generation_config.top_p,
-                    ),
-                )
-        num_params = sum(n.size for n in jax.tree_util.tree_flatten(self.graphstate)[0])
-        size_in_billions = num_params / 1e9
-        size_in_billions = f"{size_in_billions:.2f}b"
-        vinference = vInference(
-            model=None,
-            processor_class=processor,
-            generation_config=generation_config,
-            graphdef=self.graphdef,
-            mesh=self.mesh,
-            partition_axis=self.config.partition_axis,
-            inference_name=str(getattr(self._model_task, "value", self._model_task))
-            + "-"
-            + str(self._model_type)
-            + ":"
-            + size_in_billions,
-            input_partition_spec=input_partition_spec,
-            seed=seed,
-            report_metrics=False,
+        eSurge requires models to use paged attention mechanisms compatible with its
+        continuous-batching KV cache (ragged v2/v3 or unified attention).
+        If the current model uses a different attention mechanism, this property
+        creates a new graph definition with ragged_page_attention_v3.
+
+        Returns:
+            nn.GraphDef: Graph definition with eSurge-compatible attention mechanism.
+
+        Note:
+            This creates only the graph structure, not a complete model. Use
+            `esurge_compatible_model` if you need a full model instance.
+
+        Example:
+            >>> gdef = model.esurge_graphdef
+            >>> # Use gdef for creating eSurge-compatible model instances
+        """
+        gdef = self.graphdef
+        if self.config.attn_mechanism not in [
+            "ragged_page_attention_v2",
+            "ragged_page_attention_v3",
+            "unified_attention",
+            "paged_flash_attention",
+        ]:
+            gdef = self.new_graphdef(attn_mechanism="ragged_page_attention_v3", recursive_update=True)
+        return gdef
+
+    @property
+    def esurge_compatible_model(self):
+        """Returns a model instance compatible with eSurge inference engine.
+
+        eSurge requires models to use paged attention mechanisms compatible with its
+        continuous-batching KV cache (ragged v2/v3 or unified attention).
+        If the current model uses a different attention mechanism, this property
+        returns a new model instance with ragged_page_attention_v3 while preserving
+        all parameters and state.
+
+        Returns:
+            Self: Model instance with eSurge-compatible attention mechanism.
+
+        Note:
+            If the model already uses a compatible attention mechanism, returns self.
+            Otherwise, builds a new graph definition with ragged_page_attention_v3 and
+            merges the existing parameters/state, leaving the original model unchanged.
+
+        Example:
+            >>> # Get eSurge-compatible version of model
+            >>> esurge_model = model.esurge_compatible_model
+            >>> # Now safe to use with eSurge inference
+            >>> outputs = esurge_model.esurge_generate("Hello world")
+        """
+        if self.config.attn_mechanism in [
+            "ragged_page_attention_v2",
+            "ragged_page_attention_v3",
+            "unified_attention",
+            "paged_flash_attention",
+        ]:
+            return self
+
+        if jax.default_backend() == "tpu":
+            compat_graphdef = self.new_graphdef(attn_mechanism="ragged_page_attention_v3")
+        else:
+            compat_graphdef = self.new_graphdef(attn_mechanism="unified_attention")
+
+        return self.merge_module(compat_graphdef, self.graphstate, self.graphother)
+
+    @staticmethod
+    def _esurge_engine_has_model_state(engine) -> bool:
+        """Check whether an engine still has runner model state attached."""
+        try:
+            return getattr(getattr(engine, "runner", None), "model", None) is not None
+        except Exception:
+            return False
+
+    def _esurge_cache_scope(self) -> str:
+        """Return a stable cache scope for this model instance.
+
+        eSurge cache entries should be scoped to a model object, not to the
+        current weight values. Some training loops mutate/replace graphstate at
+        each step, and using a value-dependent hash causes unnecessary engine
+        churn and repeated recompilation.
+        """
+        scope = getattr(self, "_esurge_cache_scope_key", None)
+        if scope is not None:
+            return scope
+
+        try:
+            model_hash = self.static_hash(["attn_mechanism"])
+        except Exception:
+            model_hash = "unknown"
+
+        scope = f"{id(self)}-{model_hash}"
+        try:
+            self._esurge_cache_scope_key = scope
+        except Exception:
+            # Best-effort fallback when model objects disallow dynamic attrs.
+            pass
+        return scope
+
+    def pause_esurge(
+        self,
+        engine_id: str | None = None,
+        *,
+        release_model_state: bool = False,
+        clear_compiled_cache: bool = False,
+    ) -> None:
+        """Pause eSurge engine(s) for this model.
+
+        Pauses the background scheduler of eSurge engines without clearing queued state.
+        This is useful for temporarily freeing resources while keeping the engine ready
+        for quick resumption.
+
+        Args:
+            engine_id: Optional specific engine cache key to pause. If None, pauses all
+                engines associated with this model.
+            release_model_state: When True, also drops engine-held model state
+                references to free memory.
+            clear_compiled_cache: Whether to clear compiled engine caches when
+                releasing model state.
+
+        Example:
+            >>> # Pause all engines for this model
+            >>> model.pause_esurge()
+            >>>
+            >>> # Later, generate will auto-resume
+            >>> outputs = model.esurge_generate("prompt")  # Auto-resumes!
+        """
+        model_hash = self._esurge_cache_scope()
+
+        if engine_id is not None:
+            # Pause specific engine
+            if engine_id in _ESURGE_MAP_CACHE:
+                eng = _ESURGE_MAP_CACHE[engine_id]
+                eng.pause()
+                if release_model_state and hasattr(eng, "release_model_state"):
+                    eng.release_model_state(clear_compiled_cache=clear_compiled_cache)
+                if not getattr(eng, "silent_mode", False):
+                    logger.info(f"Paused eSurge engine: {engine_id}")
+            else:
+                logger.warning(f"Engine not found: {engine_id}")
+        else:
+            # Pause all engines for this model
+            paused_count = 0
+            should_log = False
+            for cache_key, engine in _ESURGE_MAP_CACHE.items():
+                if cache_key.startswith(f"{model_hash}-"):
+                    engine.pause()
+                    if release_model_state and hasattr(engine, "release_model_state"):
+                        engine.release_model_state(clear_compiled_cache=clear_compiled_cache)
+                    paused_count += 1
+                    should_log = should_log or not getattr(engine, "silent_mode", False)
+            if paused_count > 0:
+                if should_log:
+                    logger.info(f"Paused {paused_count} eSurge engine(s) for this model")
+            else:
+                logger.info("No eSurge engines found to pause for this model")
+
+    def resume_esurge(self, engine_id: str | None = None) -> None:
+        """Resume paused eSurge engine(s) for this model.
+
+        Resumes the background scheduler of paused eSurge engines, making them
+        ready to process generation requests again.
+
+        Args:
+            engine_id: Optional specific engine cache key to resume. If None, resumes all
+                engines associated with this model.
+
+        Example:
+            >>> # Pause engines to free resources
+            >>> model.pause_esurge()
+            >>>
+            >>> # Manually resume when needed
+            >>> model.resume_esurge()
+            >>> outputs = model.esurge_generate("prompt")
+        """
+        model_hash = self._esurge_cache_scope()
+
+        if engine_id is not None:
+            # Resume specific engine
+            if engine_id in _ESURGE_MAP_CACHE:
+                eng = _ESURGE_MAP_CACHE[engine_id]
+                if not self._esurge_engine_has_model_state(eng):
+                    eng.update_model_weights(self, restart_scheduler=False)
+                eng.resume()
+                if not getattr(eng, "silent_mode", False):
+                    logger.info(f"Resumed eSurge engine: {engine_id}")
+            else:
+                logger.warning(f"Engine not found: {engine_id}")
+        else:
+            # Resume all engines for this model
+            resumed_count = 0
+            should_log = False
+            for cache_key, engine in _ESURGE_MAP_CACHE.items():
+                if cache_key.startswith(f"{model_hash}-"):
+                    if not self._esurge_engine_has_model_state(engine):
+                        engine.update_model_weights(self, restart_scheduler=False)
+                    engine.resume()
+                    resumed_count += 1
+                    should_log = should_log or not getattr(engine, "silent_mode", False)
+            if resumed_count > 0:
+                if should_log:
+                    logger.info(f"Resumed {resumed_count} eSurge engine(s) for this model")
+            else:
+                logger.info("No eSurge engines found to resume for this model")
+
+    def list_esurge_engines(self) -> list[dict]:
+        """List all cached eSurge engines for this model.
+
+        Returns a list of dictionaries containing information about each cached engine,
+        including its status (running/paused), number of requests, and configuration hash.
+
+        Returns:
+            List of dicts with engine information:
+                - cache_key: The cache key for this engine
+                - paused: Whether the engine is paused
+                - running_requests: Number of currently running requests
+                - pending_requests: Number of pending requests
+                - max_num_seqs: Maximum concurrent sequences
+
+        Example:
+            >>> engines = model.list_esurge_engines()
+            >>> for engine in engines:
+            ...     print(f"Engine {engine['cache_key']}: "
+            ...           f"Paused={engine['paused']}, "
+            ...           f"Running={engine['running_requests']}")
+        """
+        model_hash = self._esurge_cache_scope()
+        engines_info = []
+
+        for cache_key, engine in _ESURGE_MAP_CACHE.items():
+            if cache_key.startswith(f"{model_hash}-"):
+                info = {
+                    "cache_key": cache_key,
+                    "paused": getattr(engine, "_paused", False),
+                    "running_requests": getattr(engine, "num_running_requests", 0),
+                    "pending_requests": getattr(engine, "num_pending_requests", 0),
+                    "max_num_seqs": getattr(engine, "_max_num_seqs", None),
+                }
+                engines_info.append(info)
+
+        return engines_info
+
+    def get_relevant_esurge(
+        self,
+        tokenizer: str | PreTrainedTokenizerBase | None = None,
+        max_num_seqs: int | None = None,
+    ):
+        """Retrieves a relevant eSurge engine instance from the cache.
+
+        This method searches for an existing eSurge engine in the cache that matches
+        the current model. If tokenizer or max_num_seqs are None, it returns the most
+        recently created engine for this model. If no engine exists and parameters are
+        missing, it uses sensible defaults.
+
+        Args:
+            tokenizer: Optional tokenizer path or instance. If None, retrieves from
+                the most recent cached engine for this model.
+            max_num_seqs: Optional maximum number of concurrent sequences. If None,
+                uses value from cached engine or defaults to 32 if no cache exists.
+
+        Returns:
+            eSurge engine instance if found in cache, None otherwise.
+
+        Example:
+            >>> # Try to get existing engine with default params
+            >>> engine = model.get_relevant_esurge()
+            >>> if engine:
+            ...     outputs = engine.generate("Hello world")
+            >>>
+            >>> # Get engine with specific tokenizer
+            >>> engine = model.get_relevant_esurge(tokenizer="gpt2")
+        """
+        model_hash = self._esurge_cache_scope()
+
+        # Search for any cached engine matching this model
+        matching_engines = []
+        for cache_key, engine in _ESURGE_MAP_CACHE.items():
+            if cache_key.startswith(f"{model_hash}-"):
+                matching_engines.append(engine)
+
+        if not matching_engines:
+            return None
+
+        # If tokenizer and max_num_seqs are both provided, try exact match
+        if tokenizer is not None and max_num_seqs is not None:
+            # Try to find exact match based on parameters
+            for engine in matching_engines:
+                if (
+                    hasattr(engine, "tokenizer")
+                    and hasattr(engine, "_max_num_seqs")
+                    and engine._max_num_seqs == max_num_seqs
+                ):
+                    return engine
+
+        # Return the most recently added engine (last in cache)
+        return matching_engines[-1]
+
+    def get_esurge(
+        self,
+        tokenizer: str | PreTrainedTokenizerBase | None = None,
+        max_model_len: int | None = None,
+        min_input_pad: int | None = None,
+        max_num_seqs: int | None = None,
+        max_num_batched_tokens: int | None = None,
+        hbm_utilization: float | None = None,
+        page_size: int | None = None,
+        enable_prefix_caching: bool | None = None,
+        runner_verbose: bool | None = None,
+        decode_truncated_prompt: bool | None = None,
+        destroy_pages_on_pause: bool | None = None,
+        silent_mode: bool | None = None,
+        max_num_seq_buckets: list[int] | None = None,
+        data_parallelism_axis: str | None = None,
+    ):
+        """Gets or creates an eSurge engine with the specified parameters.
+
+        This method intelligently retrieves an existing cached engine or creates a new one.
+        For any parameter that is None, it will:
+        1. Try to retrieve the value from a cached engine
+        2. If no cached engine exists, use sensible defaults
+        3. Only require tokenizer if no cached engine is available
+
+        Args:
+            tokenizer: Tokenizer path or instance. If None, retrieves from cached engine.
+                Required only if no cached engine exists.
+            max_model_len: Maximum sequence length. Defaults to model's max position embeddings.
+            min_input_pad: Minimum padding for input sequences. Defaults to 16.
+            max_num_seqs: Maximum number of concurrent sequences. Defaults to 32.
+            max_num_batched_tokens: Maximum tokens per batch. Defaults to None.
+            hbm_utilization: Fraction of HBM to use for KV cache. Defaults to 0.85.
+            page_size: Size of memory pages for paged attention. Defaults to 128.
+            enable_prefix_caching: Enable prefix caching. Defaults to True.
+            runner_verbose: Enable verbose logging. Defaults to False.
+            decode_truncated_prompt: Decode truncated prompts. Defaults to True.
+            destroy_pages_on_pause: Free memory on pause. Defaults to True.
+            max_num_seq_buckets: Optional explicit sequence-capacity buckets for runner compilation.
+            data_parallelism_axis: Mesh axis name used by eSurge for KV-page data parallelism. Defaults to "dp".
+
+        Returns:
+            eSurge engine instance, either from cache or newly created.
+
+        Raises:
+            ValueError: If tokenizer is required but not provided and no cached engine exists.
+
+        Example:
+            >>> # First call with tokenizer (creates new engine)
+            >>> engine = model.get_esurge(tokenizer="meta-llama/Llama-2-7b-hf")
+            >>>
+            >>> # Subsequent calls without parameters (reuses cached engine)
+            >>> engine = model.get_esurge()
+            >>>
+            >>> # Override specific parameters
+            >>> engine = model.get_esurge(max_num_seqs=128)
+        """
+        # Check if all configurable parameters are None (user wants cached engine)
+        all_none = all(
+            param is None
+            for param in [
+                tokenizer,
+                max_model_len,
+                min_input_pad,
+                max_num_seqs,
+                max_num_seq_buckets,
+                max_num_batched_tokens,
+                hbm_utilization,
+                page_size,
+                enable_prefix_caching,
+                data_parallelism_axis,
+                runner_verbose,
+                decode_truncated_prompt,
+                destroy_pages_on_pause,
+                silent_mode,
+            ]
         )
-        if compile_config is not None:
-            vinference.precompile(
-                config=compile_config,
-                graphother=self.graphother,
-                graphstate=self.graphstate,
+
+        # If all params are None, try to return cached engine directly
+        if all_none:
+            cached_engine = self.get_relevant_esurge()
+            if cached_engine is not None:
+                if not self._esurge_engine_has_model_state(cached_engine):
+                    cached_engine.update_model_weights(self, restart_scheduler=False)
+                # Auto-resume if paused
+                if hasattr(cached_engine, "_paused") and cached_engine._paused:
+                    if not getattr(cached_engine, "silent_mode", False):
+                        logger.info("Auto-resuming paused eSurge engine")
+                    cached_engine.resume()
+                return cached_engine
+            # No cache exists, will use defaults below
+
+        # Set default for max_model_len
+        if max_model_len is None:
+            max_model_len = self.config.granted_freq_max_position_embedding
+
+        # Try to get a relevant cached engine if any parameter is None
+        any_none = any(
+            param is None
+            for param in [
+                tokenizer,
+                min_input_pad,
+                max_num_seqs,
+                max_num_seq_buckets,
+                max_num_batched_tokens,
+                hbm_utilization,
+                page_size,
+                enable_prefix_caching,
+                data_parallelism_axis,
+                runner_verbose,
+                decode_truncated_prompt,
+                destroy_pages_on_pause,
+                silent_mode,
+            ]
+        )
+
+        cached_engine = None
+        if any_none:
+            cached_engine = self.get_relevant_esurge(tokenizer=tokenizer, max_num_seqs=max_num_seqs)
+
+        # Extract parameters from cached engine or use defaults
+        if tokenizer is None:
+            if cached_engine is not None:
+                tokenizer = cached_engine.tokenizer
+            else:
+                raise ValueError(
+                    "tokenizer is required when no cached eSurge engine exists. "
+                    "Either provide a tokenizer or create an engine first by calling get_esurge with a tokenizer."
+                )
+
+        # Set defaults for other parameters
+        if min_input_pad is None:
+            min_input_pad = getattr(cached_engine, "_min_input_pad", 16) if cached_engine else 16
+        max_num_seqs_was_none = max_num_seqs is None
+        if max_num_seqs is None:
+            max_num_seqs = getattr(cached_engine, "_max_num_seqs", 32) if cached_engine else 32
+        if max_num_seq_buckets is None:
+            # Only inherit cached buckets when max_num_seqs was also inherited.
+            # If max_num_seqs was explicitly provided by caller, let eSurgeRunner
+            # recompute buckets from that explicit capacity.
+            if max_num_seqs_was_none and cached_engine and hasattr(cached_engine, "runner"):
+                cached_buckets = getattr(cached_engine.runner, "max_num_seq_buckets", None)
+                if cached_buckets is not None:
+                    max_num_seq_buckets = [int(v) for v in cached_buckets]
+        if max_num_batched_tokens is None:
+            max_num_batched_tokens = getattr(cached_engine, "_max_num_batched_tokens", None) if cached_engine else None
+        if hbm_utilization is None:
+            hbm_utilization = getattr(cached_engine, "_hbm_utilization", 0.85) if cached_engine else 0.85
+        if page_size is None:
+            page_size = getattr(cached_engine, "_page_size", 128) if cached_engine else 128
+        if enable_prefix_caching is None:
+            enable_prefix_caching = getattr(cached_engine, "_enable_prefix_caching", True) if cached_engine else True
+        if data_parallelism_axis is None:
+            data_parallelism_axis = getattr(cached_engine, "data_parallelism_axis", "dp") if cached_engine else "dp"
+        if runner_verbose is None:
+            runner_verbose = getattr(cached_engine, "_runner_verbose", False) if cached_engine else False
+        if decode_truncated_prompt is None:
+            decode_truncated_prompt = getattr(cached_engine, "_decode_truncated_prompt", True) if cached_engine else True
+        if destroy_pages_on_pause is None:
+            destroy_pages_on_pause = getattr(cached_engine, "_destroy_pages_on_pause", True) if cached_engine else True
+        if silent_mode is None:
+            silent_mode = getattr(cached_engine, "silent_mode", False) if cached_engine else False
+
+        # Build the configuration dict
+        model_hash = self._esurge_cache_scope()
+        extra_dict = dict(
+            tokenizer=tokenizer,
+            max_model_len=max_model_len,
+            min_input_pad=min_input_pad,
+            max_num_seqs=max_num_seqs,
+            max_num_seq_buckets=max_num_seq_buckets,
+            max_num_batched_tokens=max_num_batched_tokens,
+            hbm_utilization=hbm_utilization,
+            page_size=page_size,
+            enable_prefix_caching=enable_prefix_caching,
+            data_parallelism_axis=data_parallelism_axis,
+            runner_verbose=runner_verbose,
+            decode_truncated_prompt=decode_truncated_prompt,
+            destroy_pages_on_pause=destroy_pages_on_pause,
+            silent_mode=silent_mode,
+        )
+
+        # Check if this exact configuration exists in cache
+        extra_dict_str = pprint.pformat(extra_dict)
+        bytes_in = hashlib.md5(extra_dict_str.encode("utf-8")).digest()
+        extra_dict_hash = int.from_bytes(bytes_in, byteorder="big", signed=True)
+        esurge_hash = f"{model_hash}-{extra_dict_hash}"
+
+        created_new_engine = False
+        if esurge_hash in _ESURGE_MAP_CACHE:
+            esurge = _ESURGE_MAP_CACHE[esurge_hash]
+        else:
+            # Create new engine
+            from easydel.inference import eSurge
+
+            esurge = eSurge(model=self, **extra_dict)
+            _ESURGE_MAP_CACHE[esurge_hash] = esurge
+            created_new_engine = True
+
+        # Freshly created engines already carry current model weights.
+        # Re-refreshing immediately forces an unnecessary scheduler restart.
+        if (
+            not created_new_engine
+            and esurge.num_running_requests == 0
+            and esurge.num_pending_requests == 0
+        ):
+            esurge.update_model_weights(self)
+
+        # Auto-resume only after weights/model state are refreshed.
+        if hasattr(esurge, "_paused") and esurge._paused:
+            if not getattr(esurge, "silent_mode", False):
+                logger.info("Auto-resuming paused eSurge engine")
+            esurge.resume()
+
+        return esurge
+
+    def _call_esurge_engine(
+        self,
+        engine,
+        prompts: list[dict[str, str]] | list[str] | str,
+        tools: list[dict] | None = None,
+        sampling_params: SamplingParams | None = None,
+        request_id: str | None = None,
+        stream: bool = False,
+        chat_template: str | None = None,
+        use_tqdm: bool = False,
+    ):
+        """Internal helper to call an eSurge engine with the appropriate method.
+
+        Determines whether to use chat or completion mode and calls the
+        corresponding engine method.
+
+        Args:
+            engine: The eSurge engine instance to use.
+            prompts: Input prompts (string, list of strings, or list of message dicts).
+            tools: Optional tool definitions for chat mode.
+            sampling_params: Generation parameters.
+            request_id: Optional request ID.
+            stream: Whether to stream results.
+            chat_template: Optional chat template.
+
+        Returns:
+            Generation results from the engine.
+        """
+        # Determine if prompts is chat format (list of message dicts)
+        is_chat_mode = isinstance(prompts, list) and len(prompts) > 0 and isinstance(prompts[0], dict)
+
+        if is_chat_mode:
+            # Chat mode: use engine.chat()
+            return engine.chat(
+                messages=prompts,
+                tools=tools,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                stream=stream,
+                chat_template=chat_template,
             )
-        return vinference
+        else:
+            # Completion mode: use engine.stream() or engine.generate()
+            if stream:
+                return engine.stream(
+                    prompts=prompts,
+                    sampling_params=sampling_params,
+                    request_id=request_id,
+                )
+            else:
+                return engine.generate(
+                    prompts=prompts,
+                    sampling_params=sampling_params,
+                    request_id=request_id,
+                    use_tqdm=use_tqdm,
+                )
+
+    def esurge_generate(
+        self,
+        prompts: list[dict[str, str]] | list[str] | str,
+        tools: list[dict] | None = None,
+        sampling_params: SamplingParams | None = None,
+        request_id: str | None = None,
+        stream: bool = False,
+        chat_template: str | None = None,
+        *,
+        tokenizer: str | PreTrainedTokenizerBase | None = None,
+        max_model_len: int | None = None,
+        min_input_pad: int | None = None,
+        max_num_seqs: int | None = None,
+        max_num_seq_buckets: list[int] | None = None,
+        max_num_batched_tokens: int | None = None,
+        hbm_utilization: float | None = None,
+        page_size: int | None = None,
+        enable_prefix_caching: bool | None = None,
+        data_parallelism_axis: str | None = None,
+        runner_verbose: bool | None = None,
+        decode_truncated_prompt: bool | None = None,
+        destroy_pages_on_pause: bool | None = None,
+        silent_mode: bool | None = None,
+        use_tqdm: bool = False,
+    ):
+        """High-level interface for text generation using eSurge engine.
+
+        This method provides a convenient way to generate text using the eSurge inference
+        engine with automatic caching and configuration management. It supports both chat
+        and completion modes, with optional streaming.
+
+        All engine configuration parameters are optional. When omitted, the method will:
+        1. Try to retrieve values from a cached engine for this model
+        2. Fall back to sensible defaults if no cached engine exists
+        3. Only require tokenizer on the first call when no cache exists
+
+        Args:
+            prompts: Input prompts. Can be:
+                - Single string for simple completion
+                - List of strings for batch completion
+                - List of dicts with 'role' and 'content' keys for chat mode
+            tools: Optional list of tool/function definitions for function calling in chat mode.
+            sampling_params: Generation parameters (temperature, top_p, max_tokens, etc.).
+                Defaults to SamplingParams(max_tokens=128) if None.
+            request_id: Optional unique identifier for tracking. Auto-generated if None.
+            stream: If True, returns an iterator for streaming generation.
+                If False, returns complete results.
+            chat_template: Optional custom Jinja2 template for chat formatting.
+            tokenizer: Tokenizer path or instance. Required only on first call if no cached
+                engine exists. Subsequent calls can omit this to reuse the cached tokenizer.
+            max_model_len: Maximum sequence length. Defaults to model's max position embeddings.
+            min_input_pad: Minimum padding for input sequences. Defaults to 16.
+            max_num_seqs: Maximum number of concurrent sequences. Defaults to 32.
+            max_num_seq_buckets: Optional explicit sequence-capacity buckets for runner compilation.
+            max_num_batched_tokens: Maximum tokens per batch. Defaults to None (auto-calculate).
+            hbm_utilization: Fraction of HBM to use for KV cache. Defaults to 0.85.
+            page_size: Size of memory pages for paged attention. Defaults to 128.
+            enable_prefix_caching: Enable prefix caching for shared prompts. Defaults to True.
+            data_parallelism_axis: Mesh axis name used by eSurge for KV-page data parallelism. Defaults to "dp".
+            runner_verbose: Enable verbose logging in the model runner. Defaults to False.
+            decode_truncated_prompt: Decode and display truncated prompts. Defaults to True.
+            destroy_pages_on_pause: Free memory pages when requests are paused. Defaults to True.
+
+        Returns:
+            - For chat mode (prompts is list[dict]):
+                - If stream=True: Iterator[RequestOutput] with delta updates
+                - If stream=False: RequestOutput with complete response
+            - For completion mode (prompts is str or list[str]):
+                - If stream=True: Iterator[RequestOutput] with delta updates
+                - If stream=False: list[RequestOutput] with complete responses
+
+        Example:
+            >>> # Simple completion
+            >>> outputs = model.esurge_generate("Tell me about AI")
+            >>> print(outputs[0].get_text())
+            >>>
+            >>> # Streaming completion
+            >>> for chunk in model.esurge_generate("Tell me a story", stream=True):
+            ...     print(chunk.delta_text, end="", flush=True)
+            >>>
+            >>> # Chat mode
+            >>> messages = [
+            ...     {"role": "system", "content": "You are helpful."},
+            ...     {"role": "user", "content": "What is 2+2?"}
+            ... ]
+            >>> response = model.esurge_generate(messages)
+            >>> print(response.get_text())
+        """
+        # Get or create eSurge engine with specified parameters
+        esurge = self.get_esurge(
+            tokenizer=tokenizer,
+            max_model_len=max_model_len,
+            min_input_pad=min_input_pad,
+            max_num_seqs=max_num_seqs,
+            max_num_seq_buckets=max_num_seq_buckets,
+            max_num_batched_tokens=max_num_batched_tokens,
+            hbm_utilization=hbm_utilization,
+            page_size=page_size,
+            enable_prefix_caching=enable_prefix_caching,
+            data_parallelism_axis=data_parallelism_axis,
+            runner_verbose=runner_verbose,
+            decode_truncated_prompt=decode_truncated_prompt,
+            destroy_pages_on_pause=destroy_pages_on_pause,
+            silent_mode=silent_mode,
+        )
+
+        # Call the engine with the appropriate method
+        return self._call_esurge_engine(
+            esurge,
+            prompts=prompts,
+            tools=tools,
+            sampling_params=sampling_params,
+            request_id=request_id,
+            stream=stream,
+            chat_template=chat_template,
+            use_tqdm=use_tqdm,
+        )
+
+
+# Global cache for eSurge engine instances.
+# Keys are hash strings combining model hash and configuration hash.
+# Values are eSurge engine instances that can be reused across calls.
+_ESURGE_MAP_CACHE: dict[str, tp.Any] = {}

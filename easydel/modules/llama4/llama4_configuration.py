@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@
 
 import typing
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
 from eformer.loggings import get_logger
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -24,58 +23,55 @@ from easydel.infra.factory import register_config
 logger = get_logger(__name__)
 
 
+def _patch_hf_llama4_pooler_output() -> None:
+    """HF compatibility: ensure Llama4 image features expose `pooler_output`."""
+    try:
+        from transformers.modeling_outputs import BaseModelOutputWithPooling
+        from transformers.models.llama4 import modeling_llama4 as hf_llama4
+    except Exception:
+        return
+
+    llama4_cls = getattr(hf_llama4, "Llama4ForConditionalGeneration", None)
+    if llama4_cls is None:
+        return
+
+    original_get_image_features = getattr(llama4_cls, "get_image_features", None)
+    if original_get_image_features is None or getattr(original_get_image_features, "_easydel_pooler_patch", False):
+        return
+
+    def _patched_get_image_features(self, *args, **kwargs):
+        outputs = original_get_image_features(self, *args, **kwargs)
+        if hasattr(outputs, "pooler_output"):
+            return outputs
+
+        last_hidden_state = getattr(outputs, "last_hidden_state", None)
+        if last_hidden_state is None and isinstance(outputs, tuple) and len(outputs) > 0:
+            last_hidden_state = outputs[0]
+        if last_hidden_state is None:
+            return outputs
+
+        return BaseModelOutputWithPooling(
+            last_hidden_state=last_hidden_state,
+            pooler_output=last_hidden_state,
+            hidden_states=getattr(outputs, "hidden_states", None),
+            attentions=getattr(outputs, "attentions", None),
+        )
+
+    _patched_get_image_features._easydel_pooler_patch = True  # type: ignore[attr-defined]
+    llama4_cls.get_image_features = _patched_get_image_features
+
+
+_patch_hf_llama4_pooler_output()
+
+
 def _get_partition_rules(self, *args, **kwargs):
-    """
-    Get the partition rules for the model.
-    Returns:
-        `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
-    """
-    pmag = self.partition_manager
-    return (
-        (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-        (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-        (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-        (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-        (r"self_attn/qk_norm/scale", pmag.resolve(Replicated)),
-        (r"feed_forward/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-        (r"feed_forward/down_proj/kernel", pmag.resolve(RowWise)),
-        (r"feed_forward/router/kernel", pmag.resolve(ColumnWise)),
-        (r"feed_forward/experts/gate_up_proj", pmag.resolve(ColumnWise)),
-        (r"feed_forward/experts/down_proj", pmag.resolve(RowWise)),
-        (
-            r"feed_forward/shared_expert/(gate_proj|up_proj)/kernel",
-            pmag.resolve(ColumnWise),
-        ),
-        (r"feed_forward/shared_expert/down_proj/kernel", pmag.resolve(RowWise)),
-        (
-            r"(input_layernorm|post_attention_layernorm|pre_feedforward_layernorm|post_feedforward_layernorm|norm)/kernel",
-            pmag.resolve(Replicated),
-        ),
-        (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-        (r"patch_embedding/linear/kernel", pmag.resolve(ColumnWise)),
-        (r"class_embedding", pmag.resolve(Replicated)),
-        (r"positional_embedding_vlm", pmag.resolve(ColumnWise)),
-        (r"(layernorm_pre|layernorm_post)/scale", pmag.resolve(Replicated)),
-        (r"(layernorm_pre|layernorm_post)/bias", pmag.resolve(Replicated)),
-        (r"model/layers/\d+/self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-        (r"model/layers/\d+/self_attn/.*proj/bias", pmag.resolve(Replicated)),
-        (r"model/layers/\d+/mlp/fc1/kernel", pmag.resolve(ColumnWise)),
-        (r"model/layers/\d+/mlp/fc2/kernel", pmag.resolve(RowWise)),
-        (r"model/layers/\d+/mlp/fc(1|2)/bias", pmag.resolve(Replicated)),
-        (r"vision_adapter/mlp/fc1/kernel", pmag.resolve(ColumnWise)),
-        (r"vision_adapter/mlp/fc2/kernel", pmag.resolve(RowWise)),
-        (r"vision_adapter/mlp/fc(1|2)/bias", pmag.resolve(Replicated)),
-        (r"multi_modal_projector/linear_1/kernel", pmag.resolve(ColumnWise)),
-        (r"multi_modal_projector/linear_1/bias", pmag.resolve(Replicated)),
-        (r"score/kernel", pmag.resolve(RowWise)),
-        (r"score/bias", pmag.resolve(Replicated)),
-        (r".*bias", pmag.resolve(Replicated)),
-        (r".*", pmag.resolve(Replicated)),
-    )
+    return None
 
 
 @register_config("llama4_vision_model")
 class Llama4VisionConfig(EasyDeLBaseConfig):
+    """Configuration for the Llama4 vision tower and projector settings."""
+
     model_type = "llama4_vision_model"
     base_config_key = "vision_config"
 
@@ -91,16 +87,16 @@ class Llama4VisionConfig(EasyDeLBaseConfig):
         image_size: int = 448,
         patch_size: int = 14,
         norm_eps: float = 1e-5,
-        vision_feature_layer=-1,
-        vision_feature_select_strategy="default",
+        vision_feature_layer: int = -1,
+        vision_feature_select_strategy: str = "default",
         initializer_range: float = 0.02,
-        pixel_shuffle_ratio=0.5,
-        projector_input_dim=4096,
-        projector_output_dim=4096,
-        multi_modal_projector_bias=False,
-        projector_dropout=0.0,
-        attention_dropout=0.0,
-        rope_theta=10000,
+        pixel_shuffle_ratio: float = 0.5,
+        projector_input_dim: int = 4096,
+        projector_output_dim: int = 4096,
+        multi_modal_projector_bias: bool = False,
+        projector_dropout: float = 0.0,
+        attention_dropout: float = 0.0,
+        rope_theta: float = 10000,
         **kwargs,
     ):
         self.hidden_size = hidden_size
@@ -130,44 +126,46 @@ class Llama4VisionConfig(EasyDeLBaseConfig):
 
 @register_config("llama4_text")
 class Llama4TextConfig(EasyDeLBaseConfig):
+    """Configuration for the Llama4 text decoder stack."""
+
     model_type = "llama4_text"
 
     def __init__(
         self,
-        vocab_size=202048,
-        hidden_size=5120,
-        intermediate_size=8192,
-        intermediate_size_mlp=16384,
-        num_hidden_layers=48,
-        num_attention_heads=40,
-        num_key_value_heads=8,
-        head_dim=128,
-        hidden_act="silu",
-        max_position_embeddings=4096 * 32,
-        initializer_range=0.02,
-        rms_norm_eps=1e-5,
-        use_cache=True,
-        pad_token_id=None,
-        bos_token_id=1,
-        eos_token_id=2,
-        tie_word_embeddings=False,
-        rope_theta=500000,
-        attention_dropout=0.0,
-        num_experts_per_tok=1,
-        num_local_experts=16,
-        moe_layers=None,
-        interleave_moe_layer_step=1,
-        use_qk_norm=True,
-        output_router_logits=False,
-        router_aux_loss_coef=0.001,
-        router_jitter_noise=0.0,
-        rope_scaling=None,
-        no_rope_layers=None,
-        no_rope_layer_interval=4,
-        attention_chunk_size=8192,
-        attn_temperature_tuning=4,
-        floor_scale=8192,
-        attn_scale=0.1,
+        vocab_size: int = 202048,
+        hidden_size: int = 5120,
+        intermediate_size: int = 8192,
+        intermediate_size_mlp: int = 16384,
+        num_hidden_layers: int = 48,
+        num_attention_heads: int = 40,
+        num_key_value_heads: int | None = 8,
+        head_dim: int | None = 128,
+        hidden_act: str = "silu",
+        max_position_embeddings: int = 4096 * 32,
+        initializer_range: float = 0.02,
+        rms_norm_eps: float = 1e-5,
+        use_cache: bool = True,
+        pad_token_id: int | None = None,
+        bos_token_id: int = 1,
+        eos_token_id: int = 2,
+        tie_word_embeddings: bool = False,
+        rope_theta: float = 500000,
+        attention_dropout: float = 0.0,
+        num_experts_per_tok: int = 1,
+        num_local_experts: int = 16,
+        moe_layers: list[int] | None = None,
+        interleave_moe_layer_step: int = 1,
+        use_qk_norm: bool = True,
+        output_router_logits: bool = False,
+        router_aux_loss_coef: float = 0.001,
+        router_jitter_noise: float = 0.0,
+        rope_scaling: dict | None = None,
+        no_rope_layers: list[int] | None = None,
+        no_rope_layer_interval: int = 4,
+        attention_chunk_size: int = 8192,
+        attn_temperature_tuning: int = 4,
+        floor_scale: int = 8192,
+        attn_scale: float = 0.1,
         layer_types: list[str] | None = None,
         **kwargs,
     ):
@@ -233,6 +231,8 @@ class Llama4TextConfig(EasyDeLBaseConfig):
 
 @register_config("llama4")
 class Llama4Config(EasyDeLBaseConfig):
+    """Composite configuration linking Llama4 text and vision components."""
+
     model_type = "llama4"
     sub_configs: typing.ClassVar = {"text_config": Llama4TextConfig, "vision_config": Llama4VisionConfig}
     attribute_map: typing.ClassVar = {
@@ -243,19 +243,19 @@ class Llama4Config(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vision_config=None,
-        text_config=None,
-        boi_token_index=200080,
-        eoi_token_index=200081,
-        image_token_index=200092,
-        tie_word_embeddings=False,
+        vision_config: dict | Llama4VisionConfig | None = None,
+        text_config: dict | Llama4TextConfig | None = None,
+        boi_token_index: int = 200080,
+        eoi_token_index: int = 200081,
+        image_token_index: int = 200092,
+        tie_word_embeddings: bool = False,
         **kwargs,
     ):
         if vision_config is None:
             self.vision_config = Llama4VisionConfig()
             logger.info("vision_config is None, using default llama4 vision config")
         elif isinstance(vision_config, dict):
-            self.vision_config = Llama4VisionConfig(**vision_config)
+            self.vision_config = Llama4VisionConfig(**self._fix_parent_kws(vision_config, kwargs))
         elif isinstance(vision_config, Llama4VisionConfig):
             self.vision_config = vision_config
 
@@ -267,7 +267,7 @@ class Llama4Config(EasyDeLBaseConfig):
             self.text_config = Llama4TextConfig()
             logger.info("text_config is None, using default llama4 text config")
         elif isinstance(text_config, dict):
-            self.text_config = Llama4TextConfig(**text_config)
+            self.text_config = Llama4TextConfig(**self._fix_parent_kws(text_config, kwargs))
         elif isinstance(text_config, Llama4TextConfig):
             self.text_config = text_config
 

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -89,23 +88,6 @@ class PixtralVisionConfig(EasyDeLBaseConfig):
         initializer_range: int = 0.02,
         **kwargs,
     ):
-        """Initializes a PixtralVisionConfig object.
-
-        Args:
-            hidden_size (int, optional): Dimension of the hidden representations. Defaults to 1024.
-            intermediate_size (int, optional): Dimension of the MLP representations. Defaults to 4096.
-            num_hidden_layers (int, optional): Number of hidden layers in the Transformer encoder. Defaults to 24.
-            num_attention_heads (int, optional): Number of attention heads in the Transformer encoder. Defaults to 16.
-            num_channels (int, optional): Number of input channels in the input images. Defaults to 3.
-            image_size (int, optional): Max dimension of the input images. Defaults to 1024.
-            patch_size (int, optional): Size of the image patches. Defaults to 16.
-            hidden_act (str, optional): Activation function used in the hidden layers. Defaults to "gelu".
-            attention_dropout (float, optional): Dropout probability for the attention layers. Defaults to 0.0.
-            rope_theta (float, optional): The base period of the RoPE embeddings. Defaults to 10000.0.
-            initializer_range (float, optional): The standard deviation for initializing weight matrices.
-                Defaults to 0.02.
-            **kwargs: Additional keyword arguments passed to the parent class.
-        """
         super().__init__(**kwargs)
 
         self.hidden_size = hidden_size
@@ -121,33 +103,15 @@ class PixtralVisionConfig(EasyDeLBaseConfig):
         self.head_dim = hidden_size // num_attention_heads
         self.initializer_range = initializer_range
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            # Patch embedding convolution
-            ("patch_conv/kernel", PartitionSpec(None, None, None, "tp")),
-            (r"ln_pre/kernel", pmag.resolve(Replicated)),
-            (
-                r"transformer/layers/\d+/attention/(q_proj|k_proj|v_proj)/kernel",
-                pmag.resolve(ColumnWise),
-            ),
-            (r"transformer/layers/\d+/attention/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"transformer/layers/\d+/attention/.*proj/bias", pmag.resolve(Replicated)),
-            (
-                r"transformer/layers/\d+/feed_forward/(gate_proj|up_proj)/kernel",
-                pmag.resolve(ColumnWise),
-            ),
-            (r"transformer/layers/\d+/feed_forward/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"transformer/layers/\d+/feed_forward/.*proj/bias", pmag.resolve(Replicated)),
-            (
-                r"transformer/layers/\d+/(attention_norm|ffn_norm)/kernel",
-                pmag.resolve(Replicated),
-            ),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None

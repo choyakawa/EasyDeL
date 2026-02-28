@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,9 +33,9 @@ from collections.abc import Mapping, Sequence
 
 import jax
 import numpy as np
-import pyarrow as pa
-import pyarrow.compute as pc
-from datasets import Dataset, DatasetDict
+import pyarrow as pa  # pyright: ignore[reportMissingTypeStubs]
+import pyarrow.compute as pc  # pyright: ignore[reportMissingTypeStubs]
+from datasets import Dataset, DatasetDict  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 
 from easydel.infra.utils import ProcessingClassType
@@ -45,12 +45,12 @@ DatasetType = tp.TypeVar("DatasetType", Dataset, DatasetDict)
 InputDict = dict[str, str]
 InputListDict = list[InputDict]
 InputListListDict = list[list[InputDict]]
-InputType = tp.Union[InputListListDict, InputListDict, InputDict]  # noqa:UP007
+InputType = InputListListDict | InputListDict | InputDict
 OpenAIMessageContentPart = dict[str, str]
 OpenAIMessage = dict[str, str | list[OpenAIMessageContentPart]]
 OutputDict = dict[str, str]
 OutputListDict = list[OutputDict]
-OutputType = tp.Union[OutputDict, OutputListDict, None]  # noqa:UP007
+OutputType = OutputDict | OutputListDict | None
 OpenAIMessageList = list[OpenAIMessage]
 TListOrMapping = tp.TypeVar("TListOrMapping", list, Mapping)
 DatasetLike = Dataset | DatasetDict
@@ -382,6 +382,16 @@ def apply_chat_template(
     ]:
         raise KeyError(f"Invalid keys in the example: {example_keys}")
 
+    # Initialize variables that may be conditionally assigned
+    messages: str = ""
+    prompt: str = ""
+    chosen: str = ""
+    rejected: str = ""
+    completion: str = ""
+    prompt_chosen: str = ""
+    prompt_rejected: str = ""
+    prompt_completion: str = ""
+
     if "messages" in example:
         messages = tokenizer.apply_chat_template(
             example["messages"],
@@ -494,31 +504,7 @@ def maybe_apply_chat_template(
     if is_conversational(example):
         return apply_chat_template(example, tokenizer, tools)
     else:
-        return example
-
-
-def _unpair_row(examples: list[dict[str, list[dict[str, str]]]]) -> list[dict[str, list[dict[str, str]]]]:
-    """Internal function to unpair preference data rows.
-
-    Converts paired chosen/rejected examples into separate rows with labels.
-
-    Args:
-        examples: Batch of paired preference examples.
-
-    Returns:
-        dict: Unpaired examples with 'completion' and 'label' fields.
-
-    Note:
-        Internal helper for unpair_preference_dataset.
-    """
-    batch_size = len(examples["chosen"])
-    new_rows = {
-        "completion": examples["chosen"] + examples["rejected"],
-        "label": [True] * batch_size + [False] * batch_size,
-    }
-    if "prompt" in examples:
-        new_rows["prompt"] = examples["prompt"] + examples["prompt"]
-    return new_rows
+        return example  # pyright: ignore[reportReturnType]
 
 
 def maybe_convert_to_chatml(example: dict[str, list]) -> dict[str, list]:
@@ -551,7 +537,7 @@ def maybe_convert_to_chatml(example: dict[str, list]) -> dict[str, list]:
                   {'role': 'assistant', 'content': 'It is blue.'}]}
     ```
     """
-    for key in ["prompt", "completion", "chosen", "rejected", "messages", "conversations"]:
+    for key in ["prompt", "completion", "chosen", "rejected", "messages", "conversations", "conversation"]:
         if key in example and isinstance(example[key], list):
             messages = example[key]
             for message in messages:
@@ -563,6 +549,9 @@ def maybe_convert_to_chatml(example: dict[str, list]) -> dict[str, list]:
 
     if "conversations" in example:
         example["messages"] = example.pop("conversations")
+
+    if "conversation" in example:
+        example["messages"] = example.pop("conversation")
 
     return example
 
@@ -642,7 +631,7 @@ def keep_array_and_primitives(example: TListOrMapping) -> TListOrMapping:
                     filtered.append(nested)
             elif is_valid_type(value):
                 filtered.append(value)
-        return filtered
+        return filtered  # pyright: ignore[reportReturnType]
     elif isinstance(example, Mapping):
         filtered = {}
         for key, value in example.items():
@@ -652,7 +641,7 @@ def keep_array_and_primitives(example: TListOrMapping) -> TListOrMapping:
                     filtered[key] = nested
             elif is_valid_type(value):
                 filtered[key] = value
-        return filtered
+        return filtered  # pyright: ignore[reportReturnType]
     else:
         raise TypeError("Input must be a list or a dictionary.")
 
@@ -732,19 +721,37 @@ def maybe_convert_instruction_history_to_messages(example: dict[str, tp.Any]) ->
     return example
 
 
-def keep_arrays_map(example: dict[str, tp.Any], array_fields: list[str] | None = None) -> dict[str, tp.Any]:
+def keep_arrays_map(
+    example: dict[str, tp.Any],
+    array_fields: list[str] | None = None,
+    drop_fields: list[str] | None = None,
+) -> dict[str, tp.Any]:
+    """Keep only array fields and convert them to numpy arrays for HF datasets compatibility."""
     results = {}
     if array_fields is None:
         array_fields = []
+    if drop_fields is None:
+        drop_fields = []
     for k, v in example.items():
         if k in array_fields:
-            v = jnp.asarray(v)
-        if isinstance(v, int | float | np.ndarray | jax.Array):
-            results[k] = v
+            results[k] = np.asarray(v)
+        if k in drop_fields:
+            continue
+        elif isinstance(v, list | np.ndarray | jax.Array):
+            if isinstance(v, list):
+                try:
+                    el = v[0]
+                    if isinstance(el, dict):
+                        continue
+                except Exception:
+                    ...
+            results[k] = np.asarray(v)
     return results
 
 
-def _unpair_row(examples: list[dict[str, list[dict[str, str]]]]) -> list[dict[str, list[dict[str, str]]]]:
+def _unpair_row(examples: dict[str, list[tp.Any]]) -> dict[str, list[tp.Any]]:
+    """Convert a batch of paired preference rows into unpaired rows."""
+
     batch_size = len(examples["chosen"])
     new_rows = {
         "completion": examples["chosen"] + examples["rejected"],
@@ -764,7 +771,7 @@ def unpair_preference_dataset(dataset: DatasetType, num_proc: int | None = None,
             Preference dataset to unpair. The dataset must have columns `"chosen"`, `"rejected"` and optionally
             `"prompt"`.
         num_proc (`int`, *optional*):
-            Number of processes to use for processing the dataset.
+            Number of processes to use for processing the dataset. (Unused in the current implementation.)
         desc (`str`, *optional*):
             Meaningful description to be displayed alongside with the progress bar while mapping examples.
 
@@ -793,7 +800,36 @@ def unpair_preference_dataset(dataset: DatasetType, num_proc: int | None = None,
     {'prompt': 'The sky is', 'completion': ' blue.', 'label': True}
     ```
     """
-    return dataset.map(_unpair_row, batched=True, remove_columns=["chosen", "rejected"], num_proc=num_proc, desc=desc)
+
+    if isinstance(dataset, DatasetDict):
+        return DatasetDict(
+            {key: unpair_preference_dataset(subset, num_proc=num_proc, desc=desc) for key, subset in dataset.items()}
+        )
+
+    column_names = dataset.column_names
+
+    remove_columns = ["chosen", "rejected"]
+
+    try:
+        return dataset.map(
+            _unpair_row,
+            batched=True,
+            remove_columns=remove_columns,
+            num_proc=num_proc,
+            desc=desc,
+        )
+    except pa.ArrowInvalid:
+        data = {"completion": [], "label": []}
+        if "prompt" in column_names:
+            data["prompt"] = []
+        for example in dataset:
+            prompt_value = example.get("prompt")
+            for completion, label in ((example["chosen"], True), (example["rejected"], False)):
+                data["completion"].append(completion)
+                data["label"].append(label)
+                if "prompt" in column_names:
+                    data["prompt"].append(prompt_value)
+        return Dataset.from_dict(data)  # pyright: ignore[reportReturnType]
 
 
 def maybe_unpair_preference_dataset(
@@ -855,6 +891,7 @@ def extract_prompt(example: dict[str, Sequence]) -> dict[str, Sequence]:
 
     For more details, see [`maybe_extract_prompt`].
     """
+    idx = 0
     for idx in range(min(len(example["chosen"]), len(example["rejected"]))):
         if example["chosen"][idx] != example["rejected"][idx]:
             if example["chosen"][idx - 1] == " ":
@@ -950,7 +987,7 @@ def maybe_extract_prompt(example: dict[str, list]) -> dict[str, list]:
         prompt_conv = is_conversational({"prompt": example["prompt"]})
         if (chosen_conv and prompt_conv) or (not chosen_conv and not prompt_conv):
             return example
-    return extract_prompt({"chosen": example["chosen"], "rejected": example["rejected"]})
+    return extract_prompt({"chosen": example["chosen"], "rejected": example["rejected"]})  # pyright: ignore[reportReturnType]
 
 
 class _SegmentTree:
@@ -1253,7 +1290,10 @@ def pad_and_truncate_dataset(
     def process_batch(batch: dict[str, list[tp.Any]]) -> dict[str, list[tp.Any]]:
         processed: dict[str, list[tp.Any]] = {}
         for k, v in batch.items():
-            v = jnp.asarray(v)
+            # Ensure v is an array (handle cases where HF datasets returns lists)
+            if not hasattr(v, "shape"):
+                v = jnp.asarray(v)
+
             pad_val = get_padding_value(k)
             pad = max_length - v.shape[-1]
             if pad < 0 and truncate:
@@ -1300,11 +1340,16 @@ def is_conversational_from_value(example: dict[str, tp.Any]) -> bool:
     ```
     """
     maybe_messages = example.get("conversations")
+    if maybe_messages is None:
+        maybe_messages = example.get("conversation")
 
     if isinstance(maybe_messages, list):
         maybe_message = maybe_messages[0]
 
         if isinstance(maybe_message, dict) and "from" in maybe_message and "value" in maybe_message:
+            return True
+
+        if isinstance(maybe_message, dict) and "role" in maybe_message and "content" in maybe_message:
             return True
 
     return False

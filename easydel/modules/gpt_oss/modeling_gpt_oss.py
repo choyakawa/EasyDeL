@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,43 +13,130 @@
 # limitations under the License.
 
 
-from functools import partial
+import typing
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
     DecoderLayerOutput,
     MoeCausalLMOutput,
     MoeModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import auto_remat, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
-    TransformerCache,
-    TransformerCacheView,
-    TransformerMetadata,
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
+from easydel.layers import (
+    BaseMoeModule,
+    ColumnParallelLinear,
+    ColumnParallelMoELinear,
+    Embed,
+    MoeLoadBalancingStrategy,
+    MoeRoutingStrategy,
+    RMSNorm,
+    RowParallelMoELinear,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm
+from easydel.layers.attention import UnifiedAttention
+from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
 from .gpt_oss_configuration import GptOssConfig
 
 
+class GptOssRMSNorm(RMSNorm):
+    """GPT-OSS RMS Normalization layer.
+
+    This is a simple extension of RMSNorm for GPT-OSS models. RMS (Root Mean Square)
+    Layer Normalization normalizes the input tensor by its RMS value, providing
+    stable training dynamics without centering the activations.
+
+    Attributes:
+        dim (int): Dimensionality of the input features.
+        eps (float): Small epsilon value for numerical stability.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+    """
+
+    ...
+
+
 class GptOssExperts(nn.Module):
+    """Grouped expert feed-forward network used inside GPT-OSS MoE layers.
+
+    This module implements the expert network for Mixture-of-Experts (MoE) routing
+    in GPT-OSS. Each expert is a feed-forward network with a gated linear unit (GLU)
+    activation. The experts process tokens routed to them based on router decisions.
+
+    The forward pass applies a modified GLU activation with clipping for numerical
+    stability:
+        1. Compute gate projection with sigmoid activation (scaled by alpha)
+        2. Compute up projection and add 1.0
+        3. Multiply gate output with up output
+        4. Apply down projection to produce final output
+
+    Attributes:
+        config (GptOssConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        intermediate_size (int): Size of the intermediate (hidden) layer in the FFN.
+        num_experts (int): Number of expert networks.
+        hidden_size (int): Size of the hidden dimension.
+        expert_dim (int): Dimension of each expert's intermediate layer.
+        gate_proj (ColumnParallelMoELinear): Gate projection layer for GLU.
+        up_proj (ColumnParallelMoELinear): Up projection layer.
+        down_proj (RowParallelMoELinear): Down projection layer.
+        alpha (float): Scaling factor for the sigmoid in GLU activation.
+        act_fn (callable): Activation function.
+    """
+
+    reform_param: typing.ClassVar = {
+        "gate_up_proj$": {
+            "splits": [
+                {"name": "gate_proj.kernel", "spliter": lambda x: x[..., 0::2]},
+                {"name": "up_proj.kernel", "spliter": lambda x: x[..., 1::2]},
+            ],
+            "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
+        },
+        "gate_up_proj_bias$": {
+            "splits": [
+                {"name": "gate_proj.bias", "spliter": lambda x: x[..., 0::2]},
+                {"name": "up_proj.bias", "spliter": lambda x: x[..., 1::2]},
+            ],
+            "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
+        },
+        "down_proj$": {
+            "splits": [
+                {"name": "down_proj.kernel", "spliter": lambda x: x},
+            ],
+            "inverse_spliter": lambda x: x,
+        },
+        "down_proj_bias$": {
+            "splits": [
+                {"name": "down_proj.bias", "spliter": lambda x: x},
+            ],
+            "inverse_spliter": lambda x: x,
+        },
+    }
+
     def __init__(
         self,
         config: GptOssConfig,
@@ -59,6 +146,16 @@ class GptOssExperts(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the GptOssExperts module.
+
+        Args:
+            config (GptOssConfig): Configuration object for the model.
+            dtype (jnp.dtype): Data type for computations. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generators.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -68,84 +165,101 @@ class GptOssExperts(nn.Module):
         self.num_experts = config.num_local_experts
         self.hidden_size = config.hidden_size
         self.expert_dim = self.intermediate_size
-        initializer = jax.nn.initializers.normal(stddev=self.config.initializer_range)
-        self.gate_up_proj = nn.Param(
-            initializer(
-                shape=(self.num_experts, self.hidden_size, 2 * self.expert_dim),
-                key=rngs.param(),
-                dtype=param_dtype,
-            )
-        )
-        self.gate_up_proj_bias = nn.Param(
-            initializer(
-                shape=(self.num_experts, 2 * self.expert_dim),
-                key=rngs.param(),
-                dtype=param_dtype,
-            )
-        )
-        self.down_proj = nn.Param(
-            initializer(
-                shape=(self.num_experts, self.expert_dim, self.hidden_size),
-                key=rngs.param(),
-                dtype=param_dtype,
-            )
-        )
-        self.down_proj_bias = nn.Param(
-            initializer(
-                shape=(self.num_experts, self.hidden_size),
-                key=rngs.param(),
-                dtype=param_dtype,
-            )
-        )
 
+        self.gate_proj = ColumnParallelMoELinear(
+            num_experts=config.num_local_experts,
+            in_features=config.hidden_size,
+            out_features=config.intermediate_size,
+            rngs=rngs,
+            kernel_init=nn.initializers.normal(),
+            use_bias=True,
+            partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
+        )
+        self.down_proj = RowParallelMoELinear(
+            num_experts=config.num_local_experts,
+            in_features=config.intermediate_size,
+            out_features=config.hidden_size,
+            rngs=rngs,
+            use_bias=True,
+            kernel_init=nn.initializers.normal(),
+            partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
+        )
+        self.up_proj = ColumnParallelMoELinear(
+            num_experts=config.num_local_experts,
+            in_features=config.hidden_size,
+            out_features=config.intermediate_size,
+            rngs=rngs,
+            use_bias=True,
+            kernel_init=nn.initializers.normal(),
+            partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
+        )
         self.alpha = 1.702
-        self.limit = 7.0
+        self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, hidden_states: jax.Array, router_indices=None, routing_weights=None, training=False) -> jax.Array:
-        batch_size = hidden_states.shape[0]
-        hidden_states = hidden_states.reshape(-1, self.hidden_size)
-        num_experts = routing_weights.shape[1]
+    def __call__(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
+    ) -> Array:
+        """Forward pass through the expert MLP network.
 
-        if training:
-            next_states = jnp.zeros_like(hidden_states)
-            expert_mask = jax.nn.one_hot(router_indices, num_classes=num_experts)
-            expert_mask = expert_mask.transpose(2, 1, 0)
-            expert_hitted = jnp.greater(expert_mask.sum(axis=(-1, -2)), 0).nonzero()[0]
+        Applies the expert feed-forward transformation with a modified GLU activation.
+        Values are clipped for numerical stability before the activation function.
 
-            for expert_idx in expert_hitted:
-                token_idx = jnp.where(expert_mask[expert_idx])[1]
-                current_state = hidden_states[token_idx]
-                gate_up = current_state @ self.gate_up_proj.value[expert_idx] + self.gate_up_proj_bias.value[expert_idx]
-                gate = gate_up[..., ::2]
-                up = gate_up[..., 1::2]
-                gate = jnp.clip(gate, a_max=self.limit)
-                up = jnp.clip(up, a_min=-self.limit, a_max=self.limit)
-                glu = gate * jax.nn.sigmoid(gate * self.alpha)
-                gated_output = (up + 1) * glu
-                out = gated_output @ self.down_proj.value[expert_idx] + self.down_proj_bias.value[expert_idx]
-                weighted_output = out * routing_weights[token_idx, expert_idx, None]
-                next_states = next_states.at[token_idx].add(weighted_output)
+        Args:
+            hidden_states (Array): Input hidden states of shape (batch, seq_len, hidden_dim).
+            group_sizes (Array): Sizes of each expert group for routing.
+            sorted_experts (Array, optional): Sorted expert indices for efficient routing.
+                Defaults to None.
 
-            next_states = next_states.reshape(batch_size, -1, self.hidden_size)
-        else:
-            hidden_states = jnp.repeat(hidden_states[None, :, :], num_experts, axis=0)
-            gate_up = jnp.matmul(hidden_states, self.gate_up_proj.value) + self.gate_up_proj_bias.value[:, None, :]
-            gate = gate_up[..., ::2]
-            up = gate_up[..., 1::2]
-            gate = jnp.clip(gate, a_max=self.limit)
-            up = jnp.clip(up, a_min=-self.limit, a_max=self.limit)
-            glu = gate * jax.nn.sigmoid(gate * self.alpha)
-            next_states = jnp.matmul((up + 1) * glu, self.down_proj.value)
-            next_states = next_states + self.down_proj_bias.value[:, None, :]
-            next_states = next_states.reshape(num_experts, batch_size, -1, self.hidden_size)
-            routing_weights_expanded = routing_weights.transpose(1, 0).reshape(num_experts, batch_size, -1, 1)
-            next_states = next_states * routing_weights_expanded
-            next_states = next_states.sum(axis=0)
+        Returns:
+            Array: Output hidden states after expert processing with shape
+                (batch, seq_len, hidden_dim).
+        """
+        w0 = self.gate_proj(hidden_states, group_sizes, sorted_experts)
+        w1 = self.up_proj(hidden_states, group_sizes, sorted_experts)
 
-        return next_states
+        w0 = jnp.clip(w0, min=None, max=7.0)
+        w1 = jnp.clip(w1, min=-7.0, max=7.0)
+
+        glu = w0 * jax.nn.sigmoid(w0 * self.alpha)
+        intermediate = (w1 + 1.0) * glu
+
+        return self.down_proj(intermediate, group_sizes, sorted_experts)
 
 
-class GptOssTopKRouter(nn.Module):
+class GptOssMLP(BaseMoeModule):
+    """Mixture-of-Experts MLP module for GPT-OSS.
+
+    This module implements the MoE layer that routes input tokens to specialized
+    expert networks. It uses a learned router to determine which experts should
+    process each token, enabling sparse computation and increased model capacity.
+
+    The routing mechanism uses top-k selection with softmax normalization,
+    allowing each token to be processed by multiple experts with weighted
+    contributions. Custom hooks handle the routing probability computation
+    and weight refinement.
+
+    Attributes:
+        config (GptOssConfig): Configuration object for the model.
+        router (ColumnParallelLinear): Router network that computes expert selection logits.
+        experts (GptOssExperts): The collection of expert networks.
+        moe_hooks: Hooks for customizing MoE routing behavior.
+        n_routed_experts (int): Total number of routed experts.
+        num_experts_per_tok (int): Number of experts selected per token.
+        hidden_size (int): Hidden dimension size.
+    """
+
     def __init__(
         self,
         config: GptOssConfig,
@@ -155,58 +269,39 @@ class GptOssTopKRouter(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        self.config = config
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.top_k = config.num_experts_per_tok
-        self.num_experts = config.num_local_experts
-        self.hidden_dim = config.hidden_size
-        initializer = jax.nn.initializers.normal(stddev=self.config.initializer_range)
-        self.kernel = nn.Param(
-            initializer(
-                shape=(self.num_experts, self.hidden_dim),
-                key=rngs.param(),
-                dtype=param_dtype,
-            )
-        )
-        self.bias = nn.Param(
-            initializer(
-                shape=(self.num_experts,),
-                key=rngs.param(),
-                dtype=param_dtype,
-            )
-        )
+        """Initialize the GptOssMLP module.
 
-    def __call__(self, hidden_states):
-        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = hidden_states @ self.kernel.value + self.bias.value
-        router_top_value, router_indices = jax.lax.top_k(router_logits, self.top_k)
-        router_top_value = jax.nn.softmax(router_top_value, axis=1)
-        router_scores = jnp.zeros_like(router_logits)
-        router_scores = router_scores.at[jnp.arange(router_scores.shape[0])[:, None], router_indices].set(
-            router_top_value
-        )
+        Sets up the router network and expert modules, along with custom routing
+        hooks for top-k probability computation and weight normalization.
 
-        return router_scores, router_indices
-
-
-class GptOssMLP(nn.Module):
-    def __init__(
-        self,
-        config: GptOssConfig,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        *,
-        rngs: nn.Rngs,
-    ):
-        self.router = GptOssTopKRouter(
+        Args:
+            config (GptOssConfig): Configuration object for the model.
+            dtype (jnp.dtype): Data type for computations. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generators.
+        """
+        super().__init__(
             config=config,
+            n_routed_experts=config.num_local_experts,
+            num_experts_per_tok=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            lbl_coef=None,
+            rzl_coef=None,
+            routing_strategy=MoeRoutingStrategy.TOP_K,
+            load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
+        )
+
+        self.router = ColumnParallelLinear(
+            config.hidden_size,
+            config.num_local_experts,
+            use_bias=True,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            kernel_init=nn.initializers.normal(config.initializer_range),
         )
         self.experts = GptOssExperts(
             config=config,
@@ -216,186 +311,193 @@ class GptOssMLP(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states, training=False):
-        router_scores, router_indices = self.router(hidden_states)
-        routed_out = self.experts(
-            hidden_states,
-            router_indices=router_indices,
-            routing_weights=router_scores,
-            training=training,
+        def _scatter_topk_probs(logits: jax.Array) -> jax.Array:
+            top_vals, top_idx = jax.lax.top_k(logits, k=self.num_experts_per_tok)
+            top_probs = jax.nn.softmax(top_vals, axis=-1)
+            out = jnp.zeros_like(logits)
+            row_idx = jnp.arange(logits.shape[0])[:, None]
+            return out.at[row_idx, top_idx].set(top_probs)
+
+        def _softmax_topk_weights(weights: jax.Array) -> jax.Array:
+            return jax.nn.softmax(weights, axis=-1)
+
+        self.moe_hooks = self.moe_hooks.replace(
+            after_gate=_scatter_topk_probs,
+            refine_weights_hook=_softmax_topk_weights,
         )
-        return routed_out, router_scores
+
+    def __call__(self, hidden_states, training=False, layer_idx=None):
+        """Forward pass through the MoE MLP.
+
+        Routes input hidden states through the expert network based on router
+        decisions. Each token is processed by the top-k experts with weighted
+        contributions.
+
+        Args:
+            hidden_states (Array): Input hidden states of shape
+                (batch, seq_len, hidden_dim).
+            training (bool): Whether in training mode. Defaults to False.
+                Currently unused.
+            layer_idx: Layer index for debugging/logging. Defaults to None.
+
+        Returns:
+            tuple: A tuple containing:
+                - output (Array): Expert-processed hidden states of shape
+                    (batch, seq_len, hidden_dim).
+                - router_logits (Array): Router logits for auxiliary loss
+                    computation.
+        """
+        del training
+
+        def ffn_activation(w0, w1):
+            w0 = jnp.clip(w0, min=None, max=7.0)
+            w1 = jnp.clip(w1, min=-7.0, max=7.0)
+            glu = w0 * jax.nn.sigmoid(w0 * self.experts.alpha)
+            return (w1 + 1.0) * glu
+
+        out, router_logits = self.moe_call(
+            hidden_state=hidden_states,
+            gate_layer=self.router,
+            expert_layer=self.experts,
+            wi_kernel=self.experts.gate_proj.kernel.value,
+            wu_kernel=self.experts.up_proj.kernel.value,
+            wd_kernel=self.experts.down_proj.kernel.value,
+            wi_bias=self.experts.gate_proj.bias.value,
+            wu_bias=self.experts.up_proj.bias.value,
+            wd_bias=self.experts.down_proj.bias.value,
+            act_fn=self.experts.act_fn,
+            ffn_activation=ffn_activation,
+            layer_idx=layer_idx,
+        )
+        return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
-class GptOssAttention(AttentionModule):
+class GptOssAttention(UnifiedAttention):
+    """GPT-OSS Attention module with sink tokens support.
+
+    This module implements the multi-head attention mechanism for GPT-OSS with
+    support for layer-specific sliding window attention and sink tokens. The
+    attention type (global or sliding) is determined per-layer based on the
+    configuration.
+
+    Sink tokens are learnable parameters that help stabilize attention patterns
+    by providing consistent anchor points for the attention mechanism.
+
+    Attributes:
+        config (GptOssConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        layer_idx (int): Index of this layer in the model.
+        sinks (ArrayParam): Learnable sink token parameters per attention head.
+    """
+
     def __init__(
         self,
         config: GptOssConfig,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
-        super().__init__(config=config)
+        """Initialize GPT-OSS attention with sink tokens.
 
-        self.layer_idx = layer_idx
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
+        Args:
+            config (GptOssConfig): Configuration object for the model.
+            dtype (jnp.dtype): Data type for computations. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generators.
+            layer_idx (int): Index of this layer in the model. Used to determine
+                whether this layer uses sliding window attention.
+        """
+        is_sliding = config.layer_types is not None and config.layer_types[layer_idx] == "sliding_attention"
+        sliding_window = None
 
-        self.hidden_size = config.hidden_size
-        head_dim = config.hidden_size // config.num_attention_heads
-        self.head_dim = getattr(config, "head_dim", head_dim)
-        self.num_key_value_groups = self.config.num_attention_heads // self.config.num_key_value_heads
+        if is_sliding:
+            sliding_window = config.sliding_window
 
-        if self.num_key_value_groups == 1:
-            assert self.config.num_attention_heads == self.config.num_key_value_heads
-
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        row_parallel_linear = partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        self.q_proj = column_parallel_linear(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
-        self.k_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.v_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.o_proj = row_parallel_linear(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
-        self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
-        self.sliding_window = config.sliding_window if self.is_sliding else None
-        self.rotary = self.config.get_basic_rope(self.dtype, self.head_dim, self.head_dim, True)
-
-        self.attention_performer = FlexibleAttentionModule(
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
             rngs=rngs,
-            base_config=self.config,
-            softmax_scale=self.head_dim**-0.5,
-            dropout_prob=self.config.attention_dropout,
-        )
-        self.sinks = nn.Param(
-            jax.nn.initializers.normal(self.config.initializer_range)(
-                rngs.param(),
-                shape=(config.num_attention_heads,),
-                dtype=param_dtype,
-            )
-        )
-
-    def __call__(
-        self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
-        output_attentions: bool = False,
-        fcm_mask: chex.Array | None = None,
-        frequencies: chex.Array | None = None,
-    ) -> tuple[chex.Array, chex.Array]:
-        batch_size, sequence_length = hidden_states.shape[:2]
-        query_states, key_states, value_states = (
-            checkpoint_name(self.q_proj(hidden_states), name="attn_query"),
-            checkpoint_name(self.k_proj(hidden_states), name="attn_key"),
-            checkpoint_name(self.v_proj(hidden_states), name="attn_value"),
-        )
-        qshape = (
-            batch_size,
-            sequence_length,
-            self.config.num_attention_heads,
-            self.head_dim,
-        )
-        kv_shape = (
-            batch_size,
-            sequence_length,
-            self.config.num_key_value_heads,
-            self.head_dim,
-        )
-        query_states = query_states.reshape(qshape)
-        key_states = key_states.reshape(kv_shape)
-        value_states = value_states.reshape(kv_shape)
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
-
-        (
-            key_states,
-            value_states,
-            attention_mask,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            value=value_states,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            fcm_mask=fcm_mask,
-            sliding_window=self.sliding_window,
-        )
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
+            layer_idx=layer_idx,
+            attention_type="standard",
             causal=True,
-            softmax_aux=self.sinks,
+            sliding_window=sliding_window,
         )
-        attn_output = checkpoint_name(
-            self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs))),
-            name="attn_output",
+
+        # Sink tokens for improved attention
+        self.sinks = ArrayParam.bound(
+            shape=(config.num_attention_heads,),
+            dtype=param_dtype,
+            init_method="normal",
+            init_kwargs={"stddev": config.initializer_range},
+            key=rngs.param(),
         )
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
-        )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for sink parameters."""
+        return {"sinks": Replicated}
 
 
 class GptOssDecoderLayer(nn.Module):
+    """GPT-OSS decoder layer with attention and Mixture-of-Experts MLP.
+
+    This module represents a single transformer decoder block in GPT-OSS,
+    consisting of a self-attention layer followed by a Mixture-of-Experts
+    MLP layer. Both sub-layers use pre-normalization (RMSNorm) and residual
+    connections.
+
+    The layer supports different attention patterns (global or sliding window)
+    based on the layer configuration, enabling efficient processing of long
+    sequences while maintaining the ability to capture both local and global
+    dependencies.
+
+    Attributes:
+        config (GptOssConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        layer_idx (int): Index of this layer in the model.
+        self_attn (GptOssAttention): Self-attention module.
+        mlp (GptOssMLP): Mixture-of-Experts MLP module.
+        input_layernorm (GptOssRMSNorm): Pre-attention layer normalization.
+        post_attention_layernorm (GptOssRMSNorm): Pre-MLP layer normalization.
+        attention_type (str): Type of attention used in this layer.
+    """
+
     def __init__(
         self,
         config: GptOssConfig,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
+        """Initialize the GPT-OSS decoder layer.
+
+        Args:
+            config (GptOssConfig): Configuration object for the model.
+            dtype (jnp.dtype): Data type for computations. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generators.
+            layer_idx (int): Index of this layer in the model.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
+        self.layer_idx = layer_idx
         attn_block = GptOssAttention
         mlp_block = GptOssMLP
         attn_block, mlp_block = auto_remat(
@@ -408,11 +510,11 @@ class GptOssDecoderLayer(nn.Module):
 
         self.self_attn = attn_block(
             config=config,
-            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
         self.mlp = mlp_block(
@@ -422,48 +524,71 @@ class GptOssDecoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.input_layernorm = RMSNorm(
+        self.input_layernorm = GptOssRMSNorm(
             dim=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.post_attention_layernorm = RMSNorm(
+        self.post_attention_layernorm = GptOssRMSNorm(
             dim=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.attention_type = config.layer_types[layer_idx]
+        self.attention_type = config.layer_types[layer_idx] if config.layer_types is not None else "standard"
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo,
+        position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
-        fcm_mask: chex.Array | None = None,
-        frequencies: chex.Array | None = None,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
+        """Forward pass of the GPT-OSS decoder layer.
+
+        Applies self-attention with pre-normalization, followed by MoE MLP
+        with pre-normalization. Both sub-layers use residual connections.
+
+        Args:
+            hidden_states (Array): Input hidden states of shape
+                (batch, seq_len, hidden_dim).
+            mask_info (MaskInfo): Mask information for attention computation.
+            position_ids (Array): Position indices of shape (batch, seq_len).
+            mode: Runtime mode (train, decode, infer).
+            cache_view (TransformerCacheView | RaggedPagesCacheView, optional):
+                Cache view for key/value states. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata,
+                optional): Metadata for cache handling. Defaults to None.
+            output_attentions (bool): Whether to return attention weights.
+                Defaults to False.
+            output_router_logits (bool): Whether to return router logits.
+                Defaults to False.
+            frequencies (Array, optional): Rotary embedding frequencies.
+                Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Output containing:
+                - hidden_states: Processed hidden states
+                - attention_weight: Attention weights if output_attentions=True
+                - cache_view: Updated cache view
+                - router_logits: Router logits if output_router_logits=True
+        """
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
-            attention_mask,
+            mask_info,
             position_ids,
-            causal_mask,
             mode,
             cache_view,
             cache_metadata,
-            segment_ids,
             output_attentions,
-            fcm_mask,
             frequencies,
         )
         hidden_states = hidden_states + attn_outputs.attention_output
@@ -499,7 +624,7 @@ class GptOssModel(EasyDeLBaseModule):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         rngs (nn.Rngs): Random number generators.
-        embed_tokens (nn.Embed): Embedding layer for input tokens.
+        embed_tokens (Embed): Embedding layer for input tokens.
         layers (tp.List[GptOssDecoderLayer]): List of decoder layers.
         norm (RMSNorm): Final layer normalization.
         gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
@@ -531,13 +656,7 @@ class GptOssModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             config.vocab_size,
             config.hidden_size,
             dtype=dtype,
@@ -545,19 +664,21 @@ class GptOssModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
-            GptOssDecoderLayer(
-                config=config,
-                layer_idx=layer_idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for layer_idx in range(config.num_hidden_layers)
-        ]
+        self.layers = nn.List(
+            [
+                GptOssDecoderLayer(
+                    config=config,
+                    layer_idx=layer_idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
 
-        self.norm = RMSNorm(
+        self.norm = GptOssRMSNorm(
             dim=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=dtype,
@@ -567,47 +688,63 @@ class GptOssModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> MoeModelOutput:
-        """Forward pass of the GptOssModel.
+        """Performs forward pass through the GPT-OSS transformer model.
+
+        Processes input tokens through token embeddings and multiple decoder layers
+        with Mixture-of-Experts MLPs. Supports both global and sliding window
+        attention patterns based on layer configuration. Uses RMSNorm for
+        pre-normalization and rotary position embeddings.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
-            output_router_logits (tp.Optional[bool]): Whether to return router logits from the MoE layers.
-                Defaults to `config.output_router_logits`.
-            past_key_values (tp.Optional[TransformerCache | PagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
-
+            input_ids: Input token IDs of shape (batch_size, sequence_length).
+                Either this or `inputs_embeds` must be provided but not both.
+            inputs_embeds: Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Use instead of
+                `input_ids` for custom embeddings.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length)
+                indicating which tokens to attend to (True) and which to ignore
+                (False).
+            mask_info: Pre-computed mask information. If provided, overrides
+                `attention_mask`.
+            position_ids: Explicit position indices of shape
+                (batch_size, sequence_length). Auto-generated if not provided.
+            output_attentions: Whether to return attention weights from all layers.
+                Defaults to config.output_attentions.
+            output_hidden_states: Whether to return hidden states from all layers.
+                Defaults to config.output_hidden_states.
+            output_router_logits: Whether to return router logits from MoE layers.
+                Defaults to config.output_router_logits.
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER).
+                Auto-detected if None.
+            past_key_values: Cached key/value states for efficient autoregressive
+                generation.
+            cache_metadata: Metadata for paged attention mechanisms.
 
         Returns:
-            MoeModelOutput: The model's output.
-                returns a `MoeModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-                `attentions` (optional), and `router_logits` (optional).
+            MoeModelOutput containing:
+                - last_hidden_state: Final layer output of shape
+                    (batch, seq_len, hidden_size)
+                - past_key_values: Updated cache for next generation step
+                - hidden_states: Tuple of all layer outputs if
+                    output_hidden_states=True
+                - attentions: Tuple of attention weights if output_attentions=True
+                - router_logits: Tuple of router logits if output_router_logits=True
 
         Raises:
-            ValueError: If neither `input_ids` nor `inputs_embeds` is provided.
+            ValueError: If both `input_ids` and `inputs_embeds` are provided,
+                or if neither is provided.
         """
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits
@@ -629,27 +766,23 @@ class GptOssModel(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
-        batch_size, sequence_length, _ = inputs_embeds.shape
+
+        sequence_length = inputs_embeds.shape[1]
 
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
 
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-        else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
 
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
-
-        if attention_mask.ndim == 2:
-            attention_mask = jnp.expand_dims(attention_mask, (1, 2))
+            position_ids = mask_info.q_position_ids
 
         hidden_states = inputs_embeds
         if mode is None:
@@ -672,15 +805,13 @@ class GptOssModel(EasyDeLBaseModule):
                 all_hidden_states += (hidden_states,)
             layer_outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 output_router_logits=output_router_logits,
-                causal_mask=self.causal_mask,
-                segment_ids=segment_ids,
                 frequencies=self.frequencies,
             )
 
@@ -732,25 +863,30 @@ class GptOssModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=GptOssConfig, model_type="gpt_oss")
-class GptOssForCausalLM(EasyDeLBaseModule):
-    """GptOss model with a Causal Language Modeling head.
+class GptOssForCausalLM(BaseCausalLMModule[GptOssModel, GptOssConfig]):  # type: ignore
+    """GPT-OSS model with a Causal Language Modeling head.
 
-    This model consists of the base GptOss transformer (`GptOssModel`) followed by a
-    linear layer (`lm_head`) that projects the transformer's output hidden states
-    to the vocabulary size, producing logits for next token prediction. It also handles
-    the calculation of the auxiliary loss from the MoE layers.
+    This model extends the base GPT-OSS transformer by adding a linear layer on top
+    to predict the next token in a sequence, making it suitable for causal language
+    modeling tasks. It leverages Mixture-of-Experts (MoE) routing for increased model
+    capacity with sparse computation.
+
+    The model supports auxiliary load balancing loss to encourage balanced routing
+    across experts, which is crucial for efficient MoE training.
 
     Attributes:
         config (GptOssConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation.
+        dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         rngs (nn.Rngs): Random number generators.
-        model (GptOssModel): The core GptOss transformer model.
-        lm_head (ParallelLinear): The linear layer for projecting hidden states to vocabulary logits.
-        num_experts (int): Total number of experts.
-        num_experts_per_tok (int): Number of experts to route per token.
+        base_model (GptOssModel): The underlying GPT-OSS transformer model.
+        lm_head: Linear layer projecting hidden states to vocabulary logits.
     """
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "gpt_oss"
+    _config_class = GptOssConfig
 
     def __init__(
         self,
@@ -761,156 +897,117 @@ class GptOssForCausalLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the GptOssForCausalLM model.
+        """Initialize the GPT-OSS Causal LM module.
 
         Args:
-            config (GptOssConfig): The configuration object for the GptOss model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config: Model configuration
+            dtype: Data type for computations
+            param_dtype: Data type for parameters
+            precision: Precision setting for JAX operations
+            rngs: Random number generators
         """
         super().__init__(
             config=config,
+            base_model_class=GptOssModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = GptOssModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            rngs=rngs,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            use_bias=False,
-            kernel_init=nn.initializers.normal(config.initializer_range),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            lm_head_bias=False,
+            router_aux_loss_coef=config.router_aux_loss_coef,
         )
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
-    ) -> MoeCausalLMOutput | tuple:
-        """Forward pass of the GptOssForCausalLM model.
+    ) -> MoeCausalLMOutput:
+        """Forward pass for GPT-OSS Causal Language Model.
+
+        Processes input tokens through the GPT-OSS transformer with MoE layers
+        and projects the output to vocabulary logits for next-token prediction.
+        Computes auxiliary load balancing loss for MoE training when router
+        logits are available.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
-                output_attentions (tp.Optional[bool]): Whether to return attention weights.
-            Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
-            output_router_logits (tp.Optional[bool]): Whether to return router logits from the MoE layers.
-                Defaults to `config.output_router_logits`.
-            past_key_values (tp.Optional[TransformerCache | PagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
+            input_ids (Array, optional): Input token IDs of shape
+                (batch_size, sequence_length). Either this or `inputs_embeds`
+                must be provided.
+            inputs_embeds (Array, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Use instead of
+                `input_ids` for custom embeddings.
+            attention_mask (Array, optional): Boolean mask of shape
+                (batch_size, sequence_length) indicating which tokens to attend
+                to (True) and which to ignore (False).
+            mask_info (MaskInfo, optional): Pre-computed mask information.
+                If provided, overrides `attention_mask`.
+            position_ids (Array, optional): Position indices of shape
+                (batch_size, sequence_length). Auto-generated if not provided.
+            output_attentions (bool, optional): Whether to return attention weights.
+                Defaults to config.output_attentions.
+            output_hidden_states (bool, optional): Whether to return hidden states
+                from all layers. Defaults to config.output_hidden_states.
+            output_router_logits (bool, optional): Whether to return router logits
+                from MoE layers. Defaults to config.output_router_logits.
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER).
+                Auto-detected if None.
+            past_key_values: Cached key/value states for efficient autoregressive
+                generation.
+            cache_metadata: Metadata for paged attention mechanisms.
+            apply_lm_head (bool): Whether to apply the language modeling head.
+                Set to False to get hidden states only. Defaults to True.
 
         Returns:
-            MoeCausalLMOutput: The model's output.
-                returns a `MoeCausalLMOutput` object containing `logits`, `aux_loss` (optional),
-                `hidden_states` (optional), `attentions` (optional), and `router_logits` (optional).
-
+            MoeCausalLMOutput containing:
+                - logits: Vocabulary logits of shape (batch, seq_len, vocab_size)
+                - aux_loss: Auxiliary load balancing loss for MoE training
+                - past_key_values: Updated cache for next generation step
+                - hidden_states: Tuple of all layer outputs if output_hidden_states=True
+                - attentions: Tuple of attention weights if output_attentions=True
+                - router_logits: Tuple of router logits if output_router_logits=True
         """
-        if output_router_logits is None:
-            output_router_logits = self.config.output_router_logits
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            output_router_logits=output_router_logits,
-            mode=mode,
-            past_key_values=past_key_values,
-            cache_metadata=cache_metadata,
-            segment_ids=segment_ids,
-        )
-        logits = None
-        if apply_lm_head:
-            logits = self.apply_lm_head(outputs.last_hidden_state)
-        aux_loss = None
-        if output_router_logits and outputs.router_logits is not None:
-            aux_loss = auxiliary_load_balancing_loss_func(
+
+        def _aux_loss_fn(outputs, attention_mask):
+            """Custom auxiliary loss for GPT-OSS."""
+            if outputs.router_logits is None or len(outputs.router_logits) == 0:
+                return None
+            return auxiliary_load_balancing_loss_func(
                 gate_logits=outputs.router_logits,
                 num_experts=self.config.num_local_experts,
                 top_k=self.config.num_experts_per_tok,
                 attention_mask=attention_mask,
             )
-            aux_loss = aux_loss * self.config.router_aux_loss_coef
 
-        return MoeCausalLMOutput(
-            aux_loss=aux_loss,
-            logits=logits,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            router_logits=outputs.router_logits,
-            past_key_values=outputs.past_key_values,
+        return self.forward_moe(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            mask_info=mask_info,
+            position_ids=position_ids,
+            mode=mode,
+            past_key_values=past_key_values,
+            cache_metadata=cache_metadata,
+            apply_lm_head=apply_lm_head,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
+            aux_loss_fn=_aux_loss_fn,
         )
-
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
-        """
-        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
-
-    def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
-        return self.model.get_decoder()
-
-    def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        """
-        return self.lm_head
-
-    def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
-        return self.model.get_embedding()
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=GptOssConfig, model_type="gpt_oss")
-class GptOssForSequenceClassification(EasyDeLBaseModule):
+class GptOssForSequenceClassification(BaseSequenceClassificationModule[GptOssModel, GptOssConfig]):  # type: ignore
     """GptOss model with a Sequence Classification head.
 
     This model consists of the base GptOss transformer (`GptOssModel`) followed by a
@@ -929,6 +1026,10 @@ class GptOssForSequenceClassification(EasyDeLBaseModule):
         num_experts (int): Total number of experts.
         num_experts_per_tok (int): Number of experts to route per token.
     """
+
+    _task_type = TaskType.SEQUENCE_CLASSIFICATION
+    _model_type = "gpt_oss"
+    _config_class = GptOssConfig
 
     def __init__(
         self,
@@ -954,67 +1055,50 @@ class GptOssForSequenceClassification(EasyDeLBaseModule):
         """
         super().__init__(
             config=config,
+            base_model_class=GptOssModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = GptOssModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        assert hasattr(config, "num_labels"), (
-            "in order to use `SequenceClassification` Models in `EasyDeL` "
-            "you first need to attach `num_labels` to model `config`"
-        )
-        self.score = ColumnParallelLinear(
-            self.config.hidden_size,
-            config.num_labels,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
+            pooling_strategy="last",
+            score_head_bias=False,
         )
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> SequenceClassifierOutput:
         """Forward pass of the GptOssForSequenceClassification model.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
+            input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
+            inputs_embeds (tp.Optional[Array]): Input embeddings.
                 Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+            attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
                 Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+            position_ids (tp.Optional[Array]): Position indices for the tokens.
                 Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
+            segment_ids (tp.Optional[Array]): Segment IDs (unused).
             output_attentions (tp.Optional[bool]): Whether to return attention weights. Defaults to
                 `config.output_attentions`.
             output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
                 Defaults to `config.output_hidden_states`.
             output_router_logits (tp.Optional[bool]): Whether to return router logits from the MoE layers.
                 Defaults to `config.output_router_logits`.
-            past_key_values (tp.Optional[TransformerCache | PagesCache]):
+            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
                 Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
 
 
         Returns:
@@ -1029,6 +1113,7 @@ class GptOssForSequenceClassification(EasyDeLBaseModule):
         transformer_outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             mode=mode,
             past_key_values=past_key_values,
@@ -1037,7 +1122,6 @@ class GptOssForSequenceClassification(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
             inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
         )
 
         hidden_states = transformer_outputs.last_hidden_state
@@ -1102,3 +1186,7 @@ class GptOssForSequenceClassification(EasyDeLBaseModule):
         Returns the embedding layer of the module.
         """
         return self.model.get_embedding()
+
+    def get_task_head(self):
+        """Returns the sequence classification head."""
+        return self.score

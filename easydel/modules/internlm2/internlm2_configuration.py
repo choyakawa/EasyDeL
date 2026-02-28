@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -91,31 +91,32 @@ class InternLM2Config(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vocab_size=103168,
-        hidden_size=4096,
-        intermediate_size=11008,
-        num_hidden_layers=32,
-        num_attention_heads=32,
-        num_key_value_heads=None,
-        hidden_act="silu",
-        max_position_embeddings=2048,
-        initializer_range=0.02,
-        rms_norm_eps=1e-6,
-        use_cache=True,
-        pad_token_id=0,
-        bos_token_id=1,
-        eos_token_id=2,
-        pretraining_tp=1,
-        tie_word_embeddings=False,
-        bias=True,
-        rope_theta=10000,
-        rope_scaling=None,
+        vocab_size: int = 103168,
+        hidden_size: int = 4096,
+        intermediate_size: int = 11008,
+        num_hidden_layers: int = 32,
+        num_attention_heads: int = 32,
+        num_key_value_heads: int | None = None,
+        hidden_act: str = "silu",
+        max_position_embeddings: int = 2048,
+        initializer_range: float = 0.02,
+        rms_norm_eps: float = 1e-6,
+        use_cache: bool = True,
+        pad_token_id: int = 0,
+        bos_token_id: int = 1,
+        eos_token_id: int = 2,
+        pretraining_tp: int = 1,
+        tie_word_embeddings: bool = False,
+        bias: bool = True,
+        rope_theta: float = 10000,
+        rope_scaling: dict | None = None,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         fcm_min_ratio: float = -1,
         fcm_max_ratio: float = -1,
         scan_mlp_chunk_size: int = 1024,
         bits: int | None = None,
         scan_layers: bool = False,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initializes an InternLM2Config object.
@@ -175,6 +176,9 @@ class InternLM2Config(EasyDeLBaseConfig):
         self.attn_implementation = "eager"
         # HF: AttributeError: 'InternLM2Config' object has no attribute 'attn_implementation'.
         # Did you mean: '_attn_implementation'?
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -184,26 +188,31 @@ class InternLM2Config(EasyDeLBaseConfig):
             bits=bits,
             **kwargs,
         )
+        # Keep legacy InternLM2 remote-code expectation:
+        # `rope_scaling` is a property alias to `rope_parameters` in transformers>=5.
+        # InternLM2 remote-code expects either:
+        #   - None
+        #   - {"type": ..., "factor": ...}
+        if rope_scaling is None:
+            object.__setattr__(self, "rope_parameters", None)
+        elif isinstance(rope_scaling, dict):
+            legacy_rope_scaling = dict(rope_scaling)
+            if "rope_type" in legacy_rope_scaling and "type" not in legacy_rope_scaling:
+                legacy_rope_scaling["type"] = legacy_rope_scaling["rope_type"]
+            object.__setattr__(self, "rope_parameters", legacy_rope_scaling)
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"tok_embeddings/embedding", pmag.resolve(ColumnWise)),
-            (r"attention/wqkv/kernel", pmag.resolve(ColumnWise)),
-            (r"attention/wo/kernel", pmag.resolve(RowWise)),
-            (r"feed_forward/(w1|w3)/kernel", pmag.resolve(ColumnWise)),
-            (r"feed_forward/w2/kernel", pmag.resolve(RowWise)),
-            (r".*/(attention_norm|ffn_norm|norm)/kernel", pmag.resolve(Replicated)),
-            (r"output/kernel", pmag.resolve(ColumnWise)),
-            (r"score/kernel", pmag.resolve(RowWise)),
-            (r".*/(wqkv|wo|w1|w3|w2|output|score)/bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
     @property
     def granted_freq_max_position_embedding(self) -> int:

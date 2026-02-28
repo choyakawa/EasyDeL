@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,8 +16,8 @@
 import typing
 from numbers import Number
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
 from jax import numpy as jnp
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -38,6 +38,8 @@ def make_divisible(
     Returns:
         new_v: new divisible value
     """
+    if divisor is None:
+        divisor = 8
     if min_value is None:
         min_value = divisor
     new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
@@ -128,7 +130,12 @@ class OpenELMConfig(EasyDeLBaseConfig):
     """
 
     model_type: str = "openelm"
-    attribute_map: typing.ClassVar = {"tie_word_embedding": "share_input_output_layers"}
+    attribute_map: typing.ClassVar = {
+        "hidden_size": "model_dim",
+        "num_hidden_layers": "num_transformer_layers",
+        "max_position_embeddings": "max_context_length",
+        "tie_word_embeddings": "share_input_output_layers",
+    }
 
     def __init__(
         self,
@@ -139,7 +146,7 @@ class OpenELMConfig(EasyDeLBaseConfig):
         head_dim: int = 128,
         qkv_multipliers: Number | list[Number] = 1.0,
         num_query_heads: int | None = None,
-        num_gqa_groups: int = 1,
+        num_gqa_groups: int | None = 1,
         ffn_multipliers: Number | list[Number] = 4.0,
         ffn_with_glu: bool = True,
         ffn_dim_divisor: int = 256,
@@ -158,6 +165,7 @@ class OpenELMConfig(EasyDeLBaseConfig):
         use_scan_mlp: bool = False,
         scan_mlp_chunk_size: int = 1024,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """The __init__ function is called when the class is instantiated.
@@ -225,6 +233,9 @@ class OpenELMConfig(EasyDeLBaseConfig):
         self.gradient_checkpointing = gradient_checkpointing
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_transformer_layers
 
         super().__init__(
             bos_token_id=bos_token_id,
@@ -236,30 +247,18 @@ class OpenELMConfig(EasyDeLBaseConfig):
         )
         self.__post_init__()
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"token_embeddings/embedding", pmag.resolve(ColumnWise)),
-            (r"attn/qkv_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"attn/out_proj/kernel", pmag.resolve(RowWise)),
-            (r"attn/(q_norm|k_norm)/kernel", pmag.resolve(Replicated)),
-            (r"attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"ffn/proj_1/kernel", pmag.resolve(ColumnWise)),
-            (r"ffn/proj_2/kernel", pmag.resolve(RowWise)),
-            (r"ffn/.*proj/bias", pmag.resolve(Replicated)),
-            (r".*/(attn_norm|ffn_norm|norm)/kernel", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"lm_head/bias", pmag.resolve(Replicated)),
-            (r"classifier/kernel", pmag.resolve(ColumnWise)),
-            (r"classifier/bias", pmag.resolve(Replicated)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
     def __post_init__(self) -> None:
         """Performs post-initialization checks and calculations.
@@ -276,10 +275,11 @@ class OpenELMConfig(EasyDeLBaseConfig):
         else:
             head_multiple_of = 2
 
+        qkv_multipliers = self.qkv_multipliers
         if isinstance(self.qkv_multipliers, Number):
             # All attention layers have the same latent dimensions, resulting in uniform allocation of parameters.
             qkv_dim = make_divisible(
-                self.model_dim * self.qkv_multipliers,  # type:ignore
+                self.model_dim * self.qkv_multipliers,
                 divisor=self.head_dim * head_multiple_of,
             )
             query_dims = [int(qkv_dim)] * self.num_transformer_layers
@@ -330,9 +330,9 @@ class OpenELMConfig(EasyDeLBaseConfig):
                     )
                 ]
             else:
-                assert (
-                    len(self.ffn_multipliers) == self.num_transformer_layers
-                ), f"{len(self.ffn_multipliers)=}!={self.num_transformer_layers=}"
+                assert len(self.ffn_multipliers) == self.num_transformer_layers, (
+                    f"{len(self.ffn_multipliers)=}!={self.num_transformer_layers=}"
+                )
         else:
             raise NotImplementedError(
                 f"FFN multipliers should be a single number or a list containing exactly two numbers. "

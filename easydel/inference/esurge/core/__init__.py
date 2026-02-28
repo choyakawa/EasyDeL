@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -56,6 +56,7 @@ from .interface import (
     FullAttentionSpec,
     MambaSpec,
     SlidingWindowSpec,
+    create_kv_cache_specs_from_config,
 )
 from .manager import CacheManager, CachePages
 from .page_pool import PagePool
@@ -88,4 +89,5 @@ __all__ = (
     "SlidingWindowManager",
     "SlidingWindowSpec",
     "UnitaryCacheCoordinator",
+    "create_kv_cache_specs_from_config",
 )

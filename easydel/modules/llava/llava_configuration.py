@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 import typing
 
 from eformer.loggings import get_logger
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config, registry
@@ -42,7 +43,7 @@ class LlavaConfig(EasyDeLBaseConfig):
             The config object or dictionary of the vision backbone.
         text_config (`Union[AutoConfig, dict]`, *optional*, defaults to `LlamaConfig`):
             The config object or dictionary of the text backbone.
-        image_token_index (`int`, *optional*, defaults to 32000):
+        image_token_id (`int`, *optional*, defaults to 32000):
             The image token index to encode the image prompt.
         projector_hidden_act (`str`, *optional*, defaults to `"gelu"`):
             The activation function used by the multimodal projector.
@@ -64,17 +65,17 @@ class LlavaConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vision_config=None,
-        text_config=None,
-        image_token_index=32000,
-        projector_hidden_act="gelu",
-        vision_feature_select_strategy="default",
-        vision_feature_layer=-2,
-        image_seq_length=576,
-        multimodal_projector_bias=True,
+        vision_config: dict | EasyDeLBaseConfig | None = None,
+        text_config: dict | EasyDeLBaseConfig | None = None,
+        image_token_id: int = 32000,
+        projector_hidden_act: str = "gelu",
+        vision_feature_select_strategy: str = "default",
+        vision_feature_layer: int | list[int] = -2,
+        image_seq_length: int = 576,
+        multimodal_projector_bias: bool = True,
         **kwargs,
     ):
-        self.image_token_index = image_token_index
+        self.image_token_id = image_token_id
         self.projector_hidden_act = projector_hidden_act
         self.image_seq_length = image_seq_length
 
@@ -117,22 +118,15 @@ class LlavaConfig(EasyDeLBaseConfig):
 
         super().__init__(**kwargs)
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for distributed training by combining the partition rules
-        from both the text and vision configurations.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
 
-        This method retrieves the partition rules from the text_config and vision_config
-        components and combines them to create a comprehensive set of rules for the entire
-        multimodal model.
-
-        Args:
-            *args: Variable length argument list to be passed to the text and vision configs.
-            **kwargs: Arbitrary keyword arguments to be passed to the text and vision configs.
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
 
         Returns:
-            tuple: A combined tuple of partition rules from both text and vision configurations.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        tp = self.text_config.get_partition_rules(*args, **kwargs)
-        vp = self.vision_config.get_partition_rules(*args, **kwargs)
-        return tp + vp
+        return None

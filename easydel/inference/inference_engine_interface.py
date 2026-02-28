@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,18 +29,23 @@ Classes:
 from __future__ import annotations
 
 import asyncio
+import json
 import time
+import traceback
 import typing as tp
+import uuid
 from abc import ABC, abstractmethod
+from collections import OrderedDict
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from http import HTTPStatus
 
 import uvicorn
 from eformer.loggings import get_logger
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -50,7 +55,9 @@ from .openai_api_modules import (
     ChatCompletionResponse,
     CompletionRequest,
     CompletionResponse,
+    DeltaMessage,
     FunctionCallFormat,
+    ResponsesRequest,
 )
 from .sampling_params import SamplingParams
 
@@ -61,7 +68,7 @@ TIMEOUT_KEEP_ALIVE = 5.0
 logger = get_logger("InferenceApiServer")
 
 
-class ServerStatus(str, Enum):
+class ServerStatus(StrEnum):
     """Server status enumeration.
 
     Represents the operational state of an inference server.
@@ -179,6 +186,14 @@ class BaseInferenceApiServer(ABC):
         server_name: str = "EasyDeL Inference API Server",
         server_description: str = "High-performance inference server with OpenAI API compatibility",
         server_version: str = "2.0.0",
+        enable_auth_ui: bool = True,
+        max_concurrent_generations: int | None = None,
+        overload_message: str = "Server is busy, please try again later",
+        enable_response_store: bool = True,
+        default_store_responses: bool = True,
+        max_stored_responses: int = 10_000,
+        max_stored_conversations: int = 1_000,
+        response_store_client: tp.Any | None = None,
     ) -> None:
         """
         Initialize the base inference API server.
@@ -194,6 +209,14 @@ class BaseInferenceApiServer(ABC):
             server_name: Name of the server for FastAPI app
             server_description: Description of the server
             server_version: Version of the server
+            enable_auth_ui: Enable "Authorize" button in /docs for API key input
+            max_concurrent_generations: Maximum concurrent inference jobs allowed. ``None`` disables the limiter.
+            overload_message: Custom error message returned when all generation slots are busy.
+            enable_response_store: Enable in-memory storage for /v1/responses conversation state.
+            default_store_responses: Default value for the Responses API ``store`` flag when omitted.
+            max_stored_responses: Maximum stored response objects (LRU evicted).
+            max_stored_conversations: Maximum stored conversation histories (LRU evicted).
+            response_store_client: Optional external store client (for example a ZMQ worker client).
         """
         self.thread_pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="inference-worker")
         self.max_request_size = max_request_size
@@ -204,13 +227,50 @@ class BaseInferenceApiServer(ABC):
         self._request_lock = asyncio.Lock()
         self.enable_function_calling = enable_function_calling
         self.default_function_format = default_function_format
+        self._overload_message = overload_message
+
+        max_slots = 0
+        if max_concurrent_generations is not None:
+            try:
+                max_slots = int(max_concurrent_generations)
+            except (TypeError, ValueError):
+                max_slots = 0
+        self._max_generation_slots = max(0, max_slots)
+        self._generation_slots: asyncio.Queue[int] | None = None
+        if self._max_generation_slots > 0:
+            self._generation_slots = asyncio.Queue(self._max_generation_slots)
+            for slot in range(self._max_generation_slots):
+                self._generation_slots.put_nowait(slot)
+
+        self._enable_response_store = bool(enable_response_store)
+        self._default_store_responses = bool(default_store_responses)
+        self._max_stored_responses = max(0, int(max_stored_responses))
+        self._max_stored_conversations = max(0, int(max_stored_conversations))
+        self._stored_responses: OrderedDict[str, dict[str, tp.Any]] = OrderedDict()
+        self._stored_conversations: OrderedDict[str, list[dict[str, tp.Any]]] = OrderedDict()
+        self._response_store_lock = asyncio.Lock()
+        self._response_store_client = response_store_client
+
+        swagger_ui_init_oauth = None
+        if enable_auth_ui:
+            swagger_ui_init_oauth = {
+                "clientId": "swagger-ui",
+                "appName": "Swagger UI",
+                "usePkceWithAuthorizationCodeGrant": True,
+            }
 
         self.app = FastAPI(
             title=server_name,
             description=server_description,
             version=server_version,
             lifespan=self._lifespan,
+            swagger_ui_init_oauth=swagger_ui_init_oauth,
         )
+
+        # Add security schemes to OpenAPI schema if auth UI is enabled
+        if enable_auth_ui:
+            self.app.openapi_schema = None  # Reset to regenerate
+            self._configure_openapi_security()
 
         if enable_cors:
             self._setup_cors(cors_origins)
@@ -253,6 +313,55 @@ class BaseInferenceApiServer(ABC):
         """
         pass
 
+    def _configure_openapi_security(self) -> None:
+        """Configure OpenAPI security schemes for API key authentication.
+
+        Adds security scheme definitions to the OpenAPI schema, which enables
+        the "Authorize" button in the /docs UI. Users can enter their API key
+        via Bearer token (Authorization header) or X-API-Key header.
+        """
+
+        def custom_openapi():
+            if self.app.openapi_schema:
+                return self.app.openapi_schema
+
+            from fastapi.openapi.utils import get_openapi
+
+            openapi_schema = get_openapi(
+                title=self.app.title,
+                version=self.app.version,
+                description=self.app.description,
+                routes=self.app.routes,
+            )
+
+            # Define security schemes
+            openapi_schema["components"]["securitySchemes"] = {
+                "BearerAuth": {
+                    "type": "http",
+                    "scheme": "bearer",
+                    "bearerFormat": "API Key",
+                    "description": "Enter your API key as a Bearer token (e.g., `sk-...`)",
+                },
+                "ApiKeyAuth": {
+                    "type": "apiKey",
+                    "in": "header",
+                    "name": "X-API-Key",
+                    "description": "Enter your API key in the X-API-Key header",
+                },
+            }
+
+            # Apply security globally to all endpoints (optional, can be overridden per endpoint)
+            # This makes the "Authorize" button appear in the UI
+            openapi_schema["security"] = [
+                {"BearerAuth": []},
+                {"ApiKeyAuth": []},
+            ]
+
+            self.app.openapi_schema = openapi_schema
+            return self.app.openapi_schema
+
+        self.app.openapi = custom_openapi
+
     def _setup_cors(self, origins: list[str] | None) -> None:
         """Setup CORS middleware.
 
@@ -280,7 +389,7 @@ class BaseInferenceApiServer(ABC):
         """
 
         @self.app.middleware("http")
-        async def add_request_id(request: Request, call_next):
+        async def add_request_id(request: Request, call_next):  # pyright: ignore[reportUnusedFunction]
             """Add unique request ID to each request."""
             request_id = f"req_{int(time.time() * 1000000)}"
             request.state.request_id = request_id
@@ -297,7 +406,7 @@ class BaseInferenceApiServer(ABC):
                     self._active_requests.discard(request_id)
 
         @self.app.middleware("http")
-        async def track_metrics(request: Request, call_next):
+        async def track_metrics(request: Request, call_next):  # pyright: ignore[reportUnusedFunction]
             """Track request metrics."""
             self.metrics.total_requests += 1
 
@@ -316,49 +425,126 @@ class BaseInferenceApiServer(ABC):
 
     @property
     def _endpoints(self) -> list[EndpointConfig]:
-        """Define all API endpoints."""
+        """Define all API endpoints.
+
+        The base server exposes a predictable suite of OpenAI-compatible
+        endpoints, so this list acts as the single source of truth for route
+        registration. Subclasses rarely need to override individual routes;
+        instead they can extend or prune the list by overriding the property and
+        composing additional :class:`EndpointConfig` entries. Keeping the
+        definitions centralized also makes it easier to document the surface
+        area of a deployment, since API docs, middleware, and monitoring only
+        have to inspect one place to understand which handlers exist.
+
+        Each entry intentionally captures the handler callable, HTTP verbs,
+        documentation metadata, and optional response model. This mirrors the
+        arguments passed to ``FastAPI.add_api_route`` and prevents drift between
+        declarative configuration and runtime state. By standardizing this
+        schema we can build tooling (for example automated smoke tests or
+        changelog generators) that iterate through the endpoints without having
+        to introspect the FastAPI app directly.
+        """
         return [
+            EndpointConfig(
+                path="/v1/responses",
+                handler=self.responses,
+                methods=["POST"],
+                tags=["Responses"],
+                summary=(
+                    "Unified OpenAI Responses API endpoint. This is the modern surface that "
+                    "replaces legacy completions for most clients and can represent text, "
+                    "tool calls, and multimodal inputs in a single schema.\n\n"
+                    "Servers may choose to implement this directly, or translate it to "
+                    "`/v1/chat/completions` internally."
+                ),
+            ),
             EndpointConfig(
                 path="/v1/chat/completions",
                 handler=self.chat_completions,
                 methods=["POST"],
                 tags=["Chat"],
-                summary="Create a chat completion",
+                summary=(
+                    "Submit a conversation expressed as OpenAI-style chat messages and "
+                    "receive assistant turns that honor streaming, function calling, and"
+                    "token usage accounting. The endpoint mirrors the semantics of the "
+                    "OpenAI Chat Completions API so existing SDKs and client libraries can"
+                    "drop in without translation.\n\n"
+                    "Use this route whenever you need multi-turn context, tool invocation,"
+                    "or delta streaming—Simple text prompts should go through the plain"
+                    "completions endpoint below."
+                ),
             ),
             EndpointConfig(
                 path="/v1/completions",
                 handler=self.completions,
                 methods=["POST"],
                 tags=["Completions"],
-                summary="Create a completion",
+                summary=(
+                    "Generate text from a raw prompt without chat scaffolding. This matches"
+                    "OpenAI's legacy completion API and is ideal for single-turn tasks such"
+                    "as template expansion, summarization, or logit probing.\n\n"
+                    "Clients receive either a full response object or a text/event-stream"
+                    "when `stream=true`, making it a minimal surface for classic prompt"
+                    "engineering workloads."
+                ),
             ),
             EndpointConfig(
                 path="/health",
                 handler=self.health_check,
                 methods=["GET"],
                 tags=["Health"],
-                summary="Comprehensive health check",
+                summary=(
+                    "Lightweight health probe that reports server status, uptime, active"
+                    "request counts, and model metadata. Load balancers and orchestrators"
+                    "can call this endpoint to decide whether a replica should receive"
+                    "traffic.\n\n"
+                    "The payload is intentionally human-readable so operators can curl the"
+                    "route during incidents and immediately understand whether the server"
+                    "is READY, BUSY, or encountering errors."
+                ),
             ),
             EndpointConfig(
                 path="/v1/models",
                 handler=self.list_models,
                 methods=["GET"],
                 tags=["Models"],
-                summary="List available models",
+                summary=(
+                    "Enumerate every model the server has loaded along with ownership,"
+                    "capabilities, and tokenizer limits. The response mirrors the OpenAI"
+                    "`/v1/models` schema so existing tooling (CLI, dashboards, SDKs) can"
+                    "introspect deployments without custom code.\n\n"
+                    "Call this endpoint when building control planes or auditing which"
+                    "models are exposed to end users."
+                ),
             ),
             EndpointConfig(
                 path="/v1/models/{model_id}",
                 handler=self.get_model,
                 methods=["GET"],
                 tags=["Models"],
-                summary="Get model details",
+                summary=(
+                    "Return detailed metadata for a specific model ID, including tokenizer"
+                    "capabilities, architecture hints, and server ownership information."
+                    "Use this to confirm feature support (e.g., chat templates or tool"
+                    "calling) before dispatching a request.\n\n"
+                    "The payload is stable enough to cache in control planes or config"
+                    "UIs that need to display per-model characteristics."
+                ),
             ),
             EndpointConfig(
                 path="/metrics",
                 handler=self.get_metrics,
                 methods=["GET"],
                 tags=["Monitoring"],
-                summary="Get server metrics",
+                summary=(
+                    "Expose aggregated counters covering request throughput, success and"
+                    "failure rates, generated tokens, and authentication statistics."
+                    "Intended for SRE dashboards, autoscalers, or simple cron-based"
+                    "reporting scripts.\n\n"
+                    "Because it shares the same authorization story as model endpoints,"
+                    "operators can lock down who may read metrics without punching holes"
+                    "in infrastructure firewalls."
+                ),
             ),
         ]
 
@@ -421,22 +607,688 @@ class BaseInferenceApiServer(ABC):
         resolved_tools = []
         if request.tools is not None:
             for tool in request.tools:
-                resolved_tools.append(tool.function.model_dump())
+                tool_payload: dict[str, tp.Any] | None = None
+                if hasattr(tool, "function") and hasattr(tool.function, "model_dump"):
+                    candidate = tool.function.model_dump()
+                    if isinstance(candidate, dict):
+                        tool_payload = candidate
+                elif isinstance(tool, dict):
+                    function_payload = tool.get("function")
+                    if isinstance(function_payload, dict):
+                        tool_payload = function_payload
+                if tool_payload is not None:
+                    resolved_tools.append(tool_payload)
         if len(resolved_tools) == 0:
             return None
         return resolved_tools
 
-    # Abstract methods that must be implemented by subclasses
+    def _mark_stream_failure(self) -> None:
+        """Adjust metrics when a streaming response fails after headers are sent."""
+
+        if self.metrics.successful_requests > 0:
+            self.metrics.successful_requests -= 1
+        self.metrics.failed_requests += 1
+
+    @staticmethod
+    def _compute_delta_text(current_text: str, previous_text: str, fallback_delta: str) -> str:
+        """Compute delta text by comparing accumulated text.
+
+        Prevents token loss under concurrent streaming by computing delta from
+        full accumulated text rather than relying on potentially incomplete
+        ``delta_text`` values supplied by an inference engine.
+        """
+
+        current_text = current_text or ""
+        previous_text = previous_text or ""
+        fallback_delta = fallback_delta or ""
+
+        if current_text.startswith(previous_text):
+            # If accumulated text did not grow, emit nothing. Replaying fallback
+            # deltas here can duplicate previously streamed content.
+            delta_text = current_text[len(previous_text) :]
+        else:
+            if not current_text and previous_text and not fallback_delta:
+                # Some tool parsers retroactively strip protocol markup, causing
+                # content snapshots to collapse to empty. Treat this as a
+                # no-op delta instead of warning every token tick.
+                return ""
+            max_overlap = min(len(previous_text), len(current_text))
+            for overlap in range(max_overlap, 0, -1):
+                if previous_text.endswith(current_text[:overlap]):
+                    return current_text[overlap:]
+            if len(current_text) < len(previous_text):
+                # Parser normalization can rewrite previous snapshots into a
+                # shorter canonical form. Suppress warnings in this benign case.
+                if fallback_delta and not previous_text.endswith(fallback_delta):
+                    return fallback_delta
+                return ""
+            if previous_text:
+                logger.warning(
+                    "Accumulated text doesn't start with previous text. "
+                    "prev_len=%s, curr_len=%s. This may indicate state corruption or generation reset.",
+                    len(previous_text),
+                    len(current_text),
+                )
+            delta_text = fallback_delta or current_text
+
+        if not delta_text and not previous_text:
+            delta_text = current_text
+
+        return delta_text
+
+    @asynccontextmanager
+    async def _acquire_generation_slot(self) -> AsyncIterator[None]:
+        """Acquire a generation slot or raise HTTP 503 when the server is saturated."""
+
+        queue = self._generation_slots
+        if queue is None:
+            yield
+            return
+
+        try:
+            token = queue.get_nowait()
+        except asyncio.QueueEmpty as e:
+            raise HTTPException(status_code=HTTPStatus.SERVICE_UNAVAILABLE, detail=self._overload_message) from e
+
+        try:
+            yield
+        finally:
+            try:
+                queue.put_nowait(token)
+            except asyncio.QueueFull:
+                logger.warning("Generation slot queue overfilled while releasing token")
+
+    def _start_stream_task(
+        self,
+        stream_fn: tp.Callable[[], Iterator[tp.Any]],
+    ) -> asyncio.Queue[tuple[str, tp.Any]]:
+        """Run blocking ``stream_fn`` in a worker thread and push results to an asyncio queue."""
+
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[tuple[str, tp.Any]] = asyncio.Queue()
+
+        def _producer() -> None:
+            try:
+                for output in stream_fn():
+                    asyncio.run_coroutine_threadsafe(queue.put(("data", output)), loop).result()
+            except Exception as exc:
+                exc.__stream_producer_traceback__ = traceback.format_exc()
+                asyncio.run_coroutine_threadsafe(queue.put(("error", exc)), loop).result()
+            finally:
+                asyncio.run_coroutine_threadsafe(queue.put(("end", None)), loop).result()
+
+        self.thread_pool.submit(_producer)
+        return queue
+
+    @staticmethod
+    def _normalize_conversation_id(value: tp.Any) -> str | None:
+        """Extract a conversation ID from request payload."""
+
+        if isinstance(value, str):
+            return value.strip() or None
+        if isinstance(value, dict):
+            conv_id = value.get("id") or value.get("conversation_id") or value.get("conversation")
+            if isinstance(conv_id, str):
+                return conv_id.strip() or None
+        return None
+
+    @staticmethod
+    def _lru_set(store: OrderedDict[str, tp.Any], key: str, value: tp.Any, max_size: int) -> None:
+        store[key] = value
+        store.move_to_end(key)
+        if max_size <= 0:
+            store.clear()
+            return
+        while len(store) > max_size:
+            store.popitem(last=False)
+
+    @staticmethod
+    def _conversation_from_messages(
+        messages: list[dict[str, tp.Any]],
+        assistant_turn: str | dict[str, tp.Any],
+    ) -> list[dict[str, tp.Any]]:
+        """Create conversation items (excluding ``instructions``) for storage."""
+
+        history = list(messages)
+        if isinstance(assistant_turn, dict):
+            history.append(assistant_turn)
+        else:
+            history.append({"role": "assistant", "content": assistant_turn})
+        return history
+
+    @staticmethod
+    def _responses_reasoning_summary_requested(payload: dict[str, tp.Any]) -> bool:
+        """Return True when reasoning summaries should be emitted in output items.
+
+        Behavior is default-on for local OpenAI-mock parity goals and can be
+        explicitly disabled using ``reasoning=False`` or
+        ``reasoning.summary`` values like ``"none"``/``false``.
+        """
+
+        include = payload.get("include")
+        if isinstance(include, list):
+            for entry in include:
+                if not isinstance(entry, str):
+                    continue
+                normalized = entry.strip().lower()
+                if normalized == "reasoning" or normalized.startswith("reasoning.summary"):
+                    return True
+
+        reasoning = payload.get("reasoning")
+        if isinstance(reasoning, bool):
+            return reasoning
+        if isinstance(reasoning, dict):
+            summary = reasoning.get("summary")
+            if summary is None:
+                return True
+            if isinstance(summary, bool):
+                return summary
+            if isinstance(summary, str):
+                normalized = summary.strip().lower()
+                return normalized not in {"", "none", "off", "disabled", "false", "0", "null"}
+            return summary is not None
+        return True
+
+    @staticmethod
+    def _responses_payload_to_messages(
+        payload: dict[str, tp.Any],
+        *,
+        include_instructions: bool = False,
+    ) -> list[dict[str, tp.Any]]:
+        """Convert OpenAI Responses API payload into OpenAI-style chat messages.
+
+        Notes:
+            - ``instructions`` is treated as an ephemeral system message. By default we do
+              not include it in the returned message list so it won't be persisted when
+              implementing multi-turn state via ``previous_response_id``.
+        """
+
+        messages: list[dict[str, tp.Any]] = []
+
+        if include_instructions:
+            instructions = payload.get("instructions")
+            if isinstance(instructions, str) and instructions.strip():
+                messages.append({"role": "system", "content": instructions})
+
+        if isinstance(payload.get("messages"), list):
+            messages.extend(tp.cast(list[dict[str, tp.Any]], payload["messages"]))
+        else:
+            input_value = payload.get("input")
+            if isinstance(input_value, str):
+                messages.append({"role": "user", "content": input_value})
+            elif isinstance(input_value, list):
+                if all(isinstance(item, dict) and "role" in item for item in input_value):
+                    messages.extend(tp.cast(list[dict[str, tp.Any]], input_value))
+                elif all(isinstance(item, dict) and "type" in item for item in input_value):
+                    for item in tp.cast(list[dict[str, tp.Any]], input_value):
+                        item_type = str(item.get("type", "")).strip().lower()
+                        if item_type == "message":
+                            role = item.get("role")
+                            role_value = str(role).strip() if isinstance(role, str) and role.strip() else "user"
+                            messages.append({"role": role_value, "content": item.get("content", "")})
+                            continue
+
+                        if item_type == "function_call_output":
+                            call_id = item.get("call_id") or item.get("tool_call_id") or item.get("id")
+                            output_value = item.get("output")
+                            if output_value is None:
+                                output_value = item.get("content")
+
+                            if isinstance(output_value, (dict, list)):
+                                output_text = json.dumps(output_value, ensure_ascii=False)
+                            elif output_value is None:
+                                output_text = ""
+                            else:
+                                output_text = str(output_value)
+
+                            tool_msg: dict[str, tp.Any] = {"role": "tool", "content": output_text}
+                            if call_id is not None:
+                                tool_msg["tool_call_id"] = str(call_id)
+                            messages.append(tool_msg)
+                            continue
+
+                        if item_type in {"input_text", "output_text", "text"}:
+                            text_value = item.get("text")
+                            if text_value is None:
+                                text_value = item.get("content", "")
+                            messages.append({"role": "user", "content": str(text_value)})
+                            continue
+
+                        messages.append({"role": "user", "content": item})
+                else:
+                    messages.append({"role": "user", "content": input_value})
+            elif input_value is not None:
+                messages.append({"role": "user", "content": str(input_value)})
+
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            normalized_parts: list[dict[str, tp.Any]] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    normalized_parts.append({"type": "text", "text": str(part)})
+                    continue
+                part_type = part.get("type")
+                if part_type in {"input_text", "output_text"}:
+                    normalized_parts.append({"type": "text", "text": part.get("text", part.get("content", ""))})
+                elif part_type == "text":
+                    normalized_parts.append({"type": "text", "text": part.get("text", "")})
+                elif part_type == "input_image":
+                    image_url = part.get("image_url") or part.get("image") or part.get("url")
+                    if image_url is not None:
+                        normalized_parts.append({"type": "image_url", "image_url": image_url})
+                elif part_type == "input_video":
+                    video = part.get("video")
+                    if video is not None:
+                        normalized_parts.append({"type": "video", "video": video})
+                else:
+                    normalized_parts.append(part)
+            msg["content"] = normalized_parts
+
+        return messages
+
+    @staticmethod
+    def _flatten_messages_to_text(messages: list[dict[str, tp.Any]]) -> list[dict[str, tp.Any]]:
+        """Collapse content arrays into plain text for tool parsing and templating."""
+
+        flattened: list[dict[str, tp.Any]] = []
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                text_parts: list[str] = []
+                for part in content:
+                    if isinstance(part, dict):
+                        part_type = part.get("type")
+                        if part_type in ("text", "input_text"):
+                            text_parts.append(str(part.get("text", "")))
+                flattened.append({**msg, "content": " ".join(part_text for part_text in text_parts if part_text)})
+            else:
+                flattened.append(msg)
+        return flattened
+
+    @staticmethod
+    def _extract_responses_tools(payload: dict[str, tp.Any]) -> tuple[list[dict[str, tp.Any]] | None, list[dict] | None]:
+        """Return (raw_tools, tools_for_chat_template) from a Responses payload."""
+
+        raw_tools = payload.get("tools") or payload.get("functions")
+        if not isinstance(raw_tools, list) or not raw_tools:
+            return None, None
+
+        tools_for_template: list[dict] = []
+        for tool in raw_tools:
+            if not isinstance(tool, dict):
+                continue
+            fn = tool.get("function")
+            if isinstance(fn, dict):
+                tools_for_template.append(fn)
+            elif isinstance(tool, dict):
+                tools_for_template.append(tool)
+
+        return tp.cast(list[dict[str, tp.Any]], raw_tools), tools_for_template or None
+
+    def _infer_sequence_length_from_engine(self, engine: tp.Any | None = None) -> int:
+        """Infer maximum sequence length from the engine or fall back to 128 tokens."""
+
+        if engine is not None and getattr(engine, "max_model_len", None):
+            try:
+                return int(engine.max_model_len)
+            except (TypeError, ValueError):
+                pass
+        return 128
+
+    def _parse_responses_max_tokens(self, payload: dict[str, tp.Any], engine: tp.Any | None) -> tuple[int, int | None]:
+        """Return (requested_tokens_for_auth, max_tokens_for_sampling)."""
+
+        raw_value = payload.get("max_output_tokens")
+        if raw_value is None:
+            raw_value = payload.get("max_tokens")
+        if raw_value is None:
+            raw_value = payload.get("max_completion_tokens")
+
+        if raw_value is None:
+            return self._infer_sequence_length_from_engine(engine), None
+
+        try:
+            parsed = int(raw_value)
+        except (TypeError, ValueError):
+            return self._infer_sequence_length_from_engine(engine), None
+
+        if parsed < 0:
+            return self._infer_sequence_length_from_engine(engine), None
+
+        return parsed, parsed or None
+
+    @staticmethod
+    def _create_sampling_params_from_responses(payload: dict[str, tp.Any], max_tokens: int | None) -> SamplingParams:
+        """Translate a Responses API payload into SamplingParams."""
+
+        temperature = payload.get("temperature", 1.0)
+        top_p = payload.get("top_p", 1.0)
+
+        try:
+            temperature_f = float(temperature)
+        except (TypeError, ValueError):
+            temperature_f = 1.0
+        temperature_f = max(0.0, min(temperature_f, 2.0))
+
+        try:
+            top_p_f = float(top_p)
+        except (TypeError, ValueError):
+            top_p_f = 1.0
+
+        stop = payload.get("stop")
+        n = payload.get("n", 1)
+
+        raw_top_k = payload.get("top_k")
+        try:
+            top_k = int(raw_top_k) if raw_top_k is not None else 0
+        except (TypeError, ValueError):
+            top_k = 0
+        if top_k < 0:
+            top_k = 0
+
+        return SamplingParams(
+            max_tokens=max_tokens,
+            temperature=temperature_f,
+            top_p=top_p_f,
+            presence_penalty=float(payload.get("presence_penalty", 0.0) or 0.0),
+            frequency_penalty=float(payload.get("frequency_penalty", 0.0) or 0.0),
+            repetition_penalty=float(payload.get("repetition_penalty", 1.0) or 1.0),
+            top_k=top_k,
+            min_p=float(payload.get("min_p", 0.0) or 0.0),
+            n=int(n or 1),
+            stop=stop,
+        )
+
+    @staticmethod
+    def _build_responses_reasoning_item(reasoning_text: str) -> dict[str, tp.Any]:
+        return {
+            "id": f"rs_{uuid.uuid4().hex}",
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": reasoning_text}],
+        }
+
+    @staticmethod
+    def _build_responses_function_call_items(tool_calls: list[tp.Any] | None) -> list[dict[str, tp.Any]]:
+        if not tool_calls:
+            return []
+
+        items: list[dict[str, tp.Any]] = []
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                continue
+
+            name = function.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+
+            arguments = function.get("arguments", "")
+            if isinstance(arguments, (dict, list)):
+                arguments_text = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+            else:
+                arguments_text = "" if arguments is None else str(arguments)
+
+            call_id = tool_call.get("id") or tool_call.get("call_id")
+            if not isinstance(call_id, str) or not call_id:
+                call_id = f"call_{uuid.uuid4().hex}"
+
+            items.append(
+                {
+                    "id": f"fc_{uuid.uuid4().hex}",
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments_text,
+                    "status": "completed",
+                }
+            )
+        return items
+
+    @staticmethod
+    def _build_responses_message_item(output_text: str) -> dict[str, tp.Any]:
+        return {
+            "id": f"msg_{uuid.uuid4().hex}",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "annotations": [], "logprobs": [], "text": output_text}],
+            "status": "completed",
+        }
+
+    @classmethod
+    def _build_responses_output_items(
+        cls,
+        *,
+        output_text: str,
+        tool_calls: list[tp.Any] | None = None,
+        reasoning_text: str | None = None,
+        include_reasoning_summary: bool = False,
+    ) -> list[dict[str, tp.Any]]:
+        items: list[dict[str, tp.Any]] = []
+        if include_reasoning_summary and isinstance(reasoning_text, str) and reasoning_text.strip():
+            items.append(cls._build_responses_reasoning_item(reasoning_text))
+        items.extend(cls._build_responses_function_call_items(tool_calls))
+        items.append(cls._build_responses_message_item(output_text))
+        return items
+
+    @staticmethod
+    def _responses_assistant_message_from_output_items(
+        output_items: list[dict[str, tp.Any]],
+    ) -> dict[str, tp.Any]:
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, tp.Any]] = []
+
+        for item in output_items:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+
+            if item_type == "message":
+                content = item.get("content")
+                if isinstance(content, list):
+                    for part in content:
+                        if not isinstance(part, dict):
+                            continue
+                        if part.get("type") == "output_text":
+                            text_parts.append(str(part.get("text", "")))
+                elif isinstance(content, str):
+                    text_parts.append(content)
+                continue
+
+            if item_type == "function_call":
+                call_id = item.get("call_id")
+                name = item.get("name")
+                arguments = item.get("arguments", "")
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                if not isinstance(call_id, str) or not call_id:
+                    call_id = f"call_{uuid.uuid4().hex}"
+                tool_calls.append(
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments if isinstance(arguments, str) else ""},
+                    }
+                )
+
+        assistant_message: dict[str, tp.Any] = {"role": "assistant", "content": "".join(text_parts)}
+        if tool_calls:
+            assistant_message["tool_calls"] = tool_calls
+        return assistant_message
+
+    @classmethod
+    def _build_responses_object(
+        cls,
+        *,
+        response_id: str,
+        model: str,
+        output_text: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        tool_calls: list[tp.Any] | None = None,
+        reasoning_text: str | None = None,
+        include_reasoning_summary: bool = False,
+        output_items: list[dict[str, tp.Any]] | None = None,
+    ) -> dict[str, tp.Any]:
+        created_at = int(time.time())
+        if output_items is None:
+            output_items = cls._build_responses_output_items(
+                output_text=output_text,
+                tool_calls=tool_calls,
+                reasoning_text=reasoning_text,
+                include_reasoning_summary=include_reasoning_summary,
+            )
+
+        return {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "model": model,
+            "status": "completed",
+            "output": output_items,
+            "usage": {
+                "input_tokens": int(prompt_tokens),
+                "output_tokens": int(completion_tokens),
+                "total_tokens": int(prompt_tokens) + int(completion_tokens),
+            },
+        }
+
+    @staticmethod
+    def _jsonify_tool_calls(tool_calls: tp.Any) -> list[tp.Any] | None:
+        if not tool_calls:
+            return None
+        if not isinstance(tool_calls, list):
+            return None
+        serialized: list[dict[str, tp.Any]] = []
+        for call in tool_calls:
+            if hasattr(call, "model_dump"):
+                payload = call.model_dump(exclude_unset=True, exclude_none=True)
+                if isinstance(payload, dict):
+                    serialized.append(payload)
+            elif isinstance(call, dict):
+                serialized.append(call)
+        return serialized or None
+
+    @classmethod
+    def _coerce_stream_delta_message(
+        cls,
+        delta_message: tp.Any,
+        *,
+        fallback_text: str = "",
+        default_role: str | None = None,
+    ) -> DeltaMessage | None:
+        """Normalize parser/engine streaming deltas into a safe DeltaMessage."""
+
+        if delta_message is None:
+            return None
+
+        normalized: DeltaMessage | None = None
+        if isinstance(delta_message, DeltaMessage):
+            normalized = delta_message
+        elif isinstance(delta_message, str):
+            normalized = DeltaMessage(content=delta_message)
+        elif isinstance(delta_message, dict):
+            try:
+                normalized = DeltaMessage(**delta_message)
+            except Exception:
+                normalized = None
+        elif hasattr(delta_message, "model_dump"):
+            payload = delta_message.model_dump(exclude_unset=True, exclude_none=True)
+            if isinstance(payload, dict):
+                try:
+                    normalized = DeltaMessage(**payload)
+                except Exception:
+                    normalized = None
+
+        if normalized is None:
+            if fallback_text:
+                normalized = DeltaMessage(content=fallback_text)
+            else:
+                return None
+
+        if default_role and not normalized.role:
+            normalized.role = default_role
+
+        if normalized.content is not None and not isinstance(normalized.content, (str, list)):
+            normalized.content = str(normalized.content)
+        if isinstance(normalized.content, list):
+            normalized.content = [part for part in normalized.content if isinstance(part, dict)] or None
+
+        normalized.tool_calls = cls._jsonify_tool_calls(normalized.tool_calls)
+        return normalized
+
+    @staticmethod
+    def _sse_event(event: str, payload: dict[str, tp.Any]) -> str:
+        return f"event: {event}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
+
+    async def _response_store_get_response(self, response_id: str) -> dict[str, tp.Any] | None:
+        if not self._enable_response_store:
+            return None
+
+        if self._response_store_client is not None:
+            return await asyncio.to_thread(self._response_store_client.get_response, response_id)
+
+        async with self._response_store_lock:
+            return self._stored_responses.get(response_id)
+
+    async def _response_store_put_response(self, response_id: str, record: dict[str, tp.Any]) -> None:
+        if not self._enable_response_store:
+            return
+
+        if self._response_store_client is not None:
+            await asyncio.to_thread(self._response_store_client.put_response, response_id, record)
+            return
+
+        async with self._response_store_lock:
+            self._lru_set(self._stored_responses, response_id, record, self._max_stored_responses)
+
+    async def _response_store_get_conversation(self, conversation_id: str) -> list[dict[str, tp.Any]] | None:
+        if not self._enable_response_store:
+            return None
+
+        if self._response_store_client is not None:
+            return await asyncio.to_thread(self._response_store_client.get_conversation, conversation_id)
+
+        async with self._response_store_lock:
+            return self._stored_conversations.get(conversation_id)
+
+    async def _response_store_put_conversation(
+        self,
+        conversation_id: str,
+        history: list[dict[str, tp.Any]],
+    ) -> None:
+        if not self._enable_response_store:
+            return
+
+        if self._response_store_client is not None:
+            await asyncio.to_thread(self._response_store_client.put_conversation, conversation_id, history)
+            return
+
+        async with self._response_store_lock:
+            self._lru_set(self._stored_conversations, conversation_id, history, self._max_stored_conversations)
+
+    async def responses(self, request: ResponsesRequest, raw_request: Request) -> JSONResponse:
+        """Handle OpenAI Responses API requests (default: not implemented)."""
+        return create_error_response(
+            HTTPStatus.NOT_IMPLEMENTED,
+            "This server does not implement the OpenAI Responses API (/v1/responses).",
+        )
 
     @abstractmethod
     async def chat_completions(
-        self, request: ChatCompletionRequest
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Request,
     ) -> ChatCompletionResponse | StreamingResponse | JSONResponse:
         """
         Handle chat completion requests.
 
         Args:
             request: The chat completion request
+            raw_request: Raw FastAPI request containing headers
 
         Returns:
             Chat completion response (streaming or non-streaming)
@@ -444,12 +1296,17 @@ class BaseInferenceApiServer(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def completions(self, request: CompletionRequest) -> CompletionResponse | StreamingResponse | JSONResponse:
+    async def completions(
+        self,
+        request: CompletionRequest,
+        raw_request: Request,
+    ) -> CompletionResponse | StreamingResponse | JSONResponse:
         """
         Handle completion requests.
 
         Args:
             request: The completion request
+            raw_request: Raw FastAPI request containing headers
 
         Returns:
             Completion response (streaming or non-streaming)
@@ -457,9 +1314,12 @@ class BaseInferenceApiServer(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def health_check(self) -> JSONResponse:
+    async def health_check(self, raw_request: Request) -> JSONResponse:
         """
         Perform comprehensive health check.
+
+        Args:
+            raw_request: Raw FastAPI request containing headers
 
         Returns:
             Health status information
@@ -467,9 +1327,12 @@ class BaseInferenceApiServer(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def get_metrics(self) -> JSONResponse:
+    async def get_metrics(self, raw_request: Request) -> JSONResponse:
         """
         Get server performance metrics.
+
+        Args:
+            raw_request: Raw FastAPI request containing headers
 
         Returns:
             Server metrics information
@@ -477,9 +1340,12 @@ class BaseInferenceApiServer(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def list_models(self) -> JSONResponse:
+    async def list_models(self, raw_request: Request) -> JSONResponse:
         """
         List available models.
+
+        Args:
+            raw_request: Raw FastAPI request containing headers
 
         Returns:
             List of available models with metadata
@@ -487,12 +1353,13 @@ class BaseInferenceApiServer(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def get_model(self, model_id: str) -> JSONResponse:
+    async def get_model(self, model_id: str, raw_request: Request) -> JSONResponse:
         """
         Get detailed information about a specific model.
 
         Args:
             model_id: The model identifier
+            raw_request: Raw FastAPI request containing headers
 
         Returns:
             Model details
@@ -500,9 +1367,12 @@ class BaseInferenceApiServer(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def list_tools(self) -> JSONResponse:
+    async def list_tools(self, raw_request: Request) -> JSONResponse:
         """
         List available tools/functions.
+
+        Args:
+            raw_request: Raw FastAPI request containing headers
 
         Returns:
             Available tools information
@@ -617,9 +1487,6 @@ class BaseInferenceApiServer(ABC):
 
         if ssl_keyfile and ssl_certfile:
             uvicorn_config.update({"ssl_keyfile": ssl_keyfile, "ssl_certfile": ssl_certfile})
-            logger.info(f"Starting HTTPS server on https://{host}:{port}")
-        else:
-            logger.info(f"Starting HTTP server on http://{host}:{port}")
 
         try:
             import uvloop
@@ -638,7 +1505,7 @@ class InferenceEngineAdapter(ABC):
     """
     Abstract adapter interface for different inference engines.
 
-    This allows different inference engines (vSurge, vLLM, TGI, etc.) to be used
+    This allows different inference engines (eSurge, vLLM, TGI, etc.) to be used
     with the same API server interface.
     """
 
@@ -648,7 +1515,7 @@ class InferenceEngineAdapter(ABC):
         prompts: str | list[str],
         sampling_params: SamplingParams,
         stream: bool = False,
-    ) -> list[ReturnSample] | tp.AsyncGenerator[list[ReturnSample], None]:
+    ) -> list[ReturnSample] | AsyncGenerator[list[ReturnSample], None]:
         """
         Generate text from prompts.
 

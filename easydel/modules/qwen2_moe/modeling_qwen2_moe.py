@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,50 +13,88 @@
 # limitations under the License.
 
 
+import typing
 from functools import partial
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
     DecoderLayerOutput,
     MoeCausalLMOutput,
     MoeModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import auto_remat, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
-    TransformerCache,
-    TransformerCacheView,
-    TransformerMetadata,
-)
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.moe import (
+from easydel.infra.utils import auto_remat
+from easydel.layers import (
     BaseMoeModule,
+    ColumnParallelLinear,
     ColumnParallelMoELinear,
+    Embed,
+    MoeFusedHooks,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
+    RowParallelLinear,
     RowParallelMoELinear,
 )
-from easydel.layers.norms import RMSNorm as RMSNorm
-from easydel.modules.qwen2_moe.configuration_qwen2_moe import Qwen2MoeConfig as Qwen2MoeConfig
+from easydel.layers import RMSNorm as RMSNorm
+from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
+
+from .qwen2_moe_configuration import Qwen2MoeConfig
 
 
 class Qwen2MoeMLPStack(nn.Module):
-    """Qwen2Moe MoE MLP using the new ParallelMoELinear layers."""
+    """Mixture of Experts MLP stack module for Qwen2 MoE models.
+
+    Implements the feedforward network used by each expert in the Sparse MoE block.
+    Uses SwiGLU activation with gated projections (gate_proj, up_proj) and a down projection.
+    This class uses ParallelMoELinear layers for efficient expert parallelism.
+    """
+
+    reform_param: typing.ClassVar = {
+        "gate_up_proj$": {
+            "splits": [
+                {
+                    "name": "gate_proj.kernel",
+                    "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2),
+                },
+                {
+                    "name": "up_proj.kernel",
+                    "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2),
+                },
+            ],
+            "inverse_spliter": lambda torch, gate, up: torch.cat(
+                (gate.transpose(-1, -2), up.transpose(-1, -2)),
+                dim=1,
+            ),
+        },
+        "down_proj$": {
+            "splits": [
+                {"name": "down_proj.kernel", "spliter": lambda x: x.swapaxes(-1, -2)},
+            ],
+            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
+        },
+    }
 
     def __init__(
         self,
@@ -66,7 +104,19 @@ class Qwen2MoeMLPStack(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int | None = None,
     ):
+        """Initialize Qwen2 MoE MLP stack block.
+
+        Args:
+            config (Qwen2MoeConfig): Model configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int | None, optional): Index of this layer in the model. Defaults to None.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -79,8 +129,10 @@ class Qwen2MoeMLPStack(nn.Module):
             rngs=rngs,
             kernel_init=nn.initializers.normal(),
             use_bias=False,
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
         )
         self.down_proj = RowParallelMoELinear(
             num_experts=config.num_experts,
@@ -89,8 +141,10 @@ class Qwen2MoeMLPStack(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
         )
         self.up_proj = ColumnParallelMoELinear(
             num_experts=config.num_experts,
@@ -99,28 +153,38 @@ class Qwen2MoeMLPStack(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
         )
         self.act_fn = nn.silu
 
-    def __call__(self, x: chex.Array, group_sizes: chex.Array) -> chex.Array:
-        """Forward pass through MoE MLP."""
-        return self.down_proj(self.act_fn(self.gate_proj(x, group_sizes)) * self.up_proj(x, group_sizes), group_sizes)
+    def __call__(self, x: Array, group_sizes: Array, sorted_experts: Array | None = None) -> Array:
+        """Forward pass through MoE MLP stack.
+
+        Args:
+            x (Array): Input tensor of shape (total_tokens, hidden_size) where total_tokens
+                is the sum of all tokens assigned to each expert.
+            group_sizes (Array): Array of shape (num_experts,) containing the number of tokens
+                assigned to each expert.
+            sorted_experts (Array | None): Optional array containing expert indices in sorted order.
+                Used for efficient expert batching.
+
+        Returns:
+            Array: Output tensor of shape (total_tokens, hidden_size) after MoE MLP transformation.
+        """
+        gate = self.gate_proj(x, group_sizes, sorted_experts)
+        up = self.up_proj(x, group_sizes, sorted_experts)
+        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
 
 
 class Qwen2MoeMLP(nn.Module):
-    """Multi-Layer Perceptron (MLP) block for the Qwen2 MoE model.
+    """Multi-Layer Perceptron module for Qwen2 MoE models.
 
-    Attributes:
-        config (Qwen2MoeConfig): Configuration object for the model.
-        gate_proj (ParallelLinear): Linear layer for the gating mechanism.
-        down_proj (ParallelLinear): Linear layer for down-projection.
-        up_proj (ParallelLinear): Linear layer for up-projection.
-        act_fn (callable): Activation function (SiLU).
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+    Implements the feedforward network with SwiGLU activation function for enhanced
+    representation learning. This MLP is used as the shared expert in the Sparse MoE
+    block, using standard ColumnParallel and RowParallel linear layers.
     """
 
     def __init__(
@@ -133,15 +197,16 @@ class Qwen2MoeMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen2MoeMLP module.
+        """Initialize Qwen2 MoE MLP block.
 
         Args:
-            config (Qwen2MoeConfig): The configuration object for the model.
-            intermediate_size (int): The size of the intermediate layer.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (Qwen2MoeConfig): Model configuration with MLP parameters.
+            intermediate_size (int): Size of the intermediate layer (hidden dimension of MLP).
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -155,7 +220,6 @@ class Qwen2MoeMLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         row_parallel_linear = partial(
             RowParallelLinear,
@@ -165,21 +229,22 @@ class Qwen2MoeMLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.gate_proj = column_parallel_linear(config.hidden_size, intermediate_size, rngs=rngs)
         self.down_proj = row_parallel_linear(intermediate_size, config.hidden_size, rngs=rngs)
         self.up_proj = column_parallel_linear(config.hidden_size, intermediate_size, rngs=rngs)
         self.act_fn = nn.silu
 
-    def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
-        """Forward pass of the MLP block.
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply SwiGLU feedforward transformation.
 
         Args:
-            hidden_states (jnp.ndarray): Input hidden states.
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
 
         Returns:
-            jnp.ndarray: Output hidden states after MLP transformation.
+            Array: Transformed hidden states of shape (batch, seq_len, hidden_dim).
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -197,25 +262,12 @@ class Qwen2MoeMLP(nn.Module):
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class Qwen2MoeAttention(AttentionModule):
-    """Qwen2 MoE Attention module.
+class Qwen2MoeAttention(UnifiedAttention):
+    """Multi-head attention layer with RoPE embeddings and sliding window support for Qwen2 MoE models.
 
-    Attributes:
-        config (Qwen2MoeConfig): Configuration object for the model.
-        hidden_size (int): Dimensionality of the hidden states.
-        head_dim (int): Dimensionality of each attention head.
-        num_key_value_groups (int): Number of groups for key/value heads (for GQA).
-        q_proj (ParallelLinear): Linear layer for query projection.
-        k_proj (ParallelLinear): Linear layer for key projection.
-        v_proj (ParallelLinear): Linear layer for value projection.
-        o_proj (ParallelLinear): Linear layer for output projection.
-        attention_performer (FlexibleAttentionModule): Module for performing attention computation.
-        resid_dropout (nn.Dropout): Dropout layer for residual connections.
-        rotary (RotaryEmbedding): Rotary positional embedding module.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+    Inherits from UnifiedAttention with Qwen2 MoE-specific customizations including
+    optional sliding window attention and custom bias configuration where Q/K/V projections
+    use configurable bias (qkv_bias) while output projection does not use bias.
     """
 
     def __init__(
@@ -226,190 +278,111 @@ class Qwen2MoeAttention(AttentionModule):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
-        """Initializes the Qwen2MoeAttention module.
+        """Initialize Qwen2 MoE attention layer with grouped-query attention and sliding window support.
 
         Args:
-            config (Qwen2MoeConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (Qwen2MoeConfig): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model, used for determining
+                sliding window attention configuration.
         """
-        super().__init__(config=config)
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
 
-        self.hidden_size = config.hidden_size
-        self.head_dim = self.config.hidden_size // self.config.num_attention_heads
-        self.num_key_value_groups = self.config.num_attention_heads // self.config.num_key_value_heads
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+            attention_type="standard",
+            causal=True,
+            sliding_window=config.sliding_window if config.use_sliding_window else None,
+        )
 
-        if self.num_key_value_groups == 1:
-            assert self.config.num_attention_heads == self.config.num_key_value_heads
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        row_parallel_linear = partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        self.q_proj = column_parallel_linear(
+    def _create_q_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Override to use qkv_bias for query projection (Qwen2Moe-specific)."""
+        return ColumnParallelLinear(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
             rngs=rngs,
             use_bias=config.qkv_bias,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
         )
-        self.k_proj = column_parallel_linear(
+
+    def _create_k_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Override to use qkv_bias for key projection (Qwen2Moe-specific)."""
+        return ColumnParallelLinear(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             rngs=rngs,
             use_bias=config.qkv_bias,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
         )
-        self.v_proj = column_parallel_linear(
+
+    def _create_v_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Override to use qkv_bias for value projection (Qwen2Moe-specific)."""
+        return ColumnParallelLinear(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             rngs=rngs,
             use_bias=config.qkv_bias,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
         )
-        self.o_proj = row_parallel_linear(
+
+    def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Override to use bias=False for output projection (Qwen2Moe-specific)."""
+        from easydel.layers import RowParallelLinear
+
+        return RowParallelLinear(
             config.num_attention_heads * self.head_dim,
             config.hidden_size,
             rngs=rngs,
             use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
         )
-        self.sliding_window = config.sliding_window if config.use_sliding_window else None
-        self.attention_performer = FlexibleAttentionModule(
-            rngs=rngs,
-            base_config=self.config,
-            softmax_scale=self.head_dim**-0.5,
-            dropout_prob=config.attention_dropout,
-        )
-        self.resid_dropout = nn.Dropout(rate=config.attention_dropout, rngs=rngs)
-        self.rotary = self.config.get_basic_rope(
+
+    def _create_rotary(self, config: Qwen2MoeConfig, dtype: jnp.dtype):
+        """Create Qwen2Moe-specific rotary embedding layer."""
+        return config.get_basic_rope(
             head_size=config.hidden_size // config.num_attention_heads,
             rotary_dim=config.hidden_size // config.num_attention_heads,
             base=config.rope_theta,
-            dtype=self.dtype,
+            dtype=dtype,
         )
 
-    def __call__(
-        self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
-        output_attentions: bool = False,
-        fcm_mask: chex.Array | None = None,
-        frequencies: chex.Array | None = None,
-    ):
-        """Forward pass of the attention module.
-
-        Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            deterministic (bool): If True, disables dropout for deterministic behavior.
-            init_cache (bool): If True, initializes cache for caching keys and values.
-            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
-        Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
-        """
-        batch_size, sequence_length = hidden_states.shape[:2]
-        query_states, key_states, value_states = (
-            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
-            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
-            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
-        )
-
-        query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        key_states = key_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        value_states = value_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
-
-        (
-            key_states,
-            value_states,
-            attention_mask,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            fcm_mask=fcm_mask,
-            sliding_window=self.sliding_window,
-        )
-
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
-            causal=True,
-            sliding_window=self.sliding_window,
-        )
-
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
-
-        attn_output = self.resid_dropout(attn_output)
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
+    def _create_attention_performer(self, config: Qwen2MoeConfig, rngs: nn.Rngs):
+        """Create attention performer with Qwen2Moe's attention dropout."""
+        return FlexibleAttentionModule(
+            rngs=rngs,
+            base_config=config,
+            softmax_scale=self.head_dim**-0.5,
+            dropout_prob=config.attention_dropout,
         )
 
 
 class Qwen2MoeSparseBlock(BaseMoeModule):
-    """Sparse Mixture of Experts (MoE) block for Qwen2 MoE.
+    """Sparse Mixture of Experts block for Qwen2 MoE models.
 
-    This block routes input hidden states to a selected subset of experts
-    and combines their outputs.
-
-    Attributes:
-        config (Qwen2MoeConfig): Configuration object for the model.
-        gate (ParallelLinear): Linear layer for the gating network.
-        experts (nn.List[Qwen2MoeMLP]): List of expert MLP modules.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+    Implements the sparse MoE layer that routes tokens to a subset of expert MLPs.
+    Uses top-k routing to distribute tokens across experts efficiently. This block
+    also includes a shared expert that processes all tokens alongside the routed experts.
     """
 
     def __init__(
@@ -421,14 +394,15 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen2MoeSparseBlock module.
+        """Initialize Qwen2 MoE Sparse MoE block.
 
         Args:
-            config (Qwen2MoeConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (Qwen2MoeConfig): Model configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -480,101 +454,71 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
             precision=precision,
             rngs=rngs,
         )
+        self.moe_hooks = MoeFusedHooks()
 
-    def _moe_call(
-        self,
-        hidden_state_flat: jax.Array,
-        batch_size: int,
-        seq_len: int,
-        hidden_size: int,
-    ) -> tuple[jax.Array, jax.Array]:
-        """Forward pass of the MoE block."""
-
-        router_logits = self.gate(hidden_state_flat).astype(jnp.float32)
-        routing_weights = jax.nn.softmax(router_logits, axis=-1)
-        selected_weights, selected_experts = self._route(routing_weights)
-        x_repeat_sort, group_sizes, sort_idx = self._permute(hidden_state_flat, selected_experts.reshape(-1))
-        out_repeat_sort = self.experts(x_repeat_sort, group_sizes)
-        out_repeat_unflat = self._unpermute(out_repeat_sort, sort_idx, (batch_size, seq_len, hidden_size))
-        output = jnp.sum(out_repeat_unflat * selected_weights[:, :, None], axis=1)
-
-        return output, router_logits
-
-    def __call__(self, hidden_states: chex.Array) -> tuple[chex.Array, chex.Array]:
+    def __call__(self, hidden_states: Array) -> tuple[Array, Array]:
         """Forward pass of the Sparse MoE block.
 
         Args:
-            hidden_states (chex.Array): Input hidden states (batch_size * sequence_length, hidden_dim).
+            hidden_states (Array): Input hidden states of shape (batch_size, sequence_length, hidden_dim).
 
         Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing:
-                - final_hidden_states (chex.Array): The output hidden states after MoE processing.
-                - router_logits (chex.Array): The logits output by the gating network.
+            tuple[Array, Array]: A tuple containing:
+                - final_hidden_states (Array): Output hidden states of shape (batch_size, sequence_length, hidden_dim)
+                  combining routed expert outputs and shared expert output.
+                - router_logits (Array): Router logits of shape (batch_size * sequence_length, num_experts)
+                  representing the gating scores for each expert.
         """
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-        batch_size, seq_len, hidden_size = hidden_states.shape
-        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+        B, S, H = hidden_states.shape
 
-        out, router_logits = self._moe_call(
-            hidden_state_flat=hidden_states,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            hidden_size=hidden_size,
+        out, router_logits = self.moe_call(
+            hidden_state=hidden_states,
+            gate_layer=self.gate,
+            expert_layer=self.experts,
+            wi_kernel=self.experts.gate_proj.kernel.value,
+            wu_kernel=self.experts.up_proj.kernel.value,
+            wd_kernel=self.experts.down_proj.kernel.value,
+            act_fn=self.experts.act_fn,
+            output_metrics=False,
         )
 
-        shared_expert_output = self.shared_expert(hidden_states)
-        shared_expert_output = jax.nn.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
-        out = out + shared_expert_output
+        hs_flat = hidden_states.reshape(-1, H)
+        shared_out = self.shared_expert(hs_flat)
+        shared_gate = jax.nn.sigmoid(self.shared_expert_gate(hs_flat))
+        shared_out = shared_gate * shared_out
+        shared_out = shared_out.reshape(B, S, H)
+        out = out + shared_out
 
-        return checkpoint_name(out.reshape(batch_size, seq_len, hidden_size), "moe_expert_output"), checkpoint_name(
-            router_logits, "moe_router_logits"
-        )
+        return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
 class Qwen2MoeDecoderLayer(nn.Module):
-    """A single decoder layer for the Qwen2 MoE model.
+    """Single decoder layer for Qwen2 MoE models.
 
-    This layer combines self-attention, a sparse MoE block (or a standard MLP),
-    and residual connections with layer normalization.
-
-    Attributes:
-        config (Qwen2MoeConfig): Configuration object for the model.
-        layer_idx (int): Index of the current layer.
-        self_attn (Qwen2MoeAttention): Self-attention module.
-        mlp (Qwen2MoeSparseBlock | Qwen2MoeMLP): MoE block or standard MLP.
-        input_layernorm (RMSNorm): Layer normalization applied before self-attention.
-        post_attention_layernorm (RMSNorm): Layer normalization applied after self-attention and
-            before the MLP/MoE block.
-        dropout_rng_key (str): Name of the RNG key for dropout.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+    Combines multi-head attention with optional sliding window and Sparse MoE feedforward
+    networks (or standard MLP for certain layers), using RMS normalization and residual
+    connections.
     """
 
     def __init__(
         self,
         config: Qwen2MoeConfig,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
-        """Initializes the Qwen2MoeDecoderLayer module.
+        """Initialize Qwen2 MoE decoder layer.
 
         Args:
-            config (Qwen2MoeConfig): The configuration object for the model.
-            layer_idx (int): The index of the current layer.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (Qwen2MoeConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
         """
         self.config = config
         self.layer_idx = layer_idx
@@ -602,6 +546,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
         self.mlp = mlp_block(
@@ -628,54 +573,52 @@ class Qwen2MoeDecoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo,
+        position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
-        fcm_mask: chex.Array | None = None,
-        frequencies: chex.Array | None = None,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> DecoderLayerOutput:
         """Forward pass of the decoder layer.
 
         Args:
-            hidden_states (chex.Array): Input hidden states (batch, seq_len, hidden_size).
-            attention_mask (chex.Array): Attention mask (batch, 1, seq_len, kv_seq_len).
-            position_ids (chex.Array): Position IDs (batch, seq_len).
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView]): Cache view for
-                key/value states (optional).
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for
-                paged attention (optional).
-            output_attentions (bool): Whether to output attention weights (default: False).
-            output_router_logits (bool): Whether to output router logits (default: False).
-            fcm_mask (tp.Optional[chex.Array]): Forward causal mask (FCM) mask (optional).
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequencies (optional).
+            hidden_states (Float[Array, "batch seq_len hidden_dim"]): Input hidden states of shape
+                (batch_size, sequence_length, hidden_size).
+            mask_info (MaskInfo): Attention mask information containing causal mask and padding mask details.
+            position_ids (Int[Array, "batch seq_len"]): Position indices for each token of shape
+                (batch_size, sequence_length).
+            mode (common_types.RUNTIME_MODE_TYPES): Runtime mode (train, decode, or prefill) controlling
+                attention implementation.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None): View into the KV cache for
+                efficient inference. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None):
+                Metadata for paged attention operations. Defaults to None.
+            output_attentions (bool): Whether to return attention weights. Defaults to False.
+            output_router_logits (bool): Whether to return router logits from MoE layers. Defaults to False.
+            frequencies (Float[Array, "seq_len head_dim"] | None): Precomputed RoPE frequencies. If None,
+                computed on-the-fly. Defaults to None.
 
         Returns:
-            DecoderLayerOutput: A tuple containing:
-                - hidden_states (chex.Array): Output hidden states after the decoder layer.
-                - attention_outputs (chex.Array): Attention weights (if `output_attentions` is True).
-                - router_logits (tp.Optional[chex.Array]): Router logits (if `output_router_logits` is
-                    True and it's an MoE layer).
+            DecoderLayerOutput: Named tuple containing:
+                - hidden_states (Array): Output hidden states of shape (batch_size, sequence_length, hidden_size).
+                - attention_weight (Array | None): Attention weights of shape
+                  (batch_size, num_heads, sequence_length, kv_sequence_length) if output_attentions=True.
+                - router_logits (Array | None): Router logits of shape (batch_size * sequence_length, num_experts)
+                  if output_router_logits=True and this is an MoE layer.
+                - cache_view (TransformerCacheView | RaggedPagesCacheView | None): Updated cache view.
         """
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
-            attention_mask,
+            mask_info,
             position_ids,
-            causal_mask,
             mode,
             cache_view,
             cache_metadata,
-            segment_ids,
             output_attentions,
-            fcm_mask,
             frequencies,
         )
         hidden_states = checkpoint_name(hidden_states + attn_outputs.attention_output, "residual")
@@ -702,21 +645,18 @@ class Qwen2MoeDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Qwen2MoeConfig, model_type="qwen2_moe")
 class Qwen2MoeModel(EasyDeLBaseModule):
-    """The base Qwen2 MoE transformer model.
+    """The base Qwen2 MoE model transformer.
 
-    This class implements the core transformer architecture, including embedding layers,
-    decoder layers, and final normalization.
+    This class represents the core transformer architecture of the Qwen2 MoE model,
+    consisting of an embedding layer, multiple Qwen2MoeDecoderLayer layers (with sparse MoE),
+    and a final layer normalization. It features optional sliding window attention,
+    shared experts, and configurable decoder sparse steps.
 
     Attributes:
         config (Qwen2MoeConfig): Configuration object for the model.
-        embed_tokens (nn.Embed): Embedding layer for input tokens.
-        layers (nn.List[Qwen2MoeDecoderLayer]): List of decoder layers.
-        norm (RMSNorm): Final layer normalization.
-        gradient_checkpointing (str): Gradient checkpointing strategy.
-        dtype (jnp.dtype): Data type for computations.
+        dtype (jnp.dtype): Data type for computation.
         param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
     """
 
     def __init__(
@@ -728,14 +668,14 @@ class Qwen2MoeModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen2MoeModel module.
+        """Initialize Qwen2 MoE base model.
 
         Args:
-            config (Qwen2MoeConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (Qwen2MoeConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -745,13 +685,7 @@ class Qwen2MoeModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             config.vocab_size,
             config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -759,17 +693,19 @@ class Qwen2MoeModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = [
-            Qwen2MoeDecoderLayer(
-                config=config,
-                layer_idx=layer_idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for layer_idx in range(self.config.num_hidden_layers)
-        ]
+        self.layers = nn.List(
+            [
+                Qwen2MoeDecoderLayer(
+                    config=config,
+                    layer_idx=layer_idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for layer_idx in range(self.config.num_hidden_layers)
+            ]
+        )
 
         self.norm = RMSNorm(
             self.config.hidden_size,
@@ -780,43 +716,56 @@ class Qwen2MoeModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeModelOutput:
         """Forward pass of the Qwen2 MoE model.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs (batch, seq_len). Mutually exclusive with
-                `inputs_embeds`.
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings (batch, seq_len, hidden_size). Mutually
-                exclusive with `input_ids`.
-            attention_mask (tp.Optional[chex.Array]): Attention mask (batch, seq_len). Usually used for padding tokens.
-            position_ids (tp.Optional[chex.Array]): Position IDs (batch, seq_len). If None, automatically generated.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (tp.Optional[bool]): Whether to output attention weights (default defined by config).
-            output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all layers
-                (default defined by config).
-            output_router_logits (tp.Optional[bool]): Whether to output router logits (default defined by config).
-            past_key_values (tp.Optional[TransformerCache | PagesCache]): Precomputed key/value states
-                for caching.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for
-                paged attention (optional).
+            input_ids (Int[Array, "batch seq_len"] | None): Input token IDs of shape (batch_size, sequence_length).
+                Mutually exclusive with `inputs_embeds`. Defaults to None.
+            inputs_embeds (Float[Array, "batch seq_len hidden_dim"] | None): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Mutually exclusive with `input_ids`. Defaults to None.
+            attention_mask (Bool[Array, "batch seq_len"] | None): Attention mask of shape (batch_size, sequence_length)
+                indicating which tokens should be attended to (1) and which should be ignored (0). Defaults to None.
+            mask_info (MaskInfo | None): Precomputed mask information. If provided, overrides `attention_mask`.
+                Defaults to None.
+            position_ids (Int[Array, "batch seq_len"] | None): Position indices of shape (batch_size, sequence_length).
+                If None, automatically generated as consecutive integers. Defaults to None.
+            output_attentions (bool | None): Whether to return attention weights for all layers. If None, uses
+                config.output_attentions. Defaults to None.
+            output_hidden_states (bool | None): Whether to return hidden states for all layers. If None, uses
+                config.output_hidden_states. Defaults to None.
+            output_router_logits (bool | None): Whether to return router logits from MoE layers. If None, uses
+                config.output_router_logits. Defaults to None.
+            mode (common_types.RUNTIME_MODE_TYPES | None): Runtime mode controlling attention implementation.
+                Automatically inferred if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None): Cached key/value states
+                from previous forward passes for efficient autoregressive generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None): Metadata for
+                paged attention operations. Defaults to None.
+            apply_lm_head (bool): Whether to apply the language model head (unused in base model). Defaults to True.
 
         Returns:
-            MoeModelOutput: The model output.
+            MoeModelOutput: Named tuple containing:
+                - last_hidden_state (Array): Final hidden states of shape (batch_size, sequence_length, hidden_size).
+                - hidden_states (tuple[Array, ...] | None): Hidden states from all layers if output_hidden_states=True.
+                - attentions (tuple[Array, ...] | None): Attention weights from all layers if output_attentions=True.
+                - router_logits (tuple[Array, ...] | None): Router logits from all MoE layers if output_router_logits=True.
+                - past_key_values (TransformerCache | RaggedPagesCache | HybridCache): Updated KV cache.
 
         Raises:
-            ValueError: If both `input_ids` and `inputs_embeds` are provided or neither is provided.
+            ValueError: If both `input_ids` and `inputs_embeds` are provided or if neither is provided.
         """
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits
@@ -838,21 +787,19 @@ class Qwen2MoeModel(EasyDeLBaseModule):
         all_hidden_states = ()
         all_router_logits = ()
         all_self_attns = ()
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-        else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         if mode is None:
             mode = (
@@ -874,10 +821,8 @@ class Qwen2MoeModel(EasyDeLBaseModule):
 
             layer_outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 position_ids=position_ids,
-                causal_mask=self.causal_mask,
-                segment_ids=segment_ids,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
@@ -936,21 +881,23 @@ class Qwen2MoeModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=Qwen2MoeConfig, model_type="qwen2_moe")
-class Qwen2MoeForCausalLM(EasyDeLBaseModule):
-    """Qwen2 MoE model with a Causal Language Modeling (CLM) head.
+class Qwen2MoeForCausalLM(BaseCausalLMModule[Qwen2MoeModel, Qwen2MoeConfig]):  # type: ignore
+    """Qwen2 MoE model with a language modeling head for causal language modeling tasks.
 
-    This class wraps the base `Qwen2MoeModel` and adds a linear layer (language model head)
-    to predict the next token logits.
+    This model is a sparse MoE transformer-based language model with causal attention masks
+    and optional sliding window attention applied to perform autoregressive language generation.
+    It includes both routed experts and shared experts for improved model capacity.
 
     Attributes:
-        config (Qwen2MoeConfig): Configuration object for the model.
-        model (Qwen2MoeModel): The base Qwen2 MoE model.
-        lm_head (ParallelLinear): The language model head (linear layer).
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+        config (Qwen2MoeConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
     """
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "qwen2_moe"
+    _config_class = Qwen2MoeConfig
 
     def __init__(
         self,
@@ -961,173 +908,126 @@ class Qwen2MoeForCausalLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen2MoeForCausalLM module.
+        """Initialize Qwen2 MoE model for causal language modeling.
 
         Args:
-            config (Qwen2MoeConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (Qwen2MoeConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
+            base_model_class=Qwen2MoeModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = Qwen2MoeModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            lm_head_bias=False,
+            router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
-        """Forward pass of the Qwen2 MoE model for Causal Language Modeling.
+        """Forward pass of the Qwen2MoeForCausalLM model.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs (batch, seq_len). Mutually exclusive
-                with `inputs_embeds`.
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings (batch, seq_len, hidden_size). Mutually
-                exclusive with `input_ids`.
-            attention_mask (tp.Optional[chex.Array]): Attention mask (batch, seq_len). Usually used for padding tokens.
-            position_ids (tp.Optional[chex.Array]): Position IDs (batch, seq_len). If None, automatically generated.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (tp.Optional[bool]): Whether to output attention weights (default defined by config).
-            output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all layers
-                (default defined by config).
-            output_router_logits (tp.Optional[bool]): Whether to output router logits (default defined by config).
-            past_key_values (tp.Optional[TransformerCache | PagesCache]): Precomputed key/value states
-                for caching.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged
-                attention (optional).
+            input_ids (Int[Array, "batch seq_len"] | None): Input token IDs of shape (batch_size, sequence_length).
+                Mutually exclusive with `inputs_embeds`. Defaults to None.
+            inputs_embeds (Float[Array, "batch seq_len hidden_dim"] | None): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Mutually exclusive with `input_ids`. Defaults to None.
+            attention_mask (Bool[Array, "batch seq_len"] | None): Attention mask of shape (batch_size, sequence_length).
+                Defaults to None.
+            mask_info (MaskInfo | None): Precomputed mask information. Defaults to None.
+            position_ids (Int[Array, "batch seq_len"] | None): Position indices of shape (batch_size, sequence_length).
+                Defaults to None.
+            output_attentions (bool | None): Whether to return attention weights. Defaults to None.
+            output_hidden_states (bool | None): Whether to return hidden states. Defaults to None.
+            output_router_logits (bool | None): Whether to return router logits from MoE layers. Defaults to None.
+            mode (common_types.RUNTIME_MODE_TYPES | None): Runtime mode. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None): Cached KV states. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None): Cache metadata.
+                Defaults to None.
+            apply_lm_head (bool): Whether to apply language modeling head to compute logits. Defaults to True.
 
         Returns:
-            MoeCausalLMOutput: The model output, including logits, hidden states, attentions, and router logits.
+            MoeCausalLMOutput: Named tuple containing:
+                - logits (Array): Language modeling logits of shape (batch_size, sequence_length, vocab_size).
+                - aux_loss (Array | None): Auxiliary load balancing loss for MoE routing.
+                - past_key_values (TransformerCache | RaggedPagesCache | HybridCache): Updated KV cache.
+                - hidden_states (tuple[Array, ...] | None): All hidden states if output_hidden_states=True.
+                - attentions (tuple[Array, ...] | None): All attention weights if output_attentions=True.
+                - router_logits (tuple[Array, ...] | None): All router logits if output_router_logits=True.
         """
-        if output_router_logits is None:
-            output_router_logits = self.config.output_router_logits
-        if output_hidden_states is None:
-            output_hidden_states = self.config.output_hidden_states
-        if output_attentions is None:
-            output_attentions = self.config.output_attentions
-        outputs = self.model(
+        return self.forward_moe(
             input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            output_router_logits=output_router_logits,
+            attention_mask=attention_mask,
+            mask_info=mask_info,
+            position_ids=position_ids,
             mode=mode,
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
-            segment_ids=segment_ids,
-        )
-        hidden_states = outputs.last_hidden_state
-
-        logits = None
-        if apply_lm_head:
-            logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
-
-        aux_loss = None
-        if output_router_logits and outputs.router_logits is not None:
-            aux_loss = auxiliary_load_balancing_loss_func(
-                gate_logits=outputs.router_logits,
-                num_experts=self.config.num_experts,
-                top_k=self.config.num_experts_per_tok,
-                attention_mask=attention_mask,
-            )
-            aux_loss += aux_loss * self.config.router_aux_loss_coef
-
-        return MoeCausalLMOutput(
-            aux_loss=aux_loss,
-            logits=logits,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            router_logits=outputs.router_logits,
-            past_key_values=outputs.past_key_values,
+            apply_lm_head=apply_lm_head,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
+            aux_loss_fn=self._compute_aux_loss,
         )
 
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
-        """
-        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+    def _compute_aux_loss(self, outputs, attention_mask):
+        """Compute auxiliary load balancing loss from router logits.
 
-    def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
-        return self.model.get_decoder()
+        Args:
+            outputs: Model outputs containing router_logits from MoE layers.
+            attention_mask: Attention mask to exclude padding tokens from loss computation.
 
-    def get_lm_head(self):
+        Returns:
+            Optional auxiliary loss value for load balancing, or None if router_logits unavailable.
         """
-        Returns the language model head of the module.
-        """
-        return self.lm_head
-
-    def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
-        return self.model.get_embedding()
+        if outputs.router_logits is None or len(outputs.router_logits) == 0:
+            return None
+        aux_loss = auxiliary_load_balancing_loss_func(
+            gate_logits=outputs.router_logits,
+            num_experts=self.config.num_experts,
+            top_k=self.config.num_experts_per_tok,
+            attention_mask=attention_mask,
+        )
+        return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Qwen2MoeConfig, model_type="qwen2_moe")
-class Qwen2MoeForSequenceClassification(EasyDeLBaseModule):
-    """Qwen2 MoE model with a sequence classification head.
+class Qwen2MoeForSequenceClassification(BaseSequenceClassificationModule[Qwen2MoeModel, Qwen2MoeConfig]):  # type: ignore
+    """Qwen2 MoE model for sequence classification tasks.
 
-    This class wraps the base `Qwen2MoeModel` and adds a linear layer on top
-    to perform sequence classification tasks.
+    This class extends the base Qwen2 MoE model by adding a linear classification head
+    to perform sequence classification tasks such as sentiment analysis or text classification.
 
     Attributes:
-        config (Qwen2MoeConfig): Configuration object for the model.
-        model (Qwen2MoeModel): The base Qwen2 MoE model.
-        score (ParallelLinear): The sequence classification head (linear layer).
+        config (Qwen2MoeConfig): Configuration for the model.
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+        precision: Precision setting for JAX operations.
     """
+
+    _task_type = TaskType.SEQUENCE_CLASSIFICATION
+    _model_type = "qwen2_moe"
+    _config_class = Qwen2MoeConfig
 
     def __init__(
         self,
@@ -1138,54 +1038,37 @@ class Qwen2MoeForSequenceClassification(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen2MoeForSequenceClassification module.
+        """Initialize Qwen2 MoE model for sequence classification.
 
         Args:
-            config (Qwen2MoeConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (Qwen2MoeConfig): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
+            base_model_class=Qwen2MoeModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = Qwen2MoeModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        assert hasattr(config, "num_labels"), (
-            "in order to use `SequenceClassification` Models in `EasyDeL` "
-            "you first need to attach `num_labels` to model `config`"
-        )
-        self.score = ColumnParallelLinear(
-            self.config.hidden_size,
-            config.num_labels,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
+            pooling_strategy="last",
+            score_head_bias=False,
         )
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -1193,27 +1076,35 @@ class Qwen2MoeForSequenceClassification(EasyDeLBaseModule):
         """Forward pass of the Qwen2 MoE model for sequence classification.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs (batch, seq_len). Mutually
-                exclusive with `inputs_embeds`.
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings (batch, seq_len, hidden_size).
-                Mutually exclusive with `input_ids`.
-            attention_mask (tp.Optional[chex.Array]): Attention mask (batch, seq_len). Usually used for padding tokens.
-            position_ids (tp.Optional[chex.Array]): Position IDs (batch, seq_len). If None, automatically generated.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            past_key_values (tp.Optional[TransformerCache | PagesCache]): Precomputed key/value states for
-                caching (ignored in classification).
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention
-                (ignored in classification).
-            output_attentions (tp.Optional[bool]): Whether to output attention weights (default defined by config).
-            output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all layers
-                (default defined by config).
+            input_ids (Int[Array, "batch seq_len"] | None): Input token IDs of shape (batch_size, sequence_length).
+                Mutually exclusive with `inputs_embeds`. Defaults to None.
+            inputs_embeds (Float[Array, "batch seq_len hidden_dim"] | None): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Mutually exclusive with `input_ids`. Defaults to None.
+            attention_mask (Bool[Array, "batch seq_len"] | None): Attention mask of shape (batch_size, sequence_length).
+                Defaults to None.
+            mask_info (MaskInfo | None): Precomputed mask information. Defaults to None.
+            position_ids (Int[Array, "batch seq_len"] | None): Position indices of shape (batch_size, sequence_length).
+                Defaults to None.
+            mode (common_types.RUNTIME_MODE_TYPES | None): Runtime mode. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None): Cached KV states (ignored
+                in classification). Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None): Cache metadata
+                (ignored in classification). Defaults to None.
+            apply_lm_head (bool): Unused in classification. Defaults to True.
+            output_attentions (bool | None): Whether to return attention weights. Defaults to None.
+            output_hidden_states (bool | None): Whether to return hidden states. Defaults to None.
 
         Returns:
-           SequenceClassifierOutput: The model output, including classification logits, hidden states, and attentions.
+            SequenceClassifierOutput: Named tuple containing:
+                - logits (Array): Classification logits of shape (batch_size, num_labels) pooled from the last token.
+                - past_key_values (TransformerCache | RaggedPagesCache | HybridCache): Updated KV cache.
+                - hidden_states (tuple[Array, ...] | None): All hidden states if output_hidden_states=True.
+                - attentions (tuple[Array, ...] | None): All attention weights if output_attentions=True.
         """
         transformer_outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             mode=mode,
             past_key_values=past_key_values,
@@ -1221,7 +1112,6 @@ class Qwen2MoeForSequenceClassification(EasyDeLBaseModule):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
         )
 
         hidden_states = transformer_outputs.last_hidden_state
@@ -1276,3 +1166,7 @@ class Qwen2MoeForSequenceClassification(EasyDeLBaseModule):
         Returns the embedding layer of the module.
         """
         return self.model.get_embedding()
+
+    def get_task_head(self):
+        """Returns the sequence classification head."""
+        return self.score

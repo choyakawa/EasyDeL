@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 
 import typing
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -139,37 +139,38 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vocab_size=262_208,
-        hidden_size=2304,
-        intermediate_size=9216,
-        num_hidden_layers=26,
-        num_attention_heads=8,
-        num_key_value_heads=4,
-        head_dim=256,
-        hidden_activation="gelu_pytorch_tanh",
-        max_position_embeddings=131_072,
-        initializer_range=0.02,
-        rms_norm_eps=1e-6,
-        use_cache=True,
-        pad_token_id=0,
-        eos_token_id=1,
-        bos_token_id=2,
-        tie_word_embeddings=True,
-        rope_theta=1_000_000.0,
-        attention_bias=False,
-        attention_dropout=0.0,
-        query_pre_attn_scalar=256,
-        sliding_window=4096,
-        final_logit_softcapping=None,
-        attn_logit_softcapping=None,
-        cache_implementation="hybrid",
-        rope_scaling=None,
-        rope_local_base_freq=10_000.0,
-        sliding_window_pattern=6,
+        vocab_size: int = 262_208,
+        hidden_size: int = 2304,
+        intermediate_size: int | None = 9216,
+        num_hidden_layers: int = 26,
+        num_attention_heads: int = 8,
+        num_key_value_heads: int = 4,
+        head_dim: int = 256,
+        hidden_activation: str = "gelu_pytorch_tanh",
+        max_position_embeddings: int = 131_072,
+        initializer_range: float = 0.02,
+        rms_norm_eps: float = 1e-6,
+        use_cache: bool = True,
+        pad_token_id: int = 0,
+        eos_token_id: int = 1,
+        bos_token_id: int = 2,
+        tie_word_embeddings: bool = True,
+        rope_theta: float = 1_000_000.0,
+        attention_bias: bool = False,
+        attention_dropout: float = 0.0,
+        query_pre_attn_scalar: int = 256,
+        sliding_window: int = 4096,
+        final_logit_softcapping: float | None = None,
+        attn_logit_softcapping: float | None = None,
+        cache_implementation: str = "hybrid",
+        rope_scaling: dict | None = None,
+        rope_local_base_freq: float = 10_000.0,
+        sliding_window_pattern: int = 6,
         layer_types: list[str] | None = None,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
         scan_layers: bool = False,
+        use_bidirectional_attention: bool = False,
         **kwargs,
     ):
         """The __init__ function is called when the class is instantiated.
@@ -214,43 +215,51 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
         self.rope_local_base_freq = rope_local_base_freq
         self.sliding_window_pattern = sliding_window_pattern
         self.layer_types = layer_types
-
+        self.use_bidirectional_attention = use_bidirectional_attention
+        if use_bidirectional_attention:
+            self.sliding_window = (self.sliding_window // 2) + 1
         if self.layer_types is None:
             self.layer_types = [
                 "sliding_attention" if bool((i + 1) % self.sliding_window_pattern) else "full_attention"
                 for i in range(self.num_hidden_layers)
             ]
         self.rope_scaling = rope_scaling
+        full_attention_rope_params: dict[str, typing.Any] = {
+            "rope_type": "default",
+            "rope_theta": self.rope_theta,
+        }
+        if isinstance(self.rope_scaling, dict):
+            full_attention_rope_params.update(self.rope_scaling)
+        if "type" in full_attention_rope_params and "rope_type" not in full_attention_rope_params:
+            full_attention_rope_params["rope_type"] = full_attention_rope_params["type"]
+        full_attention_rope_params.setdefault("type", full_attention_rope_params["rope_type"])
+        full_attention_rope_params.setdefault("rope_theta", self.rope_theta)
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+        # Gemma3 uses per-layer RoPE settings: local base for sliding attention,
+        # global (optionally scaled) RoPE for full attention.
+        rope_parameters: dict[str, dict[str, typing.Any]] = {}
+        layer_type_set = set(self.layer_types)
+        if "sliding_attention" in layer_type_set:
+            rope_parameters["sliding_attention"] = {
+                "rope_type": "default",
+                "rope_theta": self.rope_local_base_freq,
+            }
+        if "full_attention" in layer_type_set:
+            rope_parameters["full_attention"] = full_attention_rope_params
+        self.rope_parameters = rope_parameters
+
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"self_attn/(q_norm|k_norm)/kernel", pmag.resolve(Replicated)),
-            (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            (
-                r".*(input_layernorm|post_attention_layernorm|pre_feedforward_layernorm|post_feedforward_layernorm|norm)/kernel",
-                pmag.resolve(Replicated),
-            ),
-            (r"vision_tower/.*", pmag.resolve(Replicated)),
-            (r"multi_modal_projector/mm_input_projection_weight", pmag.resolve(ColumnWise)),
-            (r"multi_modal_projector/mm_soft_emb_norm/kernel", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"language_model/lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"score/kernel", pmag.resolve(RowWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
         """Retrieve attention mask details for each layer in the model.
@@ -366,13 +375,15 @@ class Gemma3Config(EasyDeLBaseConfig):
 
         super().__init__(**kwargs)
 
-    def get_partition_rules(self, *args, **kwargs):
-        """Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
 
         Returns:
-          Tuple[Tuple[str, PartitionSpec]]: A tuple of tuples, where each inner tuple contains a regex pattern
-          matching parameter names and the corresponding PartitionSpec for sharding those parameters across devices.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        text_partitions = self.text_config.get_partition_rules(*args, **kwargs)
-        vision_partitions = self.vision_config.get_partition_rules(*args, **kwargs)
-        return text_partitions + vision_partitions
+        return None

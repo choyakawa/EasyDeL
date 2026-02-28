@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -88,28 +88,28 @@ class Gemma2Config(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vocab_size=256000,
-        hidden_size=3072,
-        intermediate_size=24576,
-        num_hidden_layers=28,
-        num_attention_heads=16,
-        num_key_value_heads=16,
-        head_dim=256,
-        hidden_activation="gelu_pytorch_tanh",
-        max_position_embeddings=8192,
-        initializer_range=0.02,
-        rms_norm_eps=1e-6,
-        use_cache=True,
-        pad_token_id=0,
-        eos_token_id=1,
-        bos_token_id=2,
-        tie_word_embeddings=True,
-        rope_theta=10000.0,
-        attention_bias=False,
-        attention_dropout=0.0,
-        final_logit_softcapping=30.0,
-        query_pre_attn_scalar=224,
-        sliding_window=4096,
+        vocab_size: int = 256000,
+        hidden_size: int = 3072,
+        intermediate_size: int | None = 24576,
+        num_hidden_layers: int = 28,
+        num_attention_heads: int = 16,
+        num_key_value_heads: int = 16,
+        head_dim: int = 256,
+        hidden_activation: str = "gelu_pytorch_tanh",
+        max_position_embeddings: int = 8192,
+        initializer_range: float = 0.02,
+        rms_norm_eps: float = 1e-6,
+        use_cache: bool = True,
+        pad_token_id: int = 0,
+        eos_token_id: int = 1,
+        bos_token_id: int = 2,
+        tie_word_embeddings: bool = True,
+        rope_theta: float = 10000.0,
+        attention_bias: bool = False,
+        attention_dropout: float = 0.0,
+        final_logit_softcapping: float = 30.0,
+        query_pre_attn_scalar: int = 224,
+        sliding_window: int = 4096,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         layer_types: list[str] | None = None,
         bits: int | None = None,
@@ -117,11 +117,6 @@ class Gemma2Config(EasyDeLBaseConfig):
         attn_logit_softcapping: bool | None = None,
         **kwargs,
     ):
-        """The __init__ function is called when the class is instantiated.
-        It sets up the attributes of an object, which are sometimes called fields or properties.
-        The __init__ function can accept arguments, but self must be the first one.
-        """
-
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
         self.scan_layers = scan_layers
@@ -163,30 +158,18 @@ class Gemma2Config(EasyDeLBaseConfig):
         self.cache_implementation = "hybrid"
         self.attn_logit_softcapping = attn_logit_softcapping
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            (
-                r".*(input_layernorm|post_attention_layernorm|pre_feedforward_layernorm|post_feedforward_layernorm|norm)/kernel",
-                pmag.resolve(Replicated),
-            ),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"score/kernel", pmag.resolve(RowWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
         """Retrieve attention mask details for each layer in the model.

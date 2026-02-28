@@ -58,7 +58,7 @@ Let's see this with the complete, runnable script you provided. This script perf
 ### The PEFT/LoRA Script for SFT
 
 ```python
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 # ... (license header) ...
 
 import os
@@ -140,7 +140,7 @@ def main():
     arguments = ed.SFTConfig(
         num_train_epochs=1,
         total_batch_size=total_batch_size,
-        max_sequence_length=max_length,
+        max_length=max_length,
         learning_rate=1e-5, # LoRA can sometimes use a higher LR, e.g., 1e-4
         use_wandb=WANDB_ENTITY is not None,
         wandb_entity=WANDB_ENTITY,

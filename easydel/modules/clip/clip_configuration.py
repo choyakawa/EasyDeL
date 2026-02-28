@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,6 @@
 
 import typing
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
 from eformer.loggings import get_logger
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -24,56 +23,7 @@ logger = get_logger(__name__)
 
 
 def _get_partition_rules(self, *arg, **kwargs):
-    """Generic partition rules for CLIP text and vision models.
-
-    Args:
-            self: The configuration object (unused but part of method signature).
-            *arg: Additional positional arguments (unused).
-            **kwargs: Additional keyword arguments (unused).
-
-    Returns:
-            Tuple: A tuple of partition rules for model parameters.
-    """
-    pmag = self.partition_manager  # Handles resolving strategies
-    return (
-        # 1. Text Embeddings
-        (r"text_model/embeddings/token_embedding/embedding", pmag.resolve(ColumnWise)),
-        (r"text_model/embeddings/position_embedding/embedding", pmag.resolve(ColumnWise)),
-        (r"vision_model/embeddings/class_embedding", pmag.resolve(Replicated)),
-        (r"vision_model/embeddings/patch_embedding/kernel", pmag.resolve(ColumnWise)),
-        (r"vision_model/embeddings/patch_embedding/bias", pmag.resolve(Replicated)),
-        (r"vision_model/embeddings/position_embedding/embedding", pmag.resolve(ColumnWise)),
-        (
-            r"(text|vision)_model/encoder/layers/\d+/self_attn/(q_proj|k_proj|v_proj)/kernel",
-            pmag.resolve(ColumnWise),
-        ),
-        (
-            r"(text|vision)_model/encoder/layers/\d+/self_attn/out_proj/kernel",
-            pmag.resolve(RowWise),
-        ),
-        (
-            r"(text|vision)_model/encoder/layers/\d+/self_attn/.*proj/bias",
-            pmag.resolve(Replicated),
-        ),
-        (
-            r"(text|vision)_model/encoder/layers/\d+/mlp/fc1/kernel",
-            pmag.resolve(ColumnWise),
-        ),
-        (r"(text|vision)_model/encoder/layers/\d+/mlp/fc2/kernel", pmag.resolve(RowWise)),
-        (
-            r"(text|vision)_model/encoder/layers/\d+/mlp/fc(1|2)/bias",
-            pmag.resolve(Replicated),
-        ),
-        (r".*norm.*/scale", pmag.resolve(Replicated)),
-        (r".*norm.*/bias", pmag.resolve(Replicated)),
-        (r"(visual|text)_projection/kernel", pmag.resolve(ColumnWise)),
-        (r"(visual|text)_projection/bias", pmag.resolve(Replicated)),
-        (r"logit_scale", pmag.resolve(Replicated)),
-        (r"classifier/kernel", pmag.resolve(RowWise)),
-        (r"classifier/bias", pmag.resolve(Replicated)),
-        (r".*bias", pmag.resolve(Replicated)),
-        (r".*", pmag.resolve(Replicated)),
-    )
+    return None
 
 
 @register_config("clip_text_model")
@@ -143,21 +93,21 @@ class CLIPTextConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vocab_size=49408,
-        hidden_size=512,
-        intermediate_size=2048,
-        projection_dim=512,
-        num_hidden_layers=12,
-        num_attention_heads=8,
-        max_position_embeddings=77,
-        hidden_act="quick_gelu",
-        layer_norm_eps=1e-5,
-        attention_dropout=0.0,
-        initializer_range=0.02,
-        initializer_factor=1.0,
-        pad_token_id=1,
-        bos_token_id=49406,
-        eos_token_id=49407,
+        vocab_size: int = 49408,
+        hidden_size: int = 512,
+        intermediate_size: int = 2048,
+        projection_dim: int = 512,
+        num_hidden_layers: int = 12,
+        num_attention_heads: int = 8,
+        max_position_embeddings: int = 77,
+        hidden_act: str = "quick_gelu",
+        layer_norm_eps: float = 1e-5,
+        attention_dropout: float = 0.0,
+        initializer_range: float = 0.02,
+        initializer_factor: float = 1.0,
+        pad_token_id: int = 1,
+        bos_token_id: int = 49406,
+        eos_token_id: int = 49407,
         **kwargs,
     ):
         super().__init__(
@@ -244,19 +194,19 @@ class CLIPVisionConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        hidden_size=768,
-        intermediate_size=3072,
-        projection_dim=512,
-        num_hidden_layers=12,
-        num_attention_heads=12,
-        num_channels=3,
-        image_size=224,
-        patch_size=32,
-        hidden_act="quick_gelu",
-        layer_norm_eps=1e-5,
-        attention_dropout=0.0,
-        initializer_range=0.02,
-        initializer_factor=1.0,
+        hidden_size: int = 768,
+        intermediate_size: int = 3072,
+        projection_dim: int = 512,
+        num_hidden_layers: int = 12,
+        num_attention_heads: int = 12,
+        num_channels: int = 3,
+        image_size: int = 224,
+        patch_size: int = 32,
+        hidden_act: str = "quick_gelu",
+        layer_norm_eps: float = 1e-5,
+        attention_dropout: float = 0.0,
+        initializer_range: float = 0.02,
+        initializer_factor: float = 1.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -331,10 +281,10 @@ class CLIPConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        text_config=None,
-        vision_config=None,
-        projection_dim=512,
-        logit_scale_init_value=2.6592,
+        text_config: dict | None = None,
+        vision_config: dict | None = None,
+        projection_dim: int = 512,
+        logit_scale_init_value: float = 2.6592,
         **kwargs,
     ):
         text_config_dict = kwargs.pop("text_config_dict", None)

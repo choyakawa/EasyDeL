@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,12 +13,42 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
+
+
+def _patch_hf_phimoe_rotary_mscale() -> None:
+    """HF compatibility: initialize missing Phimoe rotary mscale attributes."""
+    try:
+        from transformers.models.phimoe import modeling_phimoe as hf_phimoe
+    except Exception:
+        return
+
+    rotary_cls = getattr(hf_phimoe, "PhimoeRotaryEmbedding", None)
+    if rotary_cls is None:
+        return
+
+    original_init = getattr(rotary_cls, "__init__", None)
+    if original_init is None or getattr(original_init, "_easydel_phimoe_mscale_patch", False):
+        return
+
+    def _patched_init(self, config, device=None):
+        original_init(self, config, device=device)
+        rope_parameters = getattr(config, "rope_parameters", {}) or {}
+        if not hasattr(self, "short_mscale"):
+            self.short_mscale = rope_parameters.get("short_mscale", 1.0)
+        if not hasattr(self, "long_mscale"):
+            self.long_mscale = rope_parameters.get("long_mscale", 1.0)
+
+    _patched_init._easydel_phimoe_mscale_patch = True  # type: ignore[attr-defined]
+    rotary_cls.__init__ = _patched_init
+
+
+_patch_hf_phimoe_rotary_mscale()
 
 
 @register_config("phimoe")
@@ -106,7 +136,7 @@ class PhiMoeConfig(EasyDeLBaseConfig):
         intermediate_size=6400,
         num_hidden_layers=32,
         num_attention_heads=32,
-        num_key_value_heads=8,
+        num_key_value_heads: int | None = 8,
         hidden_act="silu",
         max_position_embeddings=4096 * 32,
         initializer_range=0.02,
@@ -134,42 +164,6 @@ class PhiMoeConfig(EasyDeLBaseConfig):
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         **kwargs,
     ) -> None:
-        """Initializes a PhiMoeConfig object.
-
-        Args:
-            vocab_size (int, optional): Vocabulary size. Defaults to 32064.
-            hidden_size (int, optional): Dimensionality of the embeddings and hidden states. Defaults to 4096.
-            intermediate_size (int, optional): Dimensionality of the intermediate layer in MLP. Defaults to 6400.
-            num_hidden_layers (int, optional): Number of hidden layers. Defaults to 32.
-            num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
-            num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to 8.
-            hidden_act (str, optional): Activation function name. Defaults to "silu".
-            max_position_embeddings (int, optional): Maximum sequence length. Defaults to 4096 * 32.
-            initializer_range (float, optional): Standard deviation for weight initialization. Defaults to 0.02.
-            rms_norm_eps (float, optional): Epsilon for RMS normalization. Defaults to 1e-5.
-            use_cache (bool, optional): Whether to use KV cache. Defaults to True.
-            pad_token_id (int, optional): Padding token ID. Defaults to None.
-            bos_token_id (int, optional): Beginning-of-sequence token ID. Defaults to 1.
-            eos_token_id (int, optional): End-of-sequence token ID. Defaults to 2.
-            tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
-            rope_theta (float, optional): Base value for RoPE. Defaults to 1e6.
-            rope_scaling (dict, optional): RoPE scaling configuration. Defaults to None.
-            sliding_window (int, optional): Sliding window size for attention. Defaults to None.
-            attention_dropout (float, optional): Dropout probability for attention scores. Defaults to 0.0.
-            num_experts_per_tok (int, optional): Number of experts to route per token. Defaults to 2.
-            num_local_experts (int, optional): Total number of local experts. Defaults to 16.
-            output_router_logits (bool, optional): Whether to output router logits. Defaults to False.
-            router_aux_loss_coef (float, optional): Coefficient for router auxiliary loss. Defaults to 0.001.
-            router_jitter_noise (float, optional): Jitter noise for router gates. Defaults to 0.01.
-            input_jitter_noise (float, optional): Jitter noise for input tokens (not typically used). Defaults to 0.0.
-            attention_bias (bool, optional): Whether to use bias in attention projections. Defaults to False.
-            embd_pdrop (float, optional): Dropout probability for embeddings. Defaults to 0.0.
-            lm_head_bias (bool, optional): Whether to use bias in the LM head. Defaults to False.
-            bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
-            gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
-                Defaults to EasyDeLGradientCheckPointers.NONE.
-            **kwargs: Additional keyword arguments passed to the parent class.
-        """
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -198,15 +192,17 @@ class PhiMoeConfig(EasyDeLBaseConfig):
         self.router_jitter_noise = router_jitter_noise
         self.input_jitter_noise = input_jitter_noise
         self.embd_pdrop = embd_pdrop
-        self.rope_scaling = rope_scaling or {}
+        self.rope_scaling = rope_scaling
         self._rope_scaling_validation()
+        if self.rope_scaling is not None and "original_max_position_embeddings" in self.rope_scaling:
+            self.original_max_position_embeddings = self.rope_scaling["original_max_position_embeddings"]
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = [
                 "sliding_attention" if self.sliding_window is not None else "full_attention"
-                for i in range(self.num_hidden_layers)
+                for _ in range(self.num_hidden_layers)
             ]
         super().__init__(
             pad_token_id=pad_token_id,
@@ -217,36 +213,18 @@ class PhiMoeConfig(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"block_sparse_moe/gate/kernel", pmag.resolve(ColumnWise)),
-            (r"block_sparse_moe/gate/bias", pmag.resolve(Replicated)),
-            (r"block_sparse_moe/experts/(w1|w3)/kernel", pmag.resolve(ColumnWise)),
-            (r"block_sparse_moe/experts/w2/kernel", pmag.resolve(RowWise)),
-            (r"block_sparse_moe/experts/.*bias", pmag.resolve(Replicated)),
-            (
-                r".*/(input_layernorm|post_attention_layernorm|norm)/scale",
-                pmag.resolve(Replicated),
-            ),
-            (
-                r".*/(input_layernorm|post_attention_layernorm|norm)/bias",
-                pmag.resolve(Replicated),
-            ),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"lm_head/bias", pmag.resolve(Replicated)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
     def _rope_scaling_validation(self):
         """
@@ -264,7 +242,21 @@ class PhiMoeConfig(EasyDeLBaseConfig):
         if self.rope_scaling is None:
             return
 
-        if not isinstance(self.rope_scaling, dict) or len(self.rope_scaling) != 6:
+        rope_scaling_type = self.rope_scaling.get("type", self.rope_scaling.get("rope_type"))
+        if rope_scaling_type in (None, "default"):
+            # Base config compatibility can inject a default rope payload; treat it as no scaling.
+            self.rope_scaling = None
+            return
+
+        required_keys = {
+            "type",
+            "short_factor",
+            "long_factor",
+            "short_mscale",
+            "long_mscale",
+            "original_max_position_embeddings",
+        }
+        if not isinstance(self.rope_scaling, dict) or not required_keys.issubset(self.rope_scaling.keys()):
             raise ValueError(
                 "`rope_scaling` must be a dictionary with three fields, `type`, `short_factor`, `long_factor`, "
                 f"`short_mscale`, `long_mscale` and `original_max_position_embeddings`, got {self.rope_scaling}"

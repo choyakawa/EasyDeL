@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -73,28 +73,29 @@ class GPTNeoXConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vocab_size=50432,
-        hidden_size=6144,
-        num_hidden_layers=44,
-        num_attention_heads=64,
-        intermediate_size=24576,
-        hidden_act="gelu",
-        rotary_pct=0.25,
-        rotary_emb_base=10000,
-        attention_dropout=0.0,
-        hidden_dropout=0.0,
-        classifier_dropout=0.1,
-        max_position_embeddings=2048,
-        initializer_range=0.02,
-        layer_norm_eps=1e-5,
-        use_cache=True,
-        bos_token_id=0,
-        eos_token_id=2,
-        tie_word_embeddings=False,
-        use_parallel_residual=True,
-        rope_scaling=None,
-        attention_bias=True,
-        gradient_checkpointing=EasyDeLGradientCheckPointers.NONE,
+        vocab_size: int = 50432,
+        hidden_size: int = 6144,
+        num_hidden_layers: int = 44,
+        num_attention_heads: int = 64,
+        intermediate_size: int = 24576,
+        hidden_act: str = "gelu",
+        rotary_pct: float = 0.25,
+        rotary_emb_base: int = 10000,
+        attention_dropout: float = 0.0,
+        hidden_dropout: float = 0.0,
+        classifier_dropout: float = 0.1,
+        max_position_embeddings: int = 2048,
+        initializer_range: float = 0.02,
+        layer_norm_eps: float = 1e-5,
+        use_cache: bool = True,
+        bos_token_id: int = 0,
+        eos_token_id: int = 2,
+        tie_word_embeddings: bool = False,
+        use_parallel_residual: bool = True,
+        rope_scaling: dict | None = None,
+        attention_bias: bool = True,
+        gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initializes a GPTNeoXConfig object.
@@ -147,33 +148,20 @@ class GPTNeoXConfig(EasyDeLBaseConfig):
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.from_pt = False
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embed_in/embedding", pmag.resolve(ColumnWise)),
-            (r"attention/query_key_value/kernel", pmag.resolve(ColumnWise)),
-            (r"attention/dense/kernel", pmag.resolve(RowWise)),
-            (r"mlp/dense_h_to_4h/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/dense_4h_to_h/kernel", pmag.resolve(RowWise)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (
-                r".*/(input_layernorm|post_attention_layernorm|final_layer_norm)/scale",
-                pmag.resolve(Replicated),
-            ),
-            (
-                r".*/(input_layernorm|post_attention_layernorm|final_layer_norm)/bias",
-                pmag.resolve(Replicated),
-            ),
-            (
-                r".*(query_key_value|dense|dense_h_to_4h|dense_4h_to_h|lm_head)/bias",
-                pmag.resolve(Replicated),
-            ),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None

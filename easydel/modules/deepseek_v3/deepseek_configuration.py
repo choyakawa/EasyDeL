@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,10 +15,11 @@
 
 import typing
 
-from eformer.common_types import ColumnWise, ExpertColumnWiseAlt, ExpertRowWiseAlt, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
+from easydel.layers import RopeConfig
 
 DEEPSEEK_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 
@@ -129,49 +130,60 @@ class DeepseekV3Config(EasyDeLBaseConfig):
     model_type = "deepseek_v3"
     keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
 
+    def __setattr__(self, key, value):
+        # DeepSeek HF remote code expects `rope_scaling=None` for default RoPE.
+        # Newer config normalization can materialize {"type":"default", ...},
+        # which triggers legacy branches that require `factor`.
+        if key == "rope_scaling" and isinstance(value, dict):
+            rope_type = value.get("rope_type", value.get("type"))
+            if rope_type in (None, "default"):
+                value = None
+        super().__setattr__(key, value)
+
     def __init__(
         self,
-        vocab_size=129280,
-        hidden_size=7168,
-        intermediate_size=18432,
-        moe_intermediate_size=2048,
-        num_hidden_layers=61,
-        num_nextn_predict_layers=1,
-        num_attention_heads=128,
-        num_key_value_heads=128,
-        n_shared_experts=1,
-        n_routed_experts=256,
-        ep_size=1,
-        routed_scaling_factor=2.5,
-        kv_lora_rank=512,
-        q_lora_rank=1536,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        qk_nope_head_dim=128,
-        topk_method="noaux_tc",
-        n_group=8,
-        topk_group=4,
-        num_experts_per_tok=8,
-        moe_layer_freq=1,
-        first_k_dense_replace=3,
-        norm_topk_prob=True,
-        scoring_func="sigmoid",
-        aux_loss_alpha=0.001,
-        seq_aux=True,
-        hidden_act="silu",
-        max_position_embeddings=4096,
-        initializer_range=0.02,
-        rms_norm_eps=1e-6,
-        use_cache=True,
-        pad_token_id=None,
-        bos_token_id=0,
-        eos_token_id=1,
-        pretraining_tp=1,
-        tie_word_embeddings=False,
-        rope_theta=10000.0,
-        rope_scaling=None,
-        attention_bias=False,
-        attention_dropout=0.0,
+        vocab_size: int = 129280,
+        hidden_size: int = 7168,
+        intermediate_size: int = 18432,
+        moe_intermediate_size: int = 2048,
+        num_hidden_layers: int = 61,
+        num_nextn_predict_layers: int = 1,
+        num_attention_heads: int = 128,
+        num_key_value_heads: int | None = 128,
+        n_shared_experts: int | None = 1,
+        n_routed_experts: int | None = 256,
+        ep_size: int = 1,
+        routed_scaling_factor: float = 2.5,
+        kv_lora_rank: int = 512,
+        q_lora_rank: int | None = 1536,
+        qk_rope_head_dim: int = 64,
+        v_head_dim: int = 128,
+        qk_nope_head_dim: int = 128,
+        topk_method: str = "noaux_tc",
+        n_group: int = 8,
+        topk_group: int = 4,
+        num_experts_per_tok: int = 8,
+        moe_layer_freq: int = 1,
+        first_k_dense_replace: int = 3,
+        norm_topk_prob: bool = True,
+        scoring_func: str = "sigmoid",
+        aux_loss_alpha: float = 0.001,
+        seq_aux: bool = True,
+        hidden_act: str = "silu",
+        max_position_embeddings: int = 4096,
+        initializer_range: float = 0.02,
+        rms_norm_eps: float = 1e-6,
+        use_cache: bool = True,
+        pad_token_id: int | None = None,
+        bos_token_id: int = 0,
+        eos_token_id: int = 1,
+        pretraining_tp: int = 1,
+        tie_word_embeddings: bool = False,
+        rope_theta: float = 10000.0,
+        rope_scaling: dict | None = None,
+        attention_bias: bool = False,
+        attention_dropout: float = 0.0,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initialize a new DeepseekV3Config instance.
@@ -237,6 +249,7 @@ class DeepseekV3Config(EasyDeLBaseConfig):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.v_head_dim = v_head_dim
         self.qk_nope_head_dim = qk_nope_head_dim
+        self.head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.topk_method = topk_method
         self.n_group = n_group
         self.topk_group = topk_group
@@ -261,6 +274,9 @@ class DeepseekV3Config(EasyDeLBaseConfig):
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -269,34 +285,44 @@ class DeepseekV3Config(EasyDeLBaseConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+        rope_scaling_value = getattr(self, "rope_scaling", None)
+        if isinstance(rope_scaling_value, dict):
+            rope_type = rope_scaling_value.get("rope_type", rope_scaling_value.get("type"))
+            if rope_type in (None, "default"):
+                object.__setattr__(self, "rope_scaling", None)
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/q_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/q_a_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/q_b_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/kv_a_proj_with_mqa/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/kv_b_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"self_attn/(q_a_layernorm|kv_a_layernorm)/kernel", pmag.resolve(Replicated)),
-            (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/gate/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/gate/e_score_correction_bias", pmag.resolve(Replicated)),
-            (r"mlp/experts/(gate_proj|up_proj)/kernel", pmag.resolve(ExpertColumnWiseAlt)),
-            (r"mlp/experts/down_proj/kernel", pmag.resolve(ExpertRowWiseAlt)),
-            (r"mlp/shared_experts/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/shared_experts/down_proj/kernel", pmag.resolve(RowWise)),
-            (r".*(input_layernorm|post_attention_layernorm|norm)/kernel", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
+
+    def _get_rope_config(self) -> RopeConfig:
+        """Get RoPE configuration from the instance attributes."""
+        if not hasattr(self, "rope_scaling") or self.rope_scaling is None:
+            config = RopeConfig.from_dict(
+                dict(
+                    rope_type="yarn",
+                    base=10000,
+                    scaling_factor=1.0,
+                    original_max_position_embeddings=4096,
+                    beta_fast=32,
+                    beta_slow=1,
+                    mscale=1,
+                    mscale_all_dim=0,
+                )
+            )
+        else:
+            config = RopeConfig.from_dict(self.rope_scaling)
+
+            if config.original_max_position_embeddings is None:
+                config.original_max_position_embeddings = getattr(self, "original_max_position_embeddings", None)
+
+        return config

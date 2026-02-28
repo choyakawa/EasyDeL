@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,9 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from dataclasses import field
+from __future__ import annotations
 
-from eformer.pytree import auto_pytree
+import typing as tp
+from dataclasses import dataclass, field
 
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
@@ -22,7 +23,7 @@ from ..training_configurations import TrainingArguments
 
 
 @Registry.register("trainer-arguments", "distillation")
-@auto_pytree
+@dataclass
 class DistillationConfig(TrainingArguments):
     """Configuration class for knowledge distillation training.
 
@@ -78,4 +79,86 @@ class DistillationConfig(TrainingArguments):
             "1.0 = pure distillation, 0.0 = pure supervised learning."
         },
     )
+    dataset_text_field: str | None = field(
+        default="text",
+        metadata={"help": "Name of the text field used when tokenizing raw text datasets."},
+    )
+    assistant_only_loss: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to compute supervised CE only on assistant/completion tokens. "
+                "Requires conversational tokenization that can emit assistant masks."
+            )
+        },
+    )
+    completion_only_loss: bool | None = field(
+        default=None,
+        metadata={"help": ("Deprecated alias for `assistant_only_loss`. If set, it overrides `assistant_only_loss`.")},
+    )
+    hidden_state_loss_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Optional coefficient for matching student and teacher hidden states. "
+                "Set to 0 to disable hidden-state distillation."
+            )
+        },
+    )
+    hidden_state_layers: tuple[int, ...] | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Indices of transformer layers whose hidden states should be distilled. "
+                "Negative indices follow Python semantics. Defaults to the final layer when omitted."
+            )
+        },
+    )
+    hidden_state_loss: tp.Literal["mse"] = field(
+        default="mse",
+        metadata={"help": "Distance function used for hidden-state distillation. Currently only 'mse' is supported."},
+    )
+    attention_loss_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Optional coefficient for matching attention probability tensors. "
+                "Set to 0 to disable attention-head distillation."
+            )
+        },
+    )
+    attention_layers: tuple[int, ...] | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Indices of attention layers whose probability matrices should be distilled. "
+                "Negative indices follow Python semantics. Defaults to all available layeatrs when omitted."
+            )
+        },
+    )
+    attention_normalize: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to L1-normalize attention matrices before computing the distillation loss. "
+                "Useful when working with models that emit un-normalized attention weights."
+            )
+        },
+    )
+
+    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
+        if self.completion_only_loss is not None:
+            self.assistant_only_loss = bool(self.completion_only_loss)
+        self.completion_only_loss = bool(self.assistant_only_loss)
+        if self.hidden_state_layers is not None:
+            self.hidden_state_layers = tuple(int(i) for i in self.hidden_state_layers)
+        if self.attention_layers is not None:
+            self.attention_layers = tuple(int(i) for i in self.attention_layers)
+        if not 0.0 <= float(self.alpha) <= 1.0:
+            raise ValueError("`alpha` must be within [0, 1].")
+        if float(self.temperature) <= 0.0:
+            raise ValueError("`temperature` must be strictly positive.")
+        if hasattr(super(), "__post_init__"):
+            super().__post_init__(max_sequence_length=max_sequence_length, quantization_block=quantization_block)
+
     __hash__ = hash_fn

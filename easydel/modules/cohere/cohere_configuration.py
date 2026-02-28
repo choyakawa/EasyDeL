@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -35,7 +35,10 @@ class CohereConfig(EasyDeLBaseConfig):
         intermediate_size (`int`, *optional*, defaults to 22528):
             Dimensionality of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
         logit_scale (`float`, *optional*, defaults to 0.0625):
-            A logit scale value used in the attention layer.
+            Scaling factor applied to the final layer's output logits before computing token
+            probabilities. This multiplicative constant (default 1/16) provides finer control over
+            prediction sharpness and probability calibration. Lower values produce smoother
+            distributions; higher values make predictions more peaked.
         num_hidden_layers (`int`, *optional*, defaults to 40):
             Number of hidden layers in the Transformer encoder.
         num_attention_heads (`int`, *optional*, defaults to 64):
@@ -71,7 +74,10 @@ class CohereConfig(EasyDeLBaseConfig):
         attention_dropout (`float`, *optional*, defaults to 0.0):
             The dropout ratio for the attention probabilities.
         use_qk_norm (`bool`, *optional*, defaults to `False`):
-            Whether to use query and key normalization.
+            Whether to apply RMSNorm to query and key projections before attention computation.
+            When enabled, normalizes Q and K tensors independently using RMS normalization,
+            improving training stability and model quality especially at larger scales. Applied
+            per-head with shape (head_dim, num_heads).
         gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
             The gradient checkpointing configuration.
         bits (`int`, *optional*):
@@ -82,57 +88,31 @@ class CohereConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vocab_size=256000,
-        hidden_size=8192,
-        intermediate_size=22528,
-        logit_scale=0.0625,
-        num_hidden_layers=40,
-        num_attention_heads=64,
-        num_key_value_heads=None,
-        hidden_act="silu",
-        max_position_embeddings=8192,
-        initializer_range=0.02,
-        layer_norm_eps=1e-5,
-        use_cache=True,
-        pad_token_id=0,
-        bos_token_id=5,
-        eos_token_id=255001,
-        tie_word_embeddings=True,
-        rope_theta=10000.0,
-        attention_bias=False,
-        attention_dropout=0.0,
+        vocab_size: int = 256000,
+        hidden_size: int = 8192,
+        intermediate_size: int = 22528,
+        logit_scale: float = 0.0625,
+        num_hidden_layers: int = 40,
+        num_attention_heads: int = 64,
+        num_key_value_heads: int | None = None,
+        hidden_act: str = "silu",
+        max_position_embeddings: int = 8192,
+        initializer_range: float = 0.02,
+        layer_norm_eps: float = 1e-5,
+        use_cache: bool = True,
+        pad_token_id: int = 0,
+        bos_token_id: int = 5,
+        eos_token_id: int = 255001,
+        tie_word_embeddings: bool = True,
+        rope_theta: float = 10000.0,
+        attention_bias: bool = False,
+        attention_dropout: float = 0.0,
         use_qk_norm: bool = False,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
-        """Initializes the CohereConfig instance.
-
-        Args:
-            vocab_size (int): Vocabulary size.
-            hidden_size (int): Dimensionality of the hidden layers.
-            intermediate_size (int): Dimensionality of the intermediate feed-forward layer.
-            logit_scale (float): Logit scale for attention.
-            num_hidden_layers (int): Number of hidden layers.
-            num_attention_heads (int): Number of attention heads.
-            num_key_value_heads (Optional[int]): Number of key/value heads.
-            hidden_act (str): Activation function.
-            max_position_embeddings (int): Maximum sequence length.
-            initializer_range (float): Initializer range for weights.
-            layer_norm_eps (float): Epsilon for layer normalization.
-            use_cache (bool): Whether to use caching.
-            pad_token_id (int): Padding token ID.
-            bos_token_id (int): Beginning of sequence token ID.
-            eos_token_id (int): End of sequence token ID.
-            tie_word_embeddings (bool): Whether to tie word embeddings.
-            rope_theta (float): RoPE theta value.
-            attention_bias (bool): Whether to use attention bias.
-            attention_dropout (float): Dropout rate for attention.
-            use_qk_norm (bool): Whether to use QK normalization.
-            gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing strategy.
-            bits (Optional[int]): Number of bits for quantization.
-            **kwargs: Additional keyword arguments.
-        """
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -156,6 +136,9 @@ class CohereConfig(EasyDeLBaseConfig):
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
         self.head_dim = hidden_size // num_attention_heads
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -164,24 +147,15 @@ class CohereConfig(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager  # Handles resolving strategies
-        return (
-            (r"model/embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/(q_norm|k_norm)/kernel", pmag.resolve(Replicated)),
-            (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"input_layernorm/kernel", pmag.resolve(Replicated)),
-            (r"model/norm/kernel", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"score/kernel", pmag.resolve(RowWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None

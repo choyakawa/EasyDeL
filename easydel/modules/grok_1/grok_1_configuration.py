@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -82,29 +82,34 @@ class Grok1Config(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vocab_size=32000,
-        hidden_size=4096,
-        intermediate_size=32768,
-        num_hidden_layers=32,
-        num_attention_heads=32,
-        num_key_value_heads=32,
-        attn_output_multiplier=1.0,
-        max_attn_value=1.0,
-        max_position_embeddings=4096,
+        vocab_size: int = 32000,
+        hidden_size: int = 4096,
+        intermediate_size: int = 32768,
+        num_hidden_layers: int = 32,
+        num_attention_heads: int = 32,
+        num_key_value_heads: int | None = 32,
+        attn_output_multiplier: float = 1.0,
+        max_attn_value: float = 1.0,
+        max_position_embeddings: int = 4096,
         embedding_multiplier_scale: float = 1.0,
         output_multiplier_scale: float = 1.0,
-        rms_norm_eps=1e-5,
-        use_cache=True,
-        pad_token_id=None,
-        bos_token_id=1,
-        eos_token_id=2,
-        tie_word_embeddings=True,
-        num_experts_per_tok=2,
-        num_experts=8,
-        output_router_logits=False,
-        router_aux_loss_coef=0.001,
+        initializer_range: float = 0.02,
+        rms_norm_eps: float = 1e-5,
+        attention_dropout: float = 0.0,
+        resid_pdrop: float = 0.0,
+        use_cache: bool = True,
+        pad_token_id: int | None = None,
+        bos_token_id: int = 1,
+        eos_token_id: int = 2,
+        tie_word_embeddings: bool = True,
+        num_experts_per_tok: int = 2,
+        num_experts: int = 8,
+        output_router_logits: bool = False,
+        router_aux_loss_coef: float = 0.001,
+        rope_theta: float = 10000,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initializes a Grok1Config object.
@@ -146,21 +151,26 @@ class Grok1Config(EasyDeLBaseConfig):
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
-
+        self.initializer_range = initializer_range
         # for backward compatibility
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
 
         self.num_key_value_heads = num_key_value_heads
         self.rms_norm_eps = rms_norm_eps
+        self.attention_dropout = attention_dropout
+        self.resid_pdrop = resid_pdrop
         self.use_cache = use_cache
-
+        self.rope_theta = rope_theta
         self.num_experts_per_tok = num_experts_per_tok
         self.num_experts = num_experts
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -169,29 +179,15 @@ class Grok1Config(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"gate/kernel", pmag.resolve(ColumnWise)),
-            (r"gate/bias", pmag.resolve(Replicated)),
-            (r"experts/(linear|linear_v)/kernel", pmag.resolve(ColumnWise)),
-            (r"experts/linear_1/kernel", pmag.resolve(RowWise)),
-            (r"experts/.*linear.*/bias", pmag.resolve(Replicated)),
-            (
-                r".*(pre_attn_norm|post_attn_norm|pre_moe_norm|post_moe_norm|norm)/kernel",
-                pmag.resolve(Replicated),
-            ),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"lm_head/bias", pmag.resolve(Replicated)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None

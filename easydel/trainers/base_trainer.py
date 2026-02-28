@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,40 +13,49 @@
 # limitations under the License.
 from __future__ import annotations
 
+import collections.abc
+import copy
 import os
 import pprint
-import re
 import time
 import typing as tp
 from abc import abstractmethod
 from functools import cached_property
+from typing import NamedTuple
 
 import contextlib2
 import flax
 import flax.nnx
-import grain.python as grain
+import grain.python as grain  # pyright: ignore[reportMissingTypeStubs]
 import jax
 import jax.extend
 import numpy as np
-from eformer.escale import PartitionAxis
+from eformer import common_types
+from eformer.escale import with_sharding_constraint
 from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax._src.stages import Compiled
-from jax.sharding import PartitionSpec
+from jax.sharding import NamedSharding, PartitionSpec
 from tqdm.autonotebook import tqdm
+from transformers import GenerationConfig, ProcessorMixin
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from easydel import __version__
-from easydel.infra.base_config import EasyDeLBaseConfigDict
+
+# Import ShardedDataSource for trainer integration
+from easydel.data.core.protocols import ShardedDataSource
+from easydel.data.sources.hf_wrapper import wrap_hf_dataset
+from easydel.inference import SamplingParams
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
-from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms, EasyDeLQuantizationMethods
 from easydel.infra.factory import TaskType
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import CompilationTracker
 from easydel.utils import Timers, readme_generator
+from easydel.utils.compiling_utils import ejit
 from easydel.utils.lazy_import import is_package_available
 from easydel.utils.traversals import specs_to_name_sharding
 
@@ -59,19 +68,48 @@ from .trainer_protocol import (
     TrainerOutput,
 )
 from .training_configurations import MetricsType, TrainingArguments
+from .training_utils import resolve_total_steps
 from .utils import CollateMapTransform, HFDataSource, ToNumpy
 
 try:
-    import wandb  # type:ignore
+    import wandb
 except ImportError:
     wandb = None
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset, IterableDataset
+    from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
+    from easydel.data.transforms.base import Transform
+    from easydel.inference.esurge.esurge_engine import RequestOutput
 
 logger = get_logger(__name__)
+
+log_debug_maybe = logger.debug
+
 DEFAULT_ARGS_JSON_NAME = "easydel-training-arguments.json"
+
+
+class GenerationResults(NamedTuple):
+    """Results from unified generation containing both text and token representations.
+
+    Attributes:
+        generation_results: The generation results from engine
+        prompt_ids: Token IDs for the prompt (batch_size, max_seq_len) - left-padded
+        prompt_mask: Attention mask for the prompt (batch_size, max_seq_len)
+        sequences: Complete generated sequences including prompt (batch_size, max_seq_len + max_new_tokens)
+        completion_ids: Token IDs for only the generated completions (batch_size, max_new_tokens) - right-padded
+        completion_mask: Attention mask for completions (batch_size, max_new_tokens)
+        completion_prompts: Optional prompt objects (text or chat dicts) aligned one-to-one with completions.
+    """
+
+    generation_results: str | list[str]
+    prompt_ids: jax.Array
+    prompt_mask: jax.Array
+    sequences: jax.Array
+    completion_ids: jax.Array
+    completion_mask: jax.Array
+    decoded_prompts: str | list[str]
+    completion_prompts: list[str | list[dict[str, str]]] | None = None
 
 
 class BaseTrainer(BaseTrainerProtocol):
@@ -98,17 +136,26 @@ class BaseTrainer(BaseTrainerProtocol):
         finetune: Whether this is a fine-tuning run
         mesh: Device mesh for distributed computation
         checkpoint_manager: Manager for saving/loading checkpoints
+        _train_source: Internal ShardedDataSource for training data
+        _eval_source: Internal ShardedDataSource for evaluation data
     """
+
+    # Type annotations for internal data sources
+    arguments: TrainingArguments | None
+    model_state: EasyDeLState | None
+    _train_source: ShardedDataSource | None
+    _eval_source: ShardedDataSource | None
 
     def __init__(
         self,
         arguments: TrainingArguments | None = None,
         model_state: EasyDeLState | None = None,
         model: tp.type[EasyDeLBaseModule] | None = None,
-        dataset_train: Dataset | None = None,
-        dataset_eval: Dataset | None = None,
+        dataset_train: Dataset | IterableDataset | ShardedDataSource | None = None,
+        dataset_eval: Dataset | IterableDataset | ShardedDataSource | None = None,
         data_collator: tp.Callable | None = None,
         finetune: bool = True,
+        processing_class: PreTrainedTokenizerBase | None = None,
         **deprecated_kwargs,
     ):
         """
@@ -118,10 +165,11 @@ class BaseTrainer(BaseTrainerProtocol):
             arguments: Training configuration and hyperparameters
             model_state: Pre-initialized model state (mutually exclusive with model)
             model: Model class to initialize (mutually exclusive with model_state)
-            dataset_train: Training dataset
-            dataset_eval: Evaluation dataset
+            dataset_train: Training dataset (HF Dataset, IterableDataset, or ShardedDataSource)
+            dataset_eval: Evaluation dataset (HF Dataset, IterableDataset, or ShardedDataSource)
             data_collator: Function to collate batches of data
             finetune: Whether this is a fine-tuning run (affects initialization)
+            processing_class: Tokenizer or processor for handling text encoding/decoding
             **deprecated_kwargs: Deprecated keyword arguments for backward compatibility
 
         Raises:
@@ -142,13 +190,39 @@ class BaseTrainer(BaseTrainerProtocol):
         self._resumed_from_checkpoint = False
         if self.arguments.resume_if_possible:
             try:
-                resumed_state = self._try_resume_from_checkpoint(model_state)
-            except Exception:
-                logger.warning("Resuming from checkpoint failed. Starting fresh training.")
-                resumed_state = None
-            if resumed_state is not None:
-                model_state = resumed_state
-                self._resumed_from_checkpoint = True
+                from eformer.serialization.checkpointer import find_latest_checkpoint
+
+                checkpoint_path = find_latest_checkpoint(str(self.arguments._get_save_directory(create=False)))
+                if checkpoint_path is not None:
+                    logger.info(f"Found latest checkpoint: {checkpoint_path}")
+                    model = model_state.model
+                    resumed_state = EasyDeLState.load_state(
+                        load_directory=checkpoint_path,
+                        dtype=model.dtype,
+                        param_dtype=model.param_dtype,
+                        precision=model.precision,
+                        auto_shard_model=True,
+                        partition_axis=model.config.partition_axis,
+                        sharding_axis_names=model.config.sharding_axis_names,
+                        sharding_axis_dims=model.config.sharding_axis_dims,
+                        sharding_dcn_axis_dims=model.config.sharding_dcn_axis_dims,
+                        model_task=model.model_task,
+                        verbose=True,
+                        tx_template=arguments.get_tx_template(),
+                    )
+                    actual_step = int(jax.device_get(resumed_state.step))
+                    logger.info(f"Successfully resumed from checkpoint at step {actual_step}")
+
+                    if self.arguments.step_start_point is None:
+                        self.arguments.step_start_point = actual_step
+                        logger.info(f"Set step_start_point to {actual_step}")
+
+                    model_state = resumed_state
+                    self._resumed_from_checkpoint = True
+                else:
+                    logger.info("No checkpoints found. Starting fresh training.")
+            except Exception as e:
+                logger.warning(f"Resuming from checkpoint failed: {e}. Starting fresh training.")
 
         self.model_state = model_state
         self._model = flax.nnx.eval_shape(lambda: self.model_state.model)
@@ -156,183 +230,149 @@ class BaseTrainer(BaseTrainerProtocol):
         self.dataset_eval = dataset_eval
         self.data_collator = data_collator
         self.finetune = finetune
+        self.processing_class = processing_class
+
+        if self.data_collator is None and getattr(self.arguments, "use_data_collactor", True):
+            base_collator = self.create_collect_function(
+                max_sequence_length=self.arguments.max_length,
+                truncation_mode=self.arguments.truncation_mode,
+            )
+
+            def _stack_per_example_outputs(per_example: list[dict[str, tp.Any]]) -> dict[str, tp.Any]:
+                if not per_example or not isinstance(per_example[0], dict):
+                    return {}
+                stacked: dict[str, tp.Any] = {}
+                for key in per_example[0].keys():
+                    values = [item.get(key) for item in per_example]
+                    if any(v is None for v in values):
+                        continue
+                    try:
+                        arrays = [jnp.asarray(v) for v in values]
+                    except Exception:
+                        continue
+                    first = arrays[0]
+                    if (
+                        getattr(first, "ndim", 0) >= 1
+                        and first.shape[0] == 1
+                        and all(getattr(a, "shape", None) == first.shape for a in arrays)
+                    ):
+                        stacked[key] = jnp.concatenate(arrays, axis=0)
+                    else:
+                        stacked[key] = jnp.stack(arrays, axis=0)
+                return stacked
+
+            def _auto_data_collator(batch):
+                if not isinstance(batch, (list, tuple)):
+                    return batch
+                batch_list = list(batch)
+                if not batch_list:
+                    return batch_list
+
+                try:
+                    return base_collator(batch_list)
+                except (TypeError, AttributeError):
+                    per_example = [base_collator(example) for example in batch_list]
+                    stacked = _stack_per_example_outputs(per_example)
+                    return stacked if stacked else batch_list
+
+            self.data_collator = _auto_data_collator
+
+        # Convert datasets to ShardedDataSource for unified internal handling
+        self._train_source = self._to_sharded_source(dataset_train)
+        self._eval_source = self._to_sharded_source(dataset_eval)
+
+        # Apply trainer-specific preprocessing transform if available
+        self._apply_preprocess_transforms()
+
         self._initialize_attributes()
         self.initialize_trainer_utils()
 
-        if self.arguments.track_memory and self.arguments.track_memory > 0:
-            self._initialize_memory_tracking()
+    @staticmethod
+    def _normalize_esurge_prompts(
+        prompts: tp.Any,
+        apply_chat_template: bool,
+    ) -> list[str | list[dict[str, str]]]:
+        """Normalize user-provided prompts into strings or chat conversations."""
 
-    @classmethod
-    def load_trainer_state(
-        cls,
-        load_directory: str | os.PathLike,
-        dataset_train: Dataset | None = None,
-        dataset_eval: Dataset | None = None,
-        data_collator: tp.Callable | None = None,
-        device: jax.Device | None = "cpu",  # type:ignore
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.Precision | None = None,
-        sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1, 1),
-        sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
-        sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
-        partition_axis: PartitionAxis | None = None,
-        shard_attention_computation: bool = True,
-        shard_fns: tp.Mapping[tuple, tp.Callable] | dict | None = None,
-        backend: EasyDeLBackends | None = None,
-        platform: EasyDeLPlatforms | None = None,
-        config_kwargs: EasyDeLBaseConfigDict | None = None,
-        model_task: TaskType = TaskType.AUTO_BIND,
-        auto_shard_model: bool = True,
-        partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
-        quantization_platform: EasyDeLPlatforms | None = None,
-        quantization_method: EasyDeLQuantizationMethods | None = None,
-        quantization_block_size: int = 128,
-        quantization_pattern: str | None = None,
-        quantize_tensors: bool = True,
-        verbose: bool = True,
-        base_state: type[EasyDeLState] | None = None,
-        trainer_init_arguments: dict[str, tp.Any] | None = None,
-        **kwargs,
-    ):
-        """
-        Load a trainer from a saved checkpoint directory.
+        def _normalize_single(item: tp.Any) -> str | list[dict[str, str]]:
+            if isinstance(item, list):
+                if not item:
+                    return ""
+                if isinstance(item[0], dict):
+                    return item
+                if len(item) == 1 and isinstance(item[0], list):
+                    return _normalize_single(item[0])
+                return str(item)
 
-        This class method reconstructs a trainer instance from a previously saved
-        checkpoint, including the model state and training arguments.
+            if isinstance(item, dict):
+                if "role" in item and "content" in item:
+                    return [item]
+                for key in ("prompt", "text", "content"):
+                    if key in item:
+                        return _normalize_single(item[key])
+                return str(item)
 
-        Parameters
-        ----------
-        load_directory : str | os.PathLike
-            Path to the checkpoint directory containing saved model state
-        dataset_train : Dataset | None, optional
-            Training dataset to use with the loaded trainer
-        dataset_eval : Dataset | None, optional
-            Evaluation dataset to use with the loaded trainer
-        data_collator : tp.Callable | None, optional
-            Function to collate batches of data
-        device : jax.Device | None, optional
-            Device to load the model on, by default "cpu"
-        dtype : jnp.dtype, optional
-            Data type for computations, by default jnp.bfloat16
-        param_dtype : jnp.dtype, optional
-            Data type for model parameters, by default jnp.bfloat16
-        precision : jax.lax.Precision | None, optional
-            JAX precision level for matrix multiplications
-        sharding_axis_dims : tp.Sequence[int], optional
-            Dimensions for sharding axes (dp, fsdp, ep, tp, sp), by default (1, -1, 1, 1, 1)
-        sharding_dcn_axis_dims : tp.Sequence[int] | None, optional
-            DCN-specific sharding dimensions for cross-data-center training
-        sharding_axis_names : tp.Sequence[str], optional
-            Names for the sharding axes, by default ("dp", "fsdp", "ep", "tp", "sp")
-        partition_axis : PartitionAxis | None, optional
-            Custom partition axis configuration
-        shard_attention_computation : bool, optional
-            Whether to shard attention computations, by default True
-        shard_fns : tp.Mapping[tuple, tp.Callable] | dict | None, optional
-            Custom sharding functions for specific operations
-        backend : EasyDeLBackends | None, optional
-            Computation backend (CPU, GPU, TPU)
-        platform : EasyDeLPlatforms | None, optional
-            Platform-specific configuration
-        config_kwargs : EasyDeLBaseConfigDict | None, optional
-            Additional configuration parameters
-        model_task : TaskType, optional
-            Task type for the model, by default TaskType.AUTO_BIND
-        auto_shard_model : bool, optional
-            Whether to automatically shard the model, by default True
-        partition_rules : tuple[tuple[str, PartitionSpec], ...] | None, optional
-            Rules for partitioning model parameters across devices
-        quantization_platform : EasyDeLPlatforms | None, optional
-            Platform for quantization operations
-        quantization_method : EasyDeLQuantizationMethods | None, optional
-            Method for quantization (e.g., INT8, FP8)
-        quantization_block_size : int, optional
-            Block size for quantization, by default 128
-        quantization_pattern : str | None, optional
-            Pattern for selective quantization of layers
-        quantize_tensors : bool, optional
-            Whether to quantize tensors, by default True
-        verbose : bool, optional
-            Whether to print loading progress, by default True
-        base_state : type[EasyDeLState] | None, optional
-            Base state class to use for loading, defaults to EasyDeLState
-        trainer_init_arguments : dict[str, tp.Any] | None, optional
-            Additional arguments for trainer initialization
-        **kwargs
-            Additional keyword arguments passed to state loading
+            if apply_chat_template:
+                return [{"role": "user", "content": str(item)}]
+            return str(item)
 
-        Returns:
-            BaseTrainer A new trainer instance loaded from the checkpoint with the specified configuration
+        if isinstance(prompts, list):
+            if not prompts:
+                return []
+            if isinstance(prompts[0], dict):
+                return [_normalize_single(prompts)]
+            return [_normalize_single(p) for p in prompts]
+        return [_normalize_single(prompts)]
 
-        Raises:
-            FileNotFoundError
-                If the checkpoint directory does not exist
-            ValueError
-                If the checkpoint files are corrupted or incompatible
+    @staticmethod
+    def _decode_prompt_batch(
+        processor: PreTrainedTokenizerBase | None,
+        input_ids: jax.Array | np.ndarray,
+        skip_special_tokens: bool = True,
+        pad_token_id: int | None = None,
+        pop_pad_tokens: bool = False,
+        attention_mask: jax.Array | np.ndarray | None = None,
+    ) -> list[str]:
+        if processor is None or not hasattr(processor, "decode"):
+            raise ValueError("Cannot decode input_ids to prompts without a valid processor")
+        array = np.asarray(input_ids)
+        if array.ndim == 1:
+            array = array[None, :]
 
-        Examples
-        --------
-        >>> # Load a trainer from checkpoint
-        >>> trainer = MyTrainer.load_trainer_state(
-        ...     load_directory="/path/to/checkpoint",
-        ...     dataset_train=train_dataset,
-        ...     dataset_eval=eval_dataset,
-        ...     device=jax.devices("gpu")[0]
-        ... )
+        mask = None
+        if attention_mask is not None:
+            mask = np.asarray(attention_mask)
+            if mask.ndim == 1:
+                mask = mask[None, :]
 
-        >>> # Resume training from the loaded state
-        >>> output = trainer.train()
+        # Get pad_token_id if not provided
+        if pop_pad_tokens and pad_token_id is None:
+            pad_token_id = (
+                getattr(processor, "pad_token_id", None)
+                or getattr(getattr(processor, "tokenizer", None), "pad_token_id", None)
+                or 0
+            )
+        prompts: list[str] = []
+        for i, seq in enumerate(array):
+            if pop_pad_tokens:
+                if mask is not None:
+                    # Use attention_mask to reliably extract real tokens
+                    seq = seq[mask[i].astype(bool)]
+                elif pad_token_id is not None:
+                    seq = seq[seq != pad_token_id]
+            prompts.append(processor.decode(seq, skip_special_tokens=skip_special_tokens))
+        return prompts
 
-        Notes
-        -----
-        The method performs the following steps:
-        1. Loads the model state from the checkpoint directory
-        2. Loads the training arguments from the checkpoint
-        3. Reconstructs the trainer with the loaded state and provided datasets
-        4. The trainer is ready to resume training from the checkpoint step
-        """
-        if base_state is None:
-            base_state = EasyDeLState
-        model_state = base_state.load_state(
-            load_directory=load_directory,
-            device=device,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            sharding_axis_dims=sharding_axis_dims,
-            sharding_dcn_axis_dims=sharding_dcn_axis_dims,
-            sharding_axis_names=sharding_axis_names,
-            partition_axis=partition_axis,
-            shard_attention_computation=shard_attention_computation,
-            shard_fns=shard_fns,
-            backend=backend,
-            platform=platform,
-            config_kwargs=config_kwargs,
-            model_task=model_task,
-            auto_shard_model=auto_shard_model,
-            partition_rules=partition_rules,
-            quantization_platform=quantization_platform,
-            quantization_method=quantization_method,
-            quantization_block_size=quantization_block_size,
-            quantization_pattern=quantization_pattern,
-            quantize_tensors=quantize_tensors,
-            verbose=verbose,
-            **kwargs,
-        )
-
-        load_args_path = ePath(load_directory) / DEFAULT_ARGS_JSON_NAME
-        arguments = TrainingArguments.load_arguments(load_args_path)
-        if trainer_init_arguments is None:
-            trainer_init_arguments = {}
-        return cls(
-            arguments=arguments,
-            dataset_eval=dataset_eval,
-            dataset_train=dataset_train,
-            data_collator=data_collator,
-            model_state=model_state,
-            **trainer_init_arguments,
-        )
+    @staticmethod
+    def _sanitize_text_prompt(prompt: str, processor: PreTrainedTokenizerBase | None) -> str:
+        pad_token = None
+        if processor is not None:
+            pad_token = getattr(processor, "pad_token", None) or getattr(
+                getattr(processor, "tokenizer", None), "pad_token", None
+            )
+        if pad_token:
+            prompt = prompt.replace(pad_token, "")
+        return prompt
 
     @property
     def model(self):
@@ -406,20 +446,20 @@ class BaseTrainer(BaseTrainerProtocol):
         return self.arguments.eval_batch_size
 
     @property
-    def _train_shared_fn_extra_args(self) -> tuple[tp.Any]:
+    def _train_shared_fn_extra_args(self) -> tuple[tp.Any, ...]:
         return self._train_shared_fn_extra_args_
 
     @property
-    def _eval_shared_fn_extra_args(self) -> tuple[tp.Any]:
+    def _eval_shared_fn_extra_args(self) -> tuple[tp.Any, ...]:
         return self._eval_shared_fn_extra_args_
 
     @property
-    def _train_shared_fn_static_args(self) -> tuple[tp.Any]:
-        return self._train_shared_fn_static_args_
+    def _train_shared_fn_static_args(self) -> tuple[tp.Any, ...]:
+        return self._train_shared_fn_static_args_  # pyright: ignore[reportReturnType]
 
     @property
-    def _eval_shared_fn_static_args(self) -> tuple[tp.Any]:
-        return self._eval_shared_fn_static_args_
+    def _eval_shared_fn_static_args(self) -> tuple[tp.Any, ...]:
+        return self._eval_shared_fn_static_args_  # pyright: ignore[reportReturnType]
 
     @_train_shared_fn_static_args.setter
     def _train_shared_fn_static_args(self, val):
@@ -436,6 +476,111 @@ class BaseTrainer(BaseTrainerProtocol):
     @_eval_shared_fn_extra_args.setter
     def _eval_shared_fn_extra_args(self, val):
         self._eval_shared_fn_extra_args_ = val
+
+    @cached_property
+    def _pad_token_id(self):
+        if isinstance(self.processing_class, ProcessorMixin):
+            pad_token_id = self.processing_class.tokenizer.pad_token_id
+        else:
+            pad_token_id = self.processing_class.pad_token_id
+        if pad_token_id is not None:
+            return pad_token_id
+        else:
+            return self.eos_token_id[0]
+
+    @cached_property
+    def _eos_token_id(self) -> list[int]:
+        eos_ids = []
+        if isinstance(self.processing_class, ProcessorMixin):
+            proc_eos_token_id = self.processing_class.tokenizer.eos_token_id
+        else:
+            proc_eos_token_id = self.processing_class.eos_token_id
+        if isinstance(proc_eos_token_id, int):
+            proc_eos_token_id = [proc_eos_token_id]
+        eos_ids = eos_ids + proc_eos_token_id
+        if hasattr(self.model, "generation_config"):
+            conf_eos = self.model.generation_config.eos_token_id
+            if isinstance(conf_eos, int):
+                conf_eos = [conf_eos]
+            eos_ids = eos_ids + conf_eos
+        return list(set(eos_ids))
+
+    def _make_attn_mask(self, arr):
+        is_eos = jnp.isin(arr, jnp.asarray(self._eos_token_id).reshape(-1))
+        return (
+            (jnp.arange(is_eos.shape[1])[None, :].repeat(is_eos.shape[0], axis=0))
+            <= jnp.where(
+                is_eos.any(axis=1),
+                jnp.argmax(is_eos.astype(jnp.int32), axis=1),
+                jnp.full((is_eos.shape[0],), is_eos.shape[1]),
+            )[:, None]
+        ).astype(jnp.int32)
+
+    def _to_sharded_source(
+        self,
+        dataset: "Dataset | IterableDataset | ShardedDataSource | None",
+    ) -> ShardedDataSource | None:
+        """Convert any dataset type to ShardedDataSource.
+
+        This enables trainers to work with a unified data interface internally
+        while accepting various input types from users.
+
+        Args:
+            dataset: Input dataset (HF Dataset, IterableDataset, or ShardedDataSource).
+
+        Returns:
+            ShardedDataSource wrapping the input, or None if input is None.
+
+        Raises:
+            TypeError: If dataset type is not supported.
+        """
+        if dataset is None:
+            return None
+        if isinstance(dataset, ShardedDataSource):
+            return dataset
+        # Use wrap_hf_dataset for HF datasets
+        return wrap_hf_dataset(dataset)
+
+    def _apply_preprocess_transforms(self) -> None:
+        """Apply preprocessing transforms to data sources.
+
+        Gets the trainer-specific transform via _get_preprocess_transform()
+        and applies it to both train and eval sources if available.
+        """
+        transform = self._get_preprocess_transform()
+        if transform is None:
+            return
+
+        if self._train_source is not None:
+            self._train_source = self._train_source.transform(transform)
+        if self._eval_source is not None:
+            self._eval_source = self._eval_source.transform(transform)
+
+    def _get_preprocess_transform(self) -> Transform | None:
+        """Get trainer-specific preprocessing transform.
+
+        Override in subclasses to return a Transform that will be applied
+        to the ShardedDataSource during data loading.
+
+        Returns:
+            Transform instance or None if no preprocessing needed.
+            Return None if data is already preprocessed (e.g., has input_ids).
+        """
+        return None
+
+    def _is_pretokenized(self) -> bool:
+        """Check if the training dataset is already tokenized.
+
+        Returns:
+            True if dataset already contains 'input_ids' field.
+        """
+        if self._train_source is None:
+            return False
+        try:
+            sample = next(iter(self._train_source.open_shard(self._train_source.shard_names[0])))
+            return "input_ids" in sample
+        except (StopIteration, IndexError):
+            return False
 
     def _initialize_attributes(self):
         """Initialize all trainer attributes with default values.
@@ -475,7 +620,7 @@ class BaseTrainer(BaseTrainerProtocol):
         self._extra_backward_flops_per_token = getattr(self, "_extra_backward_flops_per_token", 0)
 
         self.checkpoint_manager = getattr(self, "checkpoint_manager", None)
-        self.pruning_module = getattr(self.arguments, "pruning_module", None)
+        self.pruning_module = self.arguments.pruning_module
         self.memory_monitor = getattr(self.arguments, "memory_monitor", None)
 
         self._model = getattr(self, "_model", None)
@@ -504,12 +649,12 @@ class BaseTrainer(BaseTrainerProtocol):
         self._train_shared_fn_static_args_ = getattr(
             self,
             "_train_shared_fn_static_args_",
-            {},
+            (),
         )
         self._eval_shared_fn_static_args_ = getattr(
             self,
             "_eval_shared_fn_static_args_",
-            {},
+            (),
         )
 
         self._train_shared_fn_extra_args_ = getattr(
@@ -522,95 +667,16 @@ class BaseTrainer(BaseTrainerProtocol):
             "_eval_shared_fn_extra_args_",
             (),
         )
-
-    def _try_resume_from_checkpoint(self, current_state: EasyDeLState) -> EasyDeLState | None:
-        """
-        Try to resume from the latest checkpoint if available.
-
-        This method searches for existing checkpoints in the save directory and
-        attempts to load the most recent one. It handles multiple checkpoint
-        directories and falls back gracefully if loading fails.
-
-        Args:
-            current_state: The current model state (used as fallback if no checkpoint found)
-
-        Returns:
-            The resumed state if a checkpoint was found and loaded, None otherwise
-
-        Note:
-            - Checkpoints are expected to be in directories named "run-{step}"
-            - The method will try multiple checkpoints if the most recent fails
-            - Sets step_start_point in arguments if resuming is successful
-            - ePath handles both local and cloud storage (gs://, s3://) transparently
-        """
-        try:
-            checkpoint_dir = self.arguments._get_save_directory(create=False)
-            all_paths = list(checkpoint_dir.glob("run-*"))
-
-            if not all_paths:
-                logger.info("No checkpoints found in save directory. Starting fresh training.")
-                return None
-
-            run_dir_names = set()
-            for path in all_paths:
-                parts = str(path).split("/")
-                for i, part in enumerate(parts):
-                    if part.startswith("run-") and part[4:].split("-")[0].isdigit():
-                        run_dir_path = "/".join(parts[: i + 1])
-                        run_dir_names.add(run_dir_path)
-                        break
-
-            if not run_dir_names:
-                logger.info("No valid run directories found. Starting fresh training.")
-                return None
-            sorted_run_dirs = sorted(
-                run_dir_names,
-                key=lambda x: int(x.split("run-")[-1].split("/")[0])
-                if x.split("run-")[-1].split("/")[0].isdigit()
-                else 0,
-                reverse=True,
-            )
-
-            for run_dir_path in sorted_run_dirs:
-                try:
-                    model = current_state.model
-                    logger.info(f"Attempting to resume from checkpoint: {run_dir_path}")
-                    run_dir = ePath(run_dir_path)
-
-                    resumed_state = EasyDeLState.load_state(
-                        load_directory=run_dir,
-                        dtype=model.dtype,
-                        param_dtype=model.param_dtype,
-                        precision=model.precision,
-                        auto_shard_model=True,
-                        partition_axis=model.config.partition_axis,
-                        sharding_axis_names=model.config.sharding_axis_names,
-                        sharding_axis_dims=model.config.sharding_axis_dims,
-                        sharding_dcn_axis_dims=model.config.sharding_dcn_axis_dims,
-                        model_task=model.model_task,
-                        verbose=True,
-                    )
-
-                    actual_step = int(jax.device_get(resumed_state.step))
-
-                    logger.info(f"Successfully resumed from checkpoint at step {actual_step}")
-
-                    if self.arguments.step_start_point is None:
-                        self.arguments.step_start_point = actual_step
-                        logger.info(f"Set step_start_point to {actual_step}")
-
-                    return resumed_state
-
-                except Exception as e:
-                    logger.warning(f"Failed to load checkpoint from {run_dir_path}: {e}")
-                    continue
-
-            logger.warning("Could not load any checkpoints. Starting fresh training.")
-            return None
-
-        except Exception as e:
-            logger.warning(f"Error while trying to resume from checkpoint: {e}")
-            return None
+        self.generate_function = getattr(self, "generate_function", None)
+        self.latest_generation_samples = getattr(self, "latest_generation_samples", [])
+        rng = getattr(self, "_generation_rng", None)
+        seed = self.arguments.generation_seed
+        if rng is None:
+            if seed is None:
+                rng = np.random.default_rng()
+            else:
+                rng = np.random.default_rng(seed)
+        self._generation_rng = rng
 
     def _initialize_memory_tracking(self):
         """Initialize memory monitoring for tracking GPU/TPU memory usage.
@@ -706,7 +772,10 @@ class BaseTrainer(BaseTrainerProtocol):
         return state, metrics
 
     def _preprocess_batch_input(
-        self, state: EasyDeLState, batch: dict[str, jax.Array], is_train: bool
+        self,
+        state: EasyDeLState,
+        batch: dict[str, jax.Array],
+        is_train: bool,
     ) -> tuple[dict[str, jax.Array], dict[str, float | int | str]]:
         """Preprocess a batch of input data before feeding to the model.
 
@@ -730,8 +799,81 @@ class BaseTrainer(BaseTrainerProtocol):
         -----
         This method can be overridden to implement custom preprocessing
         such as data augmentation, masking, or format conversion.
+        The batch is automatically purified to remove non-array fields.
         """
+        # Purify batch to keep only JAX-compatible array fields
+        batch = self._purify_batch(batch)
         return batch, {}
+
+    def _purify_batch(self, batch: dict) -> dict:
+        """Remove non-JAX-compatible fields from a batch.
+
+        Filters out fields that cannot be passed to JAX JIT-compiled functions,
+        such as strings, lists of strings, or other non-array types.
+
+        Parameters
+        ----------
+        batch : dict
+            The batch dictionary to purify
+
+        Returns
+        -------
+        dict
+            Purified batch with only JAX-compatible array fields
+        """
+
+        # Handle list of dicts (uncollated batch)
+        if isinstance(batch, (list, tuple)) and len(batch) > 0 and isinstance(batch[0], dict):
+            # Collate list of dicts into dict of arrays with padding
+            collated = {}
+            for key in batch[0].keys():
+                values = [example.get(key) for example in batch]
+                # Skip None values
+                if any(v is None for v in values):
+                    continue
+                try:
+                    arrays = [np.asarray(v) for v in values]
+                    # Check if arrays have same shape
+                    if all(arr.shape == arrays[0].shape for arr in arrays):
+                        collated[key] = np.stack(arrays)
+                    else:
+                        # Pad sequences to same length (for 1D arrays like input_ids)
+                        if all(arr.ndim == 1 for arr in arrays):
+                            max_len = max(len(arr) for arr in arrays)
+                            # Determine pad value (0 for input_ids, typically)
+                            pad_value = 0
+                            padded = []
+                            for arr in arrays:
+                                if len(arr) < max_len:
+                                    padded.append(np.pad(arr, (0, max_len - len(arr)), constant_values=pad_value))
+                                else:
+                                    padded.append(arr)
+                            collated[key] = np.stack(padded)
+                        else:
+                            # Can't handle multi-dimensional arrays with different shapes
+                            pass
+                except (ValueError, TypeError):
+                    pass  # Skip non-stackable values
+            batch = collated
+
+        purified = {}
+        for key, value in batch.items():
+            # Keep only numeric arrays (numpy or JAX)
+            if isinstance(value, (np.ndarray, jax.Array)):
+                # Check if it's a numeric dtype (not object/string)
+                if hasattr(value, "dtype") and np.issubdtype(value.dtype, np.number):
+                    purified[key] = value
+                elif hasattr(value, "dtype") and value.dtype == np.bool_:
+                    purified[key] = value
+            elif isinstance(value, (list, tuple)):
+                # Try to convert to array - will fail for strings
+                try:
+                    arr = np.asarray(value)
+                    if np.issubdtype(arr.dtype, np.number) or arr.dtype == np.bool_:
+                        purified[key] = arr
+                except (ValueError, TypeError):
+                    pass  # Skip non-convertible values
+        return purified
 
     def _ensure_functions_compiled(self):
         """Ensure training and evaluation functions are compiled.
@@ -742,6 +884,1095 @@ class BaseTrainer(BaseTrainerProtocol):
         training and evaluation step functions to improve performance.
         """
         self.compile_aot()
+
+    def _configure_generation_function(self):
+        """Prepare a default generation function when the model supports generation."""
+        if self.generate_function is not None:
+            return
+        state = getattr(self, "model_state", None)
+        if state is None or not hasattr(state, "model"):
+            return
+        model = state.model
+        if not hasattr(model, "generate"):
+            return
+        try:
+            kwargs = self._default_generation_kwargs()
+            config_overrides = self._default_generation_config_overrides()
+            shard_inputs = self.arguments.generation_shard_inputs
+            self.generate_function = self.create_generate_function(
+                shard_inputs=shard_inputs,
+                config_overrides=config_overrides,
+                **kwargs,
+            )
+        except Exception as exc:  # pragma: no cover - generation is optional
+            log_debug_maybe(f"Skipping default generation function setup due to: {exc}")
+
+    def _prepare_generation_config(
+        self,
+        generation_config: GenerationConfig | None,
+    ) -> GenerationConfig | None:
+        """Return a copy of the generation config to avoid mutating shared references."""
+        _gen_config_cls: type | None = globals().get("GenerationConfig")
+        if _gen_config_cls is None:
+            return generation_config
+        if generation_config is not None:
+            return copy.deepcopy(generation_config)
+        model = self.model_state.model
+        base_config = getattr(model, "generation_config", None)
+        if base_config is None:
+            return None
+        return copy.deepcopy(base_config)
+
+    def _default_generation_kwargs(self) -> dict[str, tp.Any]:
+        """Assemble default keyword arguments for `model.generate` based on training arguments."""
+        args = self.arguments
+        if args is None:
+            return {}
+
+        def _maybe_insert(target: dict[str, tp.Any], key: str, value: tp.Any) -> None:
+            if value is not None:
+                target[key] = value
+
+        kwargs: dict[str, tp.Any] = {}
+        _maybe_insert(kwargs, "top_p", args.generation_top_p)
+        _maybe_insert(kwargs, "top_k", args.generation_top_k)
+        _maybe_insert(kwargs, "temperature", args.generation_temperature)
+        _maybe_insert(kwargs, "do_sample", args.generation_do_sample)
+        _maybe_insert(kwargs, "num_return_sequences", args.generation_num_return_sequences)
+        _maybe_insert(kwargs, "max_new_tokens", args.generation_max_new_tokens)
+
+        if "max_new_tokens" not in kwargs:
+            fallback = args.max_completion_length
+            if fallback is not None:
+                kwargs["max_new_tokens"] = fallback
+
+        if "num_return_sequences" not in kwargs:
+            fallback = args.num_return_sequences
+            if fallback is not None:
+                kwargs["num_return_sequences"] = fallback
+
+        if "do_sample" not in kwargs:
+            if any(key in kwargs for key in ("top_p", "top_k", "temperature")):
+                kwargs["do_sample"] = True
+        if "eos_token_id" not in kwargs:
+            proc = self._get_processing_class()
+            eos_token_id = getattr(proc, "eos_token_id", None)
+            if eos_token_id is not None:
+                kwargs["eos_token_id"] = eos_token_id
+            else:
+                kwargs["eos_token_id"] = getattr(getattr(proc, "tokenizer", None), "eos_token_id", None)
+        extra = args.generation_extra_kwargs
+        if extra:
+            kwargs.update(extra)
+
+        return kwargs
+
+    def _default_generation_config_overrides(self) -> dict[str, tp.Any] | None:
+        overrides = self.arguments.generation_config_overrides
+        if not overrides:
+            return None
+        return dict(overrides)
+
+    def create_generate_function(
+        self,
+        generation_config: GenerationConfig | None = None,
+        *,
+        shard_inputs: bool = True,
+        config_overrides: dict[str, tp.Any] | None = None,
+        **generate_kwargs,
+    ) -> tp.Callable[[EasyDeLState, jax.Array, jax.Array], tuple[jax.Array, jax.Array, jax.Array]]:
+        """
+        Build and return a compiled generation function that mirrors the model's `generate`.
+
+        Parameters
+        ----------
+        generation_config:
+            Optional generation configuration. If omitted, the model's default configuration is used.
+        shard_inputs:
+            Whether to shard the prompt tensors using the model's partition manager before generation.
+        config_overrides:
+            Optional attribute overrides applied to the copied generation configuration.
+        generate_kwargs:
+            Extra keyword arguments forwarded to `module.generate`.
+        """
+        state = getattr(self, "model_state", None)
+        if state is None:
+            raise RuntimeError("Model state is not initialized; cannot create generation function.")
+        if not hasattr(state.model, "generate"):
+            raise NotImplementedError("Attached model does not provide a `generate` method.")
+
+        effective_generate_kwargs = dict(generate_kwargs)
+        config_copy = self._prepare_generation_config(generation_config)
+        if config_copy is not None and config_overrides:
+            for key, value in config_overrides.items():
+                setattr(config_copy, key, value)
+        if config_copy is not None:
+            for key, value in effective_generate_kwargs.items():
+                if hasattr(config_copy, key):
+                    setattr(config_copy, key, value)
+
+        mesh = self.model.mesh
+        empty_sharding = jax.sharding.NamedSharding(spec=jax.sharding.PartitionSpec(), mesh=mesh)
+
+        @ejit(  # pyright: ignore[reportUntypedFunctionDecorator]
+            in_shardings=(self.state_shardings, empty_sharding, empty_sharding),
+            out_shardings=(empty_sharding, empty_sharding, empty_sharding),
+        )
+        def generate(state: EasyDeLState, input_ids: jax.Array, attention_mask: jax.Array):
+            module = state.model
+            with module.mesh:
+                shard_input_ids = input_ids
+                shard_attention_mask = attention_mask
+                if shard_inputs:
+                    partition_manager = getattr(module.config, "partition_manager", None)
+                    if partition_manager is not None:
+                        axes = [common_types.BATCH, common_types.SEQUENCE_PARALLEL]
+                        shard_input_ids = partition_manager.shard(
+                            shard_input_ids,
+                            axes=axes,
+                            mode=common_types.MODE_PREFILL,
+                        )
+                        shard_attention_mask = partition_manager.shard(
+                            shard_attention_mask,
+                            axes=axes,
+                            mode=common_types.MODE_PREFILL,
+                        )
+
+                if config_copy is None:
+                    outputs = module.generate(
+                        input_ids=shard_input_ids,
+                        attention_mask=shard_attention_mask,
+                        **effective_generate_kwargs,
+                    )
+                else:
+                    outputs = module.generate(
+                        input_ids=shard_input_ids,
+                        attention_mask=shard_attention_mask,
+                        generation_config=config_copy,
+                        **effective_generate_kwargs,
+                    )
+
+                sequences: jax.Array = outputs.sequences if hasattr(outputs, "sequences") else outputs
+                return sequences, shard_input_ids, shard_attention_mask
+
+        return generate
+
+    def generate_aio(
+        self,
+        input_ids: jax.Array | np.ndarray,
+        attention_mask: jax.Array | np.ndarray | None = None,
+        *,
+        state: EasyDeLState | None = None,
+        generation_config: GenerationConfig | None = None,
+        shard_inputs: bool | None = None,
+        config_overrides: dict[str, tp.Any] | None = None,
+        return_metadata: bool = False,
+        all_gather: bool = False,
+        **generate_kwargs,
+    ):
+        """
+        Convenience wrapper around the compiled generation function.
+        """
+
+        if state is None:
+            state = self.model_state
+        if state is None:
+            raise RuntimeError("Model state is not initialized; call after trainer setup.")
+
+        if shard_inputs is None:
+            shard_inputs = self.arguments.generation_shard_inputs
+
+        input_ids = jnp.asarray(input_ids)
+        if attention_mask is None:
+            attention_mask = jnp.ones_like(input_ids, dtype=jnp.int32)
+        else:
+            attention_mask = jnp.asarray(attention_mask)
+
+        needs_custom_fn = bool(generation_config or config_overrides or generate_kwargs)
+        if needs_custom_fn:
+            merged_kwargs = self._default_generation_kwargs()
+            merged_kwargs.update(generate_kwargs)
+            merged_overrides = self._default_generation_config_overrides() or {}
+            if config_overrides:
+                merged_overrides.update(config_overrides)
+            generate_fn = self.create_generate_function(
+                generation_config=generation_config,
+                shard_inputs=shard_inputs,
+                config_overrides=merged_overrides or None,
+                **merged_kwargs,
+            )
+        else:
+            if self.generate_function is None:
+                default_kwargs = self._default_generation_kwargs()
+                default_overrides = self._default_generation_config_overrides()
+                self.generate_function = self.create_generate_function(
+                    shard_inputs=shard_inputs,
+                    config_overrides=default_overrides,
+                    **default_kwargs,
+                )
+            generate_fn = self.generate_function
+
+        sequences, prompt_ids, prompt_mask = generate_fn(state, input_ids, attention_mask)
+
+        if all_gather:
+            sequences = self._all_gather(sequences)
+            prompt_ids = self._all_gather(prompt_ids)
+            prompt_mask = self._all_gather(prompt_mask)
+
+        if return_metadata:
+            return sequences, prompt_ids, prompt_mask
+        return sequences
+
+    def generate_unified(
+        self,
+        input_ids: jax.Array | np.ndarray | None = None,
+        attention_mask: jax.Array | np.ndarray | None = None,
+        prompts: str | list[str] | None = None,
+        *,
+        state: EasyDeLState | None = None,
+        use_esurge: bool | None = None,
+        apply_chat_template: bool = False,
+        generation_config: GenerationConfig | None = None,
+        shard_inputs: bool | None = None,
+        config_overrides: dict[str, tp.Any] | None = None,
+        all_gather: bool = False,
+        **generate_kwargs,
+    ) -> GenerationResults:
+        """Unified generation interface supporting both compiled and eSurge generation.
+
+        This method provides a single interface for generation that automatically handles:
+        - Conversion between text prompts and token IDs
+        - Selection between eSurge and compiled generation based on configuration
+        - Consistent output format regardless of generation method
+        - Optional chat template application
+
+        Args:
+            input_ids: Optional token IDs for the prompt. If None, must provide prompts.
+            attention_mask: Optional attention mask for input_ids.
+            prompts: Optional text prompt(s). If None, must provide input_ids.
+            state: Model state to use for generation. Defaults to self.model_state.
+            use_esurge: Whether to use eSurge generation. Defaults to self.arguments.use_esurge_generation.
+            apply_chat_template: Whether to apply chat template to prompts. Default False.
+                If True and prompts is a string, wraps it in [{"role": "user", "content": prompt}].
+            generation_config: Optional generation configuration.
+            shard_inputs: Whether to shard inputs across devices.
+            config_overrides: Optional overrides for generation config.
+            all_gather: Whether to gather results from all devices.
+            **generate_kwargs: Additional kwargs passed to generation.
+
+        Returns:
+            GenerationResults: NamedTuple containing:
+                - generation_results: The result text
+                - prompt_ids: Token IDs for the prompt
+                - prompt_mask: Attention mask for the prompt
+                - sequences: Complete generated sequences (including prompt)
+
+        Raises:
+            ValueError: If neither input_ids nor prompts are provided.
+
+        Example:
+            >>> # Generate from token IDs (GRPO-style, no chat template)
+            >>> results = trainer.generate_unified(
+            ...     input_ids=prompt_ids,
+            ...     attention_mask=mask,
+            ...     apply_chat_template=False  # Raw generation
+            ... )
+            >>>
+            >>> # Generate with chat template (preview generation)
+            >>> results = trainer.generate_unified(
+            ...     prompts="Explain quantum computing",
+            ...     apply_chat_template=True  # Applies chat template
+            ... )
+            >>>
+            >>> # eSurge with chat format
+            >>> results = trainer.generate_unified(
+            ...     prompts=[{"role": "user", "content": "Hello"}],
+            ...     use_esurge=True
+            ... )
+        """
+        if input_ids is None and prompts is None:
+            raise ValueError("Must provide either input_ids or prompts")
+
+        state = state or self.model_state
+        args = self.arguments
+        processor = self._get_processing_class()
+
+        # Determine whether to use eSurge
+        if use_esurge is None:
+            use_esurge = args.use_esurge_generation
+
+        pad_token_id = self._pad_token_id
+        max_tokens = args.generation_max_new_tokens
+        if max_tokens is None:
+            max_tokens = getattr(args, "max_completion_length", None)
+        if max_tokens is None:
+            max_tokens = 1024
+        sampling_params = SamplingParams(
+            max_tokens=int(max_tokens),
+            temperature=args.generation_temperature or 0.7,
+            top_p=args.generation_top_p or 0.95,
+            top_k=args.generation_top_k or 64,
+            n=args.generation_num_return_sequences or 1,
+        )
+        if config_overrides:
+            max_new_tokens = config_overrides.get("max_new_tokens")
+            if max_new_tokens is not None:
+                sampling_params.max_tokens = int(max_new_tokens)
+            temperature = config_overrides.get("temperature")
+            if temperature is not None:
+                sampling_params.temperature = float(temperature)
+            top_p = config_overrides.get("top_p")
+            if top_p is not None:
+                sampling_params.top_p = float(top_p)
+            top_k = config_overrides.get("top_k")
+            if top_k is not None:
+                sampling_params.top_k = int(top_k)
+            num_return_sequences = config_overrides.get("num_return_sequences")
+            if num_return_sequences is not None:
+                sampling_params.n = int(num_return_sequences)
+            repetition_penalty = config_overrides.get("repetition_penalty")
+            if repetition_penalty is not None:
+                sampling_params.repetition_penalty = float(repetition_penalty)
+
+        # Handle eSurge generation path
+        if use_esurge:
+            # When the caller provides tokenized prompts, respect their prompt length for
+            # eSurge padding/sequence construction. Using `args.max_length` here can lead
+            # to sequences where completions are truncated away when `args.max_length`
+            # exceeds the provided `input_ids` length (common in RL trainers where
+            # `input_ids` is padded to `max_prompt_length`, not `max_length`).
+            prompt_seq_len = None
+            if input_ids is not None:
+                try:
+                    prompt_seq_len = int(input_ids.shape[-1])
+                except Exception:  # pragma: no cover - defensive: odd prompt containers
+                    prompt_seq_len = None
+
+            if prompts is None:
+                decoded_prompts = self._decode_prompt_batch(
+                    processor, input_ids, False, pad_token_id, True, attention_mask,
+                )
+                prompts = self._normalize_esurge_prompts(decoded_prompts, apply_chat_template)
+            else:
+                prompts = self._normalize_esurge_prompts(prompts, apply_chat_template)
+            return_prompts = prompts
+            if not prompts:
+                raise ValueError("No prompts available for eSurge generation")
+
+            # Build sampling params
+
+            # Build eSurge engine kwargs
+            esurge_kwargs = {}
+            if args.esurge_hbm_utilization is not None:
+                esurge_kwargs["hbm_utilization"] = args.esurge_hbm_utilization
+            if args.esurge_max_num_seqs is not None:
+                esurge_kwargs["max_num_seqs"] = args.esurge_max_num_seqs
+            else:
+                esurge_kwargs["max_num_seqs"] = (args.generation_num_return_sequences or 1) * args.total_batch_size
+            if args.esurge_min_input_pad is not None:
+                esurge_kwargs["min_input_pad"] = args.esurge_min_input_pad
+            if args.esurge_page_size is not None:
+                esurge_kwargs["page_size"] = args.esurge_page_size
+            if hasattr(args, "esurge_silent_mode"):
+                esurge_kwargs["silent_mode"] = args.esurge_silent_mode
+            if hasattr(args, "esurge_runner_verbose"):
+                esurge_kwargs["runner_verbose"] = args.esurge_runner_verbose
+            if args.esurge_max_num_batched_tokens is not None:
+                esurge_kwargs["max_num_batched_tokens"] = args.esurge_max_num_batched_tokens
+            if args.esurge_enable_prefix_caching is not None:
+                esurge_kwargs["enable_prefix_caching"] = args.esurge_enable_prefix_caching
+            if args.esurge_data_parallelism_axis is not None:
+                esurge_kwargs["data_parallelism_axis"] = args.esurge_data_parallelism_axis
+            if args.esurge_max_num_seq_buckets is not None:
+                esurge_kwargs["max_num_seq_buckets"] = [int(v) for v in args.esurge_max_num_seq_buckets]
+            effective_prompt_len = prompt_seq_len if prompt_seq_len is not None else (args.max_length or 2048)
+            # eSurge reserves a few tokens from the context budget (defaults to
+            # `reserve_tokens = max_num_seqs`). When we tightly pack
+            # `prompt_len + max_new_tokens == max_model_len` (common in PPO/GRPO
+            # rollouts where prompt is padded to max_prompt_length), eSurge will
+            # cap max_new_tokens by the reserve amount. Include the reserve in
+            # the requested max_model_len so the user-visible generation length
+            # stays consistent with `max_new_tokens`.
+            reserve_tokens = esurge_kwargs.get("reserve_tokens")
+            if reserve_tokens is None:
+                reserve_tokens = esurge_kwargs.get("max_num_seqs", 0)
+            esurge_kwargs["max_model_len"] = (
+                sampling_params.max_tokens + effective_prompt_len + int(reserve_tokens or 0)
+            )  # pyright: ignore[reportOptionalOperand]
+
+            logger.info_once(f"Creating eSurge {pprint.pformat(esurge_kwargs)}")
+            logger.info_once(
+                f"SamplingParams(max_tokens={sampling_params.max_tokens},"
+                f" temperature={sampling_params.temperature},"
+                f" top_p={sampling_params.top_p},"
+                f" top_k={sampling_params.top_k},"
+                f" n={sampling_params.n})"
+            )
+            esurge_kwargs["tokenizer"] = processor
+            esurge_engine = None
+            try:
+                esurge_engine = state.model.get_esurge(**esurge_kwargs)
+                # Use the resolved engine directly to avoid a second get_esurge()/refresh pass.
+                outputs: list[RequestOutput] = state.model._call_esurge_engine(
+                    esurge_engine,
+                    prompts=prompts,
+                    sampling_params=sampling_params,
+                    stream=False,
+                    use_tqdm=args.esurge_use_tqdm,
+                )
+            except Exception:
+                if esurge_engine is None:
+                    try:
+                        # If setup failed before returning an engine handle, fall back to
+                        # model-level pause to clean any partially initialized cached engine.
+                        state.model.pause_esurge()
+                    except Exception as cleanup_exc:  # pragma: no cover - best-effort resource cleanup
+                        log_debug_maybe(f"Failed to pause eSurge engine(s) after setup failure: {cleanup_exc}")
+                raise
+            finally:
+                if esurge_engine is not None:
+                    try:
+                        esurge_engine.pause()
+                        if hasattr(esurge_engine, "release_model_state"):
+                            esurge_engine.release_model_state(clear_compiled_cache=False)
+                    except Exception as exc:  # pragma: no cover - best-effort resource cleanup
+                        log_debug_maybe(f"Failed to pause/release eSurge engine after generation: {exc}")
+
+            # Build padded token arrays from eSurge outputs to ensure consistent shapes
+            max_seq_len = prompt_seq_len if prompt_seq_len is not None else (args.max_length or 2048)
+            max_new_tokens = sampling_params.max_tokens if sampling_params.max_tokens is not None else 1024
+            max_total_len = max_seq_len + max_new_tokens
+
+            # Track prompt arrays once per request
+            prompt_id_rows: list[list[int]] = []
+            prompt_mask_rows: list[list[int]] = []
+            sequence_rows: list[list[int]] = []
+            completion_id_rows: list[list[int]] = []
+            completion_mask_rows: list[list[int]] = []
+            output_records: list[str] = []
+            completion_prompts: list[str | list[dict[str, str]]] = []
+            prompt_indices: list[int | None] = []
+
+            def _strip_pad(tokens: list[int] | np.ndarray) -> tuple[int, ...]:
+                """Remove pad tokens for matching prompts across shuffled eSurge outputs."""
+                arr = np.asarray(tokens, dtype=np.int64).tolist()
+                return tuple(int(t) for t in arr if pad_token_id is None or t != pad_token_id)
+
+            # If caller supplied tokenized prompts, keep them as-is for return values
+            if input_ids is not None:
+                base_prompt_ids = np.asarray(input_ids, dtype=np.int32)
+                if base_prompt_ids.ndim == 1:
+                    base_prompt_ids = base_prompt_ids[None, :]
+                base_prompt_mask = (
+                    np.ones_like(base_prompt_ids, dtype=np.int32)
+                    if attention_mask is None
+                    else np.asarray(attention_mask, dtype=np.int32)
+                )
+                for row in base_prompt_ids:
+                    prompt_id_rows.append(list(row))
+                for row in base_prompt_mask:
+                    prompt_mask_rows.append(list(row))
+                prompt_signature_map: dict[tuple[int, ...], list[int]] = {}
+                for idx, row in enumerate(base_prompt_ids):
+                    sig = _strip_pad(row)
+                    prompt_signature_map.setdefault(sig, []).append(idx)
+            else:
+                prompt_signature_map = {}
+
+            # When n>1, each RequestOutput has multiple CompletionOutput objects
+            for output_idx, output in enumerate(outputs):
+                # Flatten and truncate prompt tokens
+                flattened_prompt_tokens: list[int] = []
+                if output.prompt_token_ids:
+                    for segment in output.prompt_token_ids:
+                        flattened_prompt_tokens.extend(segment)
+                base_prompt_tokens = flattened_prompt_tokens[:max_seq_len]
+                base_prompt_len = len(base_prompt_tokens)
+                prompt_padding = max_seq_len - base_prompt_len
+
+                # Left-pad prompts for RL training
+                padded_prompt_ids = [pad_token_id] * prompt_padding + base_prompt_tokens
+                padded_prompt_mask = [0] * prompt_padding + [1] * base_prompt_len
+                if input_ids is None:
+                    # When prompts were strings, this represents the canonical prompt ids/masks.
+                    prompt_id_rows.append(padded_prompt_ids)
+                    prompt_mask_rows.append(padded_prompt_mask)
+
+                mapped_prompt_idx = None
+                if prompt_signature_map:
+                    sig = _strip_pad(base_prompt_tokens)
+                    if prompt_signature_map.get(sig):
+                        mapped_prompt_idx = prompt_signature_map[sig].pop(0)
+                        if not prompt_signature_map[sig]:
+                            prompt_signature_map.pop(sig, None)
+
+                source_prompt = getattr(output, "prompt", return_prompts[output_idx] if return_prompts else None)
+
+                # Process each completion (handles n>1 sampling)
+                for completion in output.outputs:
+                    completion_prompts.append(source_prompt)
+                    prompt_indices.append(mapped_prompt_idx)
+                    # Add prompt arrays
+                    output_records.append(output.accumulated_text)
+
+                    # Extract completion tokens
+                    completion_tokens: list[int] = []
+                    if completion:
+                        completion_tokens = list(getattr(completion, "token_ids", []) or [])
+
+                    # Truncate completion if too long
+                    if len(completion_tokens) > max_new_tokens:
+                        completion_tokens = completion_tokens[:max_new_tokens]
+
+                    # Right-pad completions
+                    completion_len = len(completion_tokens)
+                    completion_padding = max_new_tokens - completion_len
+                    padded_completion_ids = completion_tokens + [pad_token_id] * completion_padding
+                    padded_completion_mask = [1] * completion_len + [0] * completion_padding
+
+                    completion_id_rows.append(padded_completion_ids)
+                    completion_mask_rows.append(padded_completion_mask)
+
+                    # Build full sequence: [left-padded prompt] + [generated tokens] + [right padding]
+                    sequence_tokens = [pad_token_id] * prompt_padding + base_prompt_tokens + completion_tokens
+                    remaining_padding = max_total_len - len(sequence_tokens)
+                    sequence_rows.append(sequence_tokens + [pad_token_id] * remaining_padding)
+
+            if not sequence_rows:
+                raise RuntimeError("eSurge generation returned no completions")
+            if not prompt_id_rows or not prompt_mask_rows:
+                raise RuntimeError("Could not determine prompt token metadata for eSurge generation")
+
+            # Reorder completions to align with original prompt order when possible.
+            if prompt_indices:
+                num_prompts = len(prompt_id_rows)
+                per_prompt: list[list[int]] = [[] for _ in range(num_prompts)]
+                unmatched: list[int] = []
+                for i, pidx in enumerate(prompt_indices):
+                    if pidx is None or pidx < 0 or pidx >= num_prompts:
+                        unmatched.append(i)
+                    else:
+                        per_prompt[pidx].append(i)
+                new_order = [idx for group in per_prompt for idx in group] + unmatched
+                completion_id_rows = [completion_id_rows[i] for i in new_order]
+                completion_mask_rows = [completion_mask_rows[i] for i in new_order]
+                completion_prompts = [completion_prompts[i] for i in new_order]
+                output_records = [output_records[i] for i in new_order]
+                sequence_rows = [sequence_rows[i] for i in new_order]
+
+            # Use original prompt ids/masks (not per-completion duplicates); repeat only if needed to align shapes.
+            base_prompt_ids = jnp.array(np.asarray(prompt_id_rows, dtype=np.int32))
+            base_prompt_mask = jnp.array(np.asarray(prompt_mask_rows, dtype=np.int32))
+            prompt_ids = base_prompt_ids
+            prompt_mask = base_prompt_mask
+
+            sequences = jnp.array(np.asarray(sequence_rows, dtype=np.int32))
+            completion_ids = jnp.array(np.asarray(completion_id_rows, dtype=np.int32))
+            completion_mask = jnp.array(np.asarray(completion_mask_rows, dtype=np.int32))
+            total_seq_len = prompt_ids.shape[-1] + completion_ids.shape[-1]
+            sequences = sequences[:, :total_seq_len]
+
+            if all_gather:
+                sequences = self._all_gather(sequences)
+                prompt_ids = self._all_gather(prompt_ids)
+                prompt_mask = self._all_gather(prompt_mask)
+                completion_ids = self._all_gather(completion_ids)
+                completion_mask = self._all_gather(completion_mask)
+            return GenerationResults(
+                generation_results=output_records,
+                prompt_ids=prompt_ids,
+                prompt_mask=prompt_mask,
+                sequences=sequences,
+                completion_ids=completion_ids,
+                completion_mask=completion_mask,
+                decoded_prompts=return_prompts,
+                completion_prompts=completion_prompts,
+            )
+
+        # Handle compiled generation path
+        else:
+            prompt_text_records: list[str] = []
+
+            if input_ids is None:
+                if prompts is None:
+                    raise ValueError("Must provide prompts when input_ids is None")
+                if processor is None or not hasattr(processor, "encode"):
+                    raise ValueError("Cannot tokenize prompts without a valid processor")
+
+                normalized_prompts = self._normalize_esurge_prompts(prompts, apply_chat_template)
+                if not normalized_prompts:
+                    raise ValueError("No prompts provided for generation")
+
+                max_seq_len = args.max_length or 2048
+
+                # Ensure left-padding for RL training (prompts should align at the right)
+                original_padding_side = getattr(processor, "padding_side", None)
+                if hasattr(processor, "padding_side"):
+                    processor.padding_side = "left"
+
+                encoded_ids: list[np.ndarray] = []
+                encoded_masks: list[np.ndarray] = []
+
+                for normalized in normalized_prompts:
+                    if isinstance(normalized, list):
+                        if not apply_chat_template or not hasattr(processor, "apply_chat_template"):
+                            raise ValueError(
+                                "Chat prompts require apply_chat_template=True when using compiled generation"
+                            )
+                        encoding = processor.apply_chat_template(
+                            normalized,
+                            return_tensors="np",
+                            padding="max_length",
+                            max_length=max_seq_len,
+                            truncation=True,
+                            add_generation_prompt=True,
+                            return_dict=True,
+                        )
+                        prompt_text_records.append(str(normalized))
+                    else:
+                        encoding = processor(
+                            normalized,
+                            return_tensors="np",
+                            padding="max_length",
+                            max_length=max_seq_len,
+                            truncation=True,
+                            add_special_tokens=True,
+                        )
+                        prompt_text_records.append(normalized)
+
+                    ids = np.asarray(encoding["input_ids"], dtype=np.int32)
+                    mask = encoding.get("attention_mask")
+                    if mask is None:
+                        mask = np.ones_like(ids, dtype=np.int32)
+                    else:
+                        mask = np.asarray(mask, dtype=np.int32)
+                    encoded_ids.append(ids)
+                    encoded_masks.append(mask)
+
+                # Restore original padding side
+                if hasattr(processor, "padding_side") and original_padding_side is not None:
+                    processor.padding_side = original_padding_side
+
+                input_ids = jnp.asarray(np.concatenate(encoded_ids, axis=0), dtype=jnp.int32)
+                attention_mask = jnp.asarray(np.concatenate(encoded_masks, axis=0), dtype=jnp.int32)
+
+            # Use compiled generation (internal call, deprecation warning suppressed)
+            sequences, prompt_ids, prompt_mask = self.generate_aio(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                state=state,
+                generation_config=generation_config,
+                shard_inputs=shard_inputs,
+                config_overrides=config_overrides,
+                return_metadata=True,
+                all_gather=all_gather,
+                **generate_kwargs,
+            )
+            # Extract completion tokens from sequences
+            max_new_tokens = sampling_params.max_tokens
+            prompt_len = prompt_ids.shape[1]
+            completion_ids = sequences[:, prompt_len : prompt_len + max_new_tokens]
+            completion_mask = self._make_attn_mask(completion_ids)
+            decoded_prompt_texts = self._decode_prompt_batch(processor, prompt_ids, False, pad_token_id, True)
+
+            # Build per-completion prompt list aligned with generated rows.
+            completion_prompts: list[str | list[dict[str, str]]] = []
+            repeat_factor = completion_ids.shape[0] // max(len(decoded_prompt_texts), 1)
+            repeat_factor = max(repeat_factor, 1)
+            for text_prompt in decoded_prompt_texts:
+                completion_prompts.extend([text_prompt] * repeat_factor)
+            if len(completion_prompts) < completion_ids.shape[0] and decoded_prompt_texts:
+                completion_prompts.extend(
+                    [decoded_prompt_texts[-1]] * (completion_ids.shape[0] - len(completion_prompts))
+                )
+            completion_prompts = completion_prompts[: completion_ids.shape[0]]
+
+            return GenerationResults(
+                generation_results=self._decode_prompt_batch(
+                    processor,
+                    sequences,
+                    skip_special_tokens=True,
+                    pad_token_id=pad_token_id,
+                    pop_pad_tokens=True,
+                ),
+                prompt_ids=prompt_ids,
+                prompt_mask=prompt_mask,
+                sequences=sequences,
+                completion_ids=completion_ids,
+                completion_mask=completion_mask,
+                decoded_prompts=decoded_prompt_texts,
+                completion_prompts=completion_prompts or None,
+            )
+
+    def _get_processing_class(self):
+        proc = getattr(self, "processing_class", None)
+        if proc is not None:
+            return proc
+        proc = getattr(self, "tokenizer", None)
+        if proc is not None:
+            return proc
+        state = getattr(self, "model_state", None)
+        if state is not None:
+            model = state.model
+            candidate = getattr(model, "processing_class", None)
+            if candidate is not None:
+                return candidate
+            candidate = getattr(model, "tokenizer", None)
+            if candidate is not None:
+                return candidate
+        return None
+
+    def _batch_decode_tokens(self, token_ids: tp.Any) -> list[str] | None:
+        processor = self._get_processing_class()
+        if processor is None or not hasattr(processor, "batch_decode"):
+            return None
+        array = np.asarray(token_ids)
+        if array.ndim == 1:
+            array = array[None, :]
+        try:
+            return processor.batch_decode(array, skip_special_tokens=True)
+        except Exception as exc:  # pragma: no cover - best effort decoding
+            log_debug_maybe(f"Failed to decode generation tokens: {exc}")
+            return None
+
+    def _collect_generation_prompts(self) -> list[tp.Any]:
+        args = self.arguments
+        if args is None:
+            return []
+        configured_prompts = list(args.generation_prompts)
+        target = args.generation_num_prompts
+        prompts = configured_prompts[: target or len(configured_prompts)]
+        remaining = max((target or 0) - len(prompts), 0)
+        if remaining > 0 and args.generation_use_train_prompts:
+            prompts.extend(self._sample_prompts_from_dataset(remaining))
+        return prompts
+
+    def _sample_prompts_from_dataset(self, expected: int) -> list[tp.Any]:
+        dataset = getattr(self, "dataset_train", None)
+        if dataset is None or expected <= 0:
+            return []
+        try:
+            dataset_len = len(dataset)
+        except Exception as exc:  # pragma: no cover - some datasets are not sized
+            log_debug_maybe(f"Cannot sample prompts from training dataset: {exc}")
+            return []
+        if dataset_len == 0:
+            return []
+        count = min(expected, dataset_len)
+        indices = self._generation_rng.choice(dataset_len, size=count, replace=False)
+        prompts: list[tp.Any] = []
+        for idx in np.atleast_1d(indices):
+            try:
+                sample = dataset[int(idx)]
+            except Exception as exc:  # pragma: no cover - ignore invalid rows
+                log_debug_maybe(f"Failed to sample dataset prompt at index {idx}: {exc}")
+                continue
+            prompts.append(sample)
+        return prompts
+
+    def _prepare_generation_input(self, prompt: tp.Any) -> dict[str, tp.Any] | None:
+        processor = self._get_processing_class()
+        prompt_text: str | None = None
+        encode_kwargs = dict(
+            truncation=True,
+            truncation_side="left",
+            tokenize=True,
+            padding="max_length",
+            max_length=self.arguments.max_length,
+            return_attention_mask=True,
+            return_tensors="np",
+            return_dict=True,
+            padding_side="left",
+            add_generation_prompt=True,
+        )
+        if isinstance(prompt, dict):
+            if "input_ids" in prompt:
+                input_ids = prompt["input_ids"]
+                attention = prompt.get("attention_mask")
+                prompt_text = prompt.get("prompt") or prompt.get("text")
+            else:
+                field = getattr(self.arguments, "generation_dataset_prompt_field", None)
+                if field and field in prompt:
+                    return self._prepare_generation_input(prompt[field])
+                for key in ("prompt", "text"):
+                    if key in prompt:
+                        return self._prepare_generation_input(prompt[key])
+                log_debug_maybe("Dataset sample missing `input_ids`/`prompt` keys for preview generation; skipping")
+                return None
+        elif isinstance(prompt, str):
+            if processor is None:
+                logger.warn("No tokenizer/processor available; cannot tokenize prompt text.")
+                return None
+            prompt_text = prompt
+
+            try:
+                processor.padding_side = "left"
+                encoded = processor.apply_chat_template([{"role": "user", "content": prompt}], **encode_kwargs)
+            except Exception as exc:  # pragma: no cover - tokenizer issues
+                log_debug_maybe(f"Failed to tokenize generation prompt: {exc}")
+                return None
+            input_ids = encoded["input_ids"]
+            attention = encoded.get("attention_mask")
+        else:
+            log_debug_maybe(f"Unsupported prompt type for preview generation: {type(prompt)}")
+            return None
+
+        input_array = np.asarray(input_ids)
+        input_array = input_array.astype(np.int32, copy=False)
+        if input_array.ndim == 1:
+            input_array = input_array[None, :]
+        input_ids = jnp.asarray(input_array, dtype=jnp.int32)
+
+        if attention is None:
+            attention_array = np.ones_like(input_array, dtype=np.int32)
+        else:
+            attention_array = np.asarray(attention)
+            if attention_array.ndim == 1:
+                attention_array = attention_array[None, :]
+            attention_array = attention_array.astype(np.int32, copy=False)
+        attention_mask = jnp.asarray(attention_array, dtype=jnp.int32)
+
+        if prompt_text is None:
+            decoded = self._batch_decode_tokens(input_ids)
+            if decoded:
+                prompt_text = decoded[0]
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "prompt_text": prompt_text,
+        }
+
+    def maybe_generate(
+        self,
+        state: EasyDeLState,
+        step: int,
+        metrics: MetricsType | None = None,
+    ) -> None:
+        """Optionally run preview generation to monitor training progress.
+
+        Uses `generate_unified` for consistent generation across both eSurge and compiled modes.
+        """
+
+        args = self.arguments
+        if args is None:
+            return
+
+        interval = args.generation_interval
+
+        if interval is None:
+            return
+
+        if interval <= 0 or step % interval != 0:
+            return
+
+        prompts = self._collect_generation_prompts()
+        if not prompts:
+            return
+
+        results: list[dict[str, tp.Any]] = []
+
+        def _finalize_preview_results(records: list[dict[str, tp.Any]]) -> None:
+            if not records:
+                return
+            self.latest_generation_samples = records
+
+            prompt_repr = "<prompt tokens>"
+            record: dict[str, tp.Any] = {}
+            for record in records:
+                prompt_repr = record["prompt"] if record["prompt"] is not None else "<prompt tokens>"
+
+            if wandb is not None and args.use_wandb and args.can_log_metrics and args.generation_log_to_wandb:
+                table = wandb.Table(columns=["step", "prompt", "completion_id", "completion"])
+                for record in records:
+                    prompt_repr = record["prompt"] if record["prompt"] is not None else "<prompt tokens>"
+                    for idx, completion in enumerate(record["completions"]):
+                        table.add_data(step, prompt_repr, idx, completion)
+                wandb.log({"preview_generations": table}, step=step)
+            if args.generation_preview_print:
+                logger.info(f"[preview step {step}] prompt: {prompt_repr}")
+                for idx, completion in enumerate(record["completions"]):
+                    logger.info(f"  completion[{idx}]: {completion}")
+
+        prepared_prompts: list[dict[str, tp.Any]] = []
+        for prompt in prompts:
+            try:
+                prepared = self._prepare_generation_input(prompt)
+            except Exception as exc:  # pragma: no cover - preview should not break training
+                log_debug_maybe(f"Preview generation failed while preparing prompt: {exc}")
+                continue
+            if prepared is not None:
+                prepared_prompts.append(prepared)
+
+        if not prepared_prompts:
+            return
+
+        pad_token_id = self._pad_token_id
+        prompt_row_counts: list[int] = []
+        prompt_row_offsets: list[int] = []
+        input_rows: list[np.ndarray] = []
+        mask_rows: list[np.ndarray] = []
+        max_prompt_len = 0
+        running_offset = 0
+        valid_prepared_prompts: list[dict[str, tp.Any]] = []
+
+        for prepared in prepared_prompts:
+            try:
+                input_np = np.asarray(prepared["input_ids"], dtype=np.int32)
+                mask_np = np.asarray(prepared["attention_mask"], dtype=np.int32)
+
+                if input_np.ndim == 1:
+                    input_np = input_np[None, :]
+                if mask_np.ndim == 1:
+                    mask_np = mask_np[None, :]
+
+                if input_np.shape != mask_np.shape:
+                    raise ValueError(
+                        f"Prompt input_ids/attention_mask shape mismatch: {input_np.shape} vs {mask_np.shape}"
+                    )
+            except Exception as exc:  # pragma: no cover - preview should not break training
+                log_debug_maybe(f"Skipping malformed preview prompt while batching: {exc}")
+                continue
+
+            rows = int(input_np.shape[0])
+            prompt_row_counts.append(rows)
+            prompt_row_offsets.append(running_offset)
+            running_offset += rows
+            max_prompt_len = max(max_prompt_len, int(input_np.shape[1]))
+            input_rows.append(input_np)
+            mask_rows.append(mask_np)
+            valid_prepared_prompts.append(prepared)
+
+        if not valid_prepared_prompts:
+            return
+        prepared_prompts = valid_prepared_prompts
+
+        try:
+            batched_input_rows: list[np.ndarray] = []
+            batched_mask_rows: list[np.ndarray] = []
+            for input_np, mask_np in zip(input_rows, mask_rows, strict=False):
+                prompt_len = int(input_np.shape[1])
+                pad_len = max_prompt_len - prompt_len
+                if pad_len > 0:
+                    input_np = np.pad(
+                        input_np,
+                        ((0, 0), (pad_len, 0)),
+                        mode="constant",
+                        constant_values=pad_token_id,
+                    )
+                    mask_np = np.pad(mask_np, ((0, 0), (pad_len, 0)), mode="constant", constant_values=0)
+                batched_input_rows.append(input_np)
+                batched_mask_rows.append(mask_np)
+
+            batched_input_ids = jnp.asarray(np.concatenate(batched_input_rows, axis=0), dtype=jnp.int32)
+            batched_attention_mask = jnp.asarray(np.concatenate(batched_mask_rows, axis=0), dtype=jnp.int32)
+        except Exception as exc:  # pragma: no cover - preview should not break training
+            log_debug_maybe(f"Preview generation failed while batching prompts: {exc}")
+            return
+
+        try:
+            gen_results = self.generate_unified(
+                input_ids=batched_input_ids,
+                attention_mask=batched_attention_mask,
+                state=state,
+                use_esurge=args.use_esurge_generation,
+                apply_chat_template=False,  # Prompts are already formatted
+                shard_inputs=args.generation_shard_inputs,
+                all_gather=False,  # Keep on device for now
+            )
+        except Exception as exc:  # pragma: no cover - preview should not break training
+            log_debug_maybe(f"Preview generation failed: {exc}")
+            for prepared in prepared_prompts:
+                try:
+                    single_results = self.generate_unified(
+                        input_ids=prepared["input_ids"],
+                        attention_mask=prepared["attention_mask"],
+                        state=state,
+                        use_esurge=args.use_esurge_generation,
+                        apply_chat_template=False,  # Prompts are already formatted
+                        shard_inputs=args.generation_shard_inputs,
+                        all_gather=False,  # Keep on device for now
+                    )
+                except Exception as single_exc:  # pragma: no cover - preview should not break training
+                    log_debug_maybe(f"Preview generation failed for one prompt: {single_exc}")
+                    continue
+
+                single_completions_text = single_results.generation_results
+                if isinstance(single_completions_text, str):
+                    single_completions = [single_completions_text]
+                elif isinstance(single_completions_text, collections.abc.Sequence):
+                    single_completions = list(single_completions_text)
+                else:
+                    single_completions = [str(single_completions_text)]
+
+                prompt_text = prepared.get("prompt_text")
+                if prompt_text is None:
+                    decoded = self._batch_decode_tokens(jax.device_get(single_results.prompt_ids))
+                    if decoded:
+                        prompt_text = decoded[0]
+
+                results.append({"prompt": prompt_text, "completions": single_completions, "step": step})
+
+            _finalize_preview_results(results)
+            return
+
+        completions_text = gen_results.generation_results
+        if isinstance(completions_text, str):
+            all_completions = [completions_text]
+        elif isinstance(completions_text, collections.abc.Sequence):
+            all_completions = list(completions_text)
+        else:
+            all_completions = [str(completions_text)]
+
+        num_return_sequences = max(int(args.generation_num_return_sequences or 1), 1)
+        expected_total = sum(count * num_return_sequences for count in prompt_row_counts)
+        if len(all_completions) != expected_total:
+            log_debug_maybe(
+                "Preview generation completion count mismatch: "
+                f"expected {expected_total}, got {len(all_completions)}"
+            )
+
+        needs_decoding = any(prepared.get("prompt_text") is None for prepared in prepared_prompts)
+        decoded_prompts: list[str] | None = None
+        if needs_decoding:
+            decoded_prompts = self._batch_decode_tokens(jax.device_get(gen_results.prompt_ids))
+
+        completion_cursor = 0
+        for prepared, rows, row_offset in zip(prepared_prompts, prompt_row_counts, prompt_row_offsets, strict=False):
+            prompt_text = prepared.get("prompt_text")
+            if prompt_text is None and decoded_prompts is not None and row_offset < len(decoded_prompts):
+                prompt_text = decoded_prompts[row_offset]
+
+            completion_count = rows * num_return_sequences
+            completions = all_completions[completion_cursor : completion_cursor + completion_count]
+            completion_cursor += completion_count
+            results.append({"prompt": prompt_text, "completions": completions, "step": step})
+
+        _finalize_preview_results(results)
+
+    def _one_to_all(self, arr: jax.Array) -> jax.Array:
+        """Distribute array from one device to all devices.
+
+        Args:
+            arr: Array to distribute.
+
+        Returns:
+            Array distributed across devices.
+        """
+        with self.mesh:
+            arr = with_sharding_constraint(arr, PartitionSpec(None))
+        return arr
+
+    def _all_gather(self, arr: jax.Array) -> jax.Array:
+        """Gather array from all devices to a single replicated array.
+
+        Args:
+            arr: Array to gather across devices.
+
+        Returns:
+            Array replicated across all devices.
+        """
+        return jax.device_put(arr, NamedSharding(self.model.mesh, PartitionSpec()))
 
     def initialize_trainer_utils(self):
         """
@@ -850,7 +2081,9 @@ class BaseTrainer(BaseTrainerProtocol):
             self.sharded_evaluation_step_function = sharded_evaluation_step_function
             self.mesh = functions.mesh
             self.checkpoint_manager = functions.checkpoint_manager
+            self.checkpointer = self._create_checkpointer()
         self.timer.log("configure functions and sharding them")
+        self._configure_generation_function()
 
     def _configure_state(self):
         """
@@ -883,7 +2116,7 @@ class BaseTrainer(BaseTrainerProtocol):
                     self.model_state = self.model_state.replace(tx=self.tx)
 
                 shape = nn.eval_shape(lambda: self.model_state)
-                rules = self.model.config.get_partition_rules()
+                rules = self.model._get_partition_rules(None)
                 state_shardings = specs_to_name_sharding(match_partition_rules(rules, shape))
 
                 self.state_shardings = state_shardings
@@ -969,6 +2202,44 @@ class BaseTrainer(BaseTrainerProtocol):
         """
         raise NotImplementedError
 
+    def _create_dataloader_from_source(
+        self,
+        source: "ShardedDataSource",
+        batch_size: int,
+        is_train: bool = True,
+        shuffle: bool = False,
+        num_epochs: int = 1,
+        drop_remainder: bool = True,
+    ) -> collections.abc.Iterator:
+        """Create dataloader iterator from ShardedDataSource.
+
+        Iterates over the transformed source (with tokenization applied).
+        Yields lists of examples (batches) that will be collated by the
+        training loop's data_collator.
+
+        Args:
+            source: ShardedDataSource to iterate over.
+            batch_size: Batch size for batching examples.
+            is_train: Whether this is for training (affects logging).
+            shuffle: Whether to shuffle (currently not implemented for sources).
+            num_epochs: Number of epochs to iterate.
+            drop_remainder: Whether to drop the last incomplete batch.
+
+        Yields:
+            Lists of examples (pre-tokenized dicts) to be collated.
+        """
+        for _ in range(num_epochs):
+            batch = []
+            for shard_name in source.shard_names:
+                for example in source.open_shard(shard_name):
+                    batch.append(example)
+                    if len(batch) >= batch_size:
+                        yield batch
+                        batch = []
+            # Handle remainder
+            if batch and not drop_remainder:
+                yield batch
+
     def _configure_grain_dataloader(self):
         """Configure Grain dataloaders for training and evaluation.
 
@@ -1000,7 +2271,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 shard_count=self.arguments.grain_shard_count or 1,
                 drop_remainder=True,
             )
-            from datasets import IterableDataset
+            from datasets import IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
             if is_train and hasattr(self, "model_state") and self.model_state is not None:
                 current_step = int(jax.device_get(self.model_state.step))
@@ -1026,7 +2297,7 @@ class BaseTrainer(BaseTrainerProtocol):
                     shuffle=shuffle,
                 )
             collate_fn = self.create_grain_collect_function(
-                max_sequence_length=self.arguments.max_sequence_length,
+                max_sequence_length=self.arguments.max_length,
                 truncation_mode=self.arguments.truncation_mode,
             )
             return grain.DataLoader(
@@ -1043,35 +2314,64 @@ class BaseTrainer(BaseTrainerProtocol):
             )
 
         def calculate_steps(dataset, is_train: bool) -> int:
-            if hasattr(dataset, "__len__"):
-                total_data_len = len(dataset)
-            else:
-                total_data_len = (
-                    self.arguments.per_epoch_training_steps if is_train else self.arguments.per_epoch_evaluation_steps
-                )
-                if total_data_len is None:
-                    raise ValueError(
-                        f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
-                        "steps for a generator/streaming dataset."
-                    )
-            batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
-            num_steps = (
-                (total_data_len + batch_size - 1) // batch_size * (self.arguments.num_train_epochs if is_train else 1)
-            )
             forced_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
-            steps = forced_steps if forced_steps is not None else num_steps
+            total_data_len: int | None = None
+            if forced_steps is None:
+                try:
+                    total_data_len = len(dataset)
+                except TypeError as e:
+                    total_data_len = (
+                        self.arguments.per_epoch_training_steps
+                        if is_train
+                        else self.arguments.per_epoch_evaluation_steps
+                    )
+                    if total_data_len is None:
+                        raise ValueError(
+                            f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
+                            "steps for a generator/streaming dataset."
+                        ) from e
 
-            if is_train:
-                steps = steps // self.arguments.gradient_accumulation_steps
-            return steps
+            batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
+            num_epochs = self.arguments.num_train_epochs if is_train else 1
+            return resolve_total_steps(
+                forced_steps=forced_steps,
+                total_data_len=total_data_len,
+                batch_size=batch_size,
+                num_epochs=num_epochs,
+                gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
+                is_train=is_train,
+            )
 
         max_training_steps = calculate_steps(self.dataset_train, is_train=True)
-        dataloader_train = _create_grain_dataloader(self.dataset_train, is_train=True)
+
+        # Use _train_source if available (has transforms applied)
+        if self._train_source is not None:
+            dataloader_train = self._create_dataloader_from_source(
+                source=self._train_source,
+                batch_size=self.training_batch_size,
+                is_train=True,
+                shuffle=self.arguments.shuffle_train_dataset,
+                num_epochs=self.arguments.num_train_epochs,
+                drop_remainder=True,
+            )
+        else:
+            dataloader_train = _create_grain_dataloader(self.dataset_train, is_train=True)
 
         dataloader_eval, max_evaluation_steps = None, 0
         if self.dataset_eval is not None and self.arguments.do_eval:
             max_evaluation_steps = calculate_steps(self.dataset_eval, is_train=False)
-            dataloader_eval = _create_grain_dataloader(self.dataset_eval, is_train=False)
+            # Use _eval_source if available (has transforms applied)
+            if self._eval_source is not None:
+                dataloader_eval = self._create_dataloader_from_source(
+                    source=self._eval_source,
+                    batch_size=self.evaluation_batch_size,
+                    is_train=False,
+                    shuffle=False,
+                    num_epochs=1,
+                    drop_remainder=True,
+                )
+            else:
+                dataloader_eval = _create_grain_dataloader(self.dataset_eval, is_train=False)
 
         return TrainerConfigureDataloaderOutput(
             dataloader_train=dataloader_train,
@@ -1113,7 +2413,7 @@ class BaseTrainer(BaseTrainerProtocol):
         except AssertionError:
             logger.warning("TensorFlow may be hogging GPU memory.")
 
-        def create_tf_dataset(dataset: Dataset, is_train: bool) -> tp.Iterator[np.ndarray]:
+        def create_tf_dataset(dataset: Dataset, is_train: bool) -> collections.abc.Iterator[np.ndarray]:
             """
             Creates a TensorFlow dataset from a Hugging Face Dataset.
 
@@ -1122,7 +2422,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 is_train (bool): Whether the dataset is for training.
 
             Returns:
-                tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
+                collections.abc.Iterator[np.ndarray]: The TensorFlow dataset iterator.
             """
 
             batch_size = self.training_batch_size if is_train else self.evaluation_batch_size
@@ -1130,7 +2430,7 @@ class BaseTrainer(BaseTrainerProtocol):
             return (
                 dataset.to_tf_dataset(
                     collate_fn=self.create_tfds_collect_function(
-                        max_sequence_length=self.arguments.max_sequence_length,
+                        max_sequence_length=self.arguments.max_length,
                         truncation_mode=self.arguments.truncation_mode,
                     ),
                     batch_size=batch_size,
@@ -1143,7 +2443,9 @@ class BaseTrainer(BaseTrainerProtocol):
                 .as_numpy_iterator()
             )
 
-        def create_tf_dataset_from_iterable(dataset: IterableDataset, is_train: bool) -> tp.Iterator[np.ndarray]:
+        def create_tf_dataset_from_iterable(
+            dataset: IterableDataset, is_train: bool
+        ) -> collections.abc.Iterator[np.ndarray]:
             """
             Creates a TensorFlow dataset from an iterable Hugging Face Dataset.
 
@@ -1152,7 +2454,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 is_train (bool): Whether the dataset is for training.
 
             Returns:
-                tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
+                collections.abc.Iterator[np.ndarray]: The TensorFlow dataset iterator.
             """
 
             batch_size = self.training_batch_size if is_train else self.evaluation_batch_size
@@ -1170,9 +2472,11 @@ class BaseTrainer(BaseTrainerProtocol):
                     lambda: dataset,
                     output_signature={
                         col: tf.TensorSpec(
-                            shape=vals.shape[1:]
-                            if len(vals.shape) > 1 and vals.shape[0] == 1  # auto remove batch dim
-                            else vals.shape,
+                            shape=(
+                                vals.shape[1:]
+                                if len(vals.shape) > 1 and vals.shape[0] == 1  # auto remove batch dim
+                                else vals.shape
+                            ),
                             dtype=tf_data_mapping[str(vals.dtype)],
                         )
                         for col, vals in next(iter(dataset)).items()
@@ -1199,29 +2503,35 @@ class BaseTrainer(BaseTrainerProtocol):
             Raises:
               ValueError: If the dataset is a generator/streaming dataset and the number of steps is not specified.
             """
-            if hasattr(dataset, "__len__"):
-                total_data_len = len(dataset)
-            else:
-                total_data_len = (
-                    self.arguments.per_epoch_training_steps if is_train else self.arguments.per_epoch_evaluation_steps
-                )
-                if total_data_len is None:
-                    raise ValueError(
-                        f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
-                        "steps for a generator/streaming dataset."
-                    )
-            batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
-            num_steps = (
-                (total_data_len + batch_size - 1) // batch_size * (self.arguments.num_train_epochs if is_train else 1)
-            )
             forced_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
-            steps = forced_steps if forced_steps is not None else num_steps
+            total_data_len: int | None = None
+            if forced_steps is None:
+                try:
+                    total_data_len = len(dataset)
+                except TypeError as e:
+                    total_data_len = (
+                        self.arguments.per_epoch_training_steps
+                        if is_train
+                        else self.arguments.per_epoch_evaluation_steps
+                    )
+                    if total_data_len is None:
+                        raise ValueError(
+                            f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
+                            "steps for a generator/streaming dataset."
+                        ) from e
 
-            if is_train:
-                steps = steps // self.arguments.gradient_accumulation_steps
-            return steps
+            batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
+            num_epochs = self.arguments.num_train_epochs if is_train else 1
+            return resolve_total_steps(
+                forced_steps=forced_steps,
+                total_data_len=total_data_len,
+                batch_size=batch_size,
+                num_epochs=num_epochs,
+                gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
+                is_train=is_train,
+            )
 
-        def to_tf_dataloader(dataset: Dataset | IterableDataset, is_train: bool) -> tp.Iterator[np.ndarray]:
+        def to_tf_dataloader(dataset: Dataset | IterableDataset, is_train: bool) -> collections.abc.Iterator[np.ndarray]:
             """
             Converts a Hugging Face Dataset to a TensorFlow dataloader.
 
@@ -1230,7 +2540,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 is_train (bool): Whether the dataset is for training.
 
             Returns:
-                tp.Iterator[np.ndarray]: The TensorFlow dataloader iterator.
+                collections.abc.Iterator[np.ndarray]: The TensorFlow dataloader iterator.
             """
             if hasattr(dataset, "__len__"):
                 return create_tf_dataset(dataset, is_train)
@@ -1239,11 +2549,33 @@ class BaseTrainer(BaseTrainerProtocol):
 
         max_training_steps = calculate_steps(self.dataset_train, is_train=True)
 
-        dataloader_train = to_tf_dataloader(self.dataset_train, is_train=True)
+        # Use _train_source if available (has transforms applied)
+        if self._train_source is not None:
+            dataloader_train = self._create_dataloader_from_source(
+                source=self._train_source,
+                batch_size=self.training_batch_size,
+                is_train=True,
+                shuffle=self.arguments.shuffle_train_dataset,
+                num_epochs=self.arguments.num_train_epochs,
+                drop_remainder=True,
+            )
+        else:
+            dataloader_train = to_tf_dataloader(self.dataset_train, is_train=True)
 
         if self.dataset_eval is not None and self.arguments.do_eval:
             max_evaluation_steps = calculate_steps(self.dataset_eval, is_train=False)
-            dataloader_eval = to_tf_dataloader(self.dataset_eval, is_train=False)
+            # Use _eval_source if available (has transforms applied)
+            if self._eval_source is not None:
+                dataloader_eval = self._create_dataloader_from_source(
+                    source=self._eval_source,
+                    batch_size=self.evaluation_batch_size,
+                    is_train=False,
+                    shuffle=False,
+                    num_epochs=1,
+                    drop_remainder=True,
+                )
+            else:
+                dataloader_eval = to_tf_dataloader(self.dataset_eval, is_train=False)
         else:
             dataloader_eval, max_evaluation_steps = None, 0
 
@@ -1297,12 +2629,11 @@ class BaseTrainer(BaseTrainerProtocol):
             config=self.model.config,
         )
 
-    def _save_state(self, state: EasyDeLState, *args, **kwargs) -> str:
+    def _save_state(self, state: EasyDeLState, save_directory: str | None = None, *args, **kwargs) -> str:
         """
         Save the current model state to a checkpoint.
 
         This method handles the complete checkpoint saving process including:
-        - Managing checkpoint limits (removing old checkpoints if needed)
         - Creating checkpoint directories with proper naming
         - Saving training arguments alongside the model
         - Generating README documentation for the checkpoint
@@ -1310,15 +2641,20 @@ class BaseTrainer(BaseTrainerProtocol):
 
         Args:
             state: The model state to save
+            save_directory: Optional override for save directory. If None, uses
+                default directory based on current step.
             *args: Additional positional arguments
             **kwargs: Additional keyword arguments
 
         Returns:
             str: Path to the saved checkpoint directory
         """
-        step = self._get_current_step(state)
-        self._manage_checkpoint_limit(self.arguments._get_save_directory())
-        directory_name = self.arguments._get_save_directory_milestone(step=step, create=True)
+        if save_directory is None:
+            step = self._get_current_step(state)
+            directory_name = self.arguments._get_save_directory_milestone(step=step, create=True)
+        else:
+            directory_name = ePath(save_directory)
+
         logger.info(f"saving state {directory_name}.")
         directory_name.mkdir(exist_ok=True)
         self.arguments.save_arguments(directory_name / DEFAULT_ARGS_JSON_NAME)
@@ -1330,6 +2666,72 @@ class BaseTrainer(BaseTrainerProtocol):
         )
 
         return str(directory_name)
+
+    def _create_checkpointer(self):
+        """Create and configure the Checkpointer instance.
+
+        Returns:
+            Checkpointer: Configured checkpointer with policies from training arguments.
+
+        Note:
+            - Uses save_steps from TrainingArguments to create checkpoint policies
+            - No time-based saving by default (can be extended via save_interval_timedelta)
+            - Checkpoints are saved to the base output directory
+        """
+        return self.arguments.get_streaming_checkpointer()
+
+    def _cleanup_old_checkpoints(self):
+        """Clean up old permanent checkpoints based on save_total_limit.
+
+        Only affects permanent checkpoints (run-based saves). Temporary checkpoints
+        are managed automatically by Checkpointer.
+
+        Uses Checkpointer's async deletion queue for non-blocking cleanup.
+
+        Note:
+            - Reads metadata.json to identify permanent vs temporary checkpoints
+            - Keeps the N most recent permanent checkpoints (N = save_total_limit)
+            - Sorts by modification time to determine which are oldest
+            - Queues deletion asynchronously (non-blocking)
+        """
+        if self.arguments.save_total_limit is None:
+            return
+
+        from eformer.serialization.checkpointer import _read_checkpoint_metadata
+
+        save_dir = ePath(self.arguments._get_save_directory())
+        if not save_dir.exists():
+            return
+
+        # Find all checkpoint directories with metadata
+        checkpoint_dirs = []
+        for path in save_dir.glob("run-*"):
+            if path.is_dir() and (path / "metadata.json").exists():
+                try:
+                    metadata = _read_checkpoint_metadata(str(path))
+                    # Only consider permanent checkpoints
+                    if not metadata.get("is_temporary", False):
+                        checkpoint_dirs.append(path)
+                except Exception:
+                    continue
+
+        if len(checkpoint_dirs) <= self.arguments.save_total_limit:
+            return
+
+        # Sort by modification time (oldest first)
+        def get_mtime(path):
+            try:
+                return path.stat().get("mtime", 0)
+            except Exception:
+                return 0
+
+        checkpoint_dirs.sort(key=get_mtime)
+
+        # Queue oldest checkpoints for async deletion
+        to_delete = checkpoint_dirs[: -self.arguments.save_total_limit]
+        for old_checkpoint in to_delete:
+            logger.info(f"Queueing old permanent checkpoint for deletion: {old_checkpoint}")
+            self.checkpointer._queue_checkpoint_removal(str(old_checkpoint))
 
     def _get_current_step(self, state):
         """Get the current training step from state.
@@ -1345,89 +2747,6 @@ class BaseTrainer(BaseTrainerProtocol):
             step += self.arguments.step_start_point
         return step
 
-    def _manage_checkpoint_limit(self, save_directory):
-        """
-        Manage the checkpoint limit by removing old checkpoints.
-
-        This method enforces the save_total_limit by removing the oldest
-        checkpoints when the limit is exceeded. It safely handles directory
-        removal and ensures only valid checkpoint directories are deleted.
-
-        Args:
-            save_directory: Base directory containing checkpoints
-
-        Note:
-            - Only removes directories matching the pattern "run-{number}"
-            - Sorts checkpoints by modification time to identify oldest
-            - Handles errors gracefully to prevent training interruption
-        """
-
-        def _remove_directory_recursive(path):
-            """Recursively remove directory using ePath methods"""
-            if not path.exists():
-                return
-
-            if path.is_file():
-                path.unlink(missing_ok=True)
-            elif path.is_dir():
-                try:
-                    for item in path.iterdir():
-                        _remove_directory_recursive(item)
-                    path.rmdir()
-                except Exception as e:
-                    logger.warning(f"Error removing directory {path}: {e}")
-
-        def _operate():
-            try:
-                save_path = ePath(save_directory)
-                checkpoint_dirs = []
-                try:
-                    all_run_paths = list(save_path.glob("run-*"))
-                    checkpoint_dirs = [p for p in all_run_paths if p.is_dir()]
-
-                    if not checkpoint_dirs:
-                        return
-
-                    run_pattern = re.compile(r"^run-\d+$")
-                    checkpoint_dirs = [p for p in checkpoint_dirs if run_pattern.match(p.name)]
-
-                except Exception as e:
-                    logger.warning(f"Error listing checkpoint directories in {save_path}: {e}")
-                    return
-
-                if not checkpoint_dirs:
-                    return
-
-                def get_mtime(path):
-                    try:
-                        return path.stat().get("mtime", 0)
-                    except Exception:
-                        return 0
-
-                checkpoint_dirs.sort(key=get_mtime)
-
-                if self.arguments.save_total_limit == 0:
-                    _do_dele = checkpoint_dirs
-                else:
-                    _do_dele = checkpoint_dirs[: -self.arguments.save_total_limit]
-
-                for old_save_directory in _do_dele:
-                    try:
-                        # Double-check it's a directory and matches pattern before removal
-                        if old_save_directory.is_dir() and old_save_directory.name.startswith("run-"):
-                            _remove_directory_recursive(old_save_directory)
-                            logger.info(f"Removed old checkpoint directory: {old_save_directory}")
-                        else:
-                            logger.warning(f"Skipping non-directory or invalid pattern: {old_save_directory}")
-                    except Exception as e:
-                        logger.error(f"Failed to remove directory {old_save_directory}: {e}")
-
-            except Exception as e:
-                logger.error(f"Error in checkpoint limit management: {e}")
-
-        if self.arguments.save_total_limit is not None:
-            _operate()
-
     def _save_readme(self, save_directory):
         """Save training information as README.md in checkpoint directory.
 
@@ -1440,7 +2759,7 @@ class BaseTrainer(BaseTrainerProtocol):
     def _format_partition_rules(self) -> str:
         """Format partition rules with proper indentation and formatting."""
         try:
-            return pprint.pformat(self.model.config.get_partition_rules(), indent=2, width=80)
+            return pprint.pformat(self.model._get_partition_rules(None), indent=2, width=80)
         except Exception as e:
             logger.error(f"Error formatting partition rules: {e!s}")
             return "Error retrieving partition rules"
@@ -1562,7 +2881,7 @@ class BaseTrainer(BaseTrainerProtocol):
 - Optimizer: {self.arguments.optimizer}
 - Epochs: {self.arguments.num_train_epochs}
 - Batch Size: {self.arguments.total_batch_size}
-- Sequence Length: {self.arguments.max_sequence_length}
+- Sequence Length: {self.arguments.max_length}
 - Dtype: {model_data["dtype_str"]}
 - Params Dtype: {model_data["param_dtype_str"]}
 
@@ -1593,7 +2912,7 @@ class BaseTrainer(BaseTrainerProtocol):
         self,
         state: EasyDeLState,
         save_directory: str | None = None,
-        gather_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None = None,
+        gather_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None = None,
         to_torch: bool = False,
         easystate_to_huggingface_model_kwargs: dict | None = None,
         torch_save_pretrained_kwargs: dict | None = None,
@@ -1764,23 +3083,6 @@ class BaseTrainer(BaseTrainerProtocol):
 
         return compiled
 
-    def _should_save_checkpoint(self, current_step):
-        """
-        Determine if checkpoint should be saved at current step.
-
-        Args:
-            current_step: The current training step
-
-        Returns:
-            bool: True if a checkpoint should be saved at this step
-
-        Note:
-            Based on save_steps configuration in training arguments
-        """
-        return (
-            self.arguments.save_steps is not None and current_step > 0 and current_step % self.arguments.save_steps == 0
-        )
-
     def _should_run_evaluation(self, current_step):
         """
         Determine if evaluation should be run at current step.
@@ -1819,9 +3121,30 @@ class BaseTrainer(BaseTrainerProtocol):
 
         dire = ePath(self.arguments.save_directory)
         if self.arguments.do_last_save:
-            filename = self._save_state(state=state, milestone=False, save_directory=dire)
-            if self.arguments.save_directory is not None:
-                checkpoint_path = dire / filename
+            # Use checkpointer.on_step with force=True for final save
+            current_step = int(jax.device_get(state.step))
+
+            # Track the saved directory in the callback
+            saved_directory = [None]  # Use list for mutability in closure
+
+            def save_callback(dest, mesh, meta, s=state):
+                full_path = str(self.arguments._get_save_directory() / dest)
+                saved_directory[0] = self._save_state(state=s, save_directory=full_path)
+                # Clean up old permanent checkpoints if save_total_limit is set
+                self._cleanup_old_checkpoints()
+
+            self.checkpointer.on_step(
+                mesh=self.mesh,
+                pytree=None,
+                step=current_step,
+                force=True,  # Force final checkpoint save
+                true_callbacks=[save_callback],
+            )
+
+            if saved_directory[0] is not None:
+                filename = saved_directory[0]
+                if self.arguments.save_directory is not None:
+                    checkpoint_path = dire / filename
 
         return TrainerOutput(
             state=state,
@@ -1834,8 +3157,8 @@ class BaseTrainer(BaseTrainerProtocol):
         self,
         state: EasyDeLState,
         exception: Exception,
-        shard_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None,
-        gather_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None,
+        shard_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
+        gather_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
     ):
         """Handle training interruption gracefully."""
         if isinstance(exception, KeyboardInterrupt):
@@ -1898,7 +3221,7 @@ class BaseTrainer(BaseTrainerProtocol):
             batch = next(data_iter)
 
         # Remove specified ids from batch if needed
-        for id_to_pop in self.arguments.ids_to_pop_from_dataset:
+        for id_to_pop in self.arguments.ids_to_pop_from_dataset or []:
             _ = batch.pop(id_to_pop, None)
 
         return batch, data_iter

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,9 +13,7 @@
 # limitations under the License.
 
 
-import typing
-
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -40,7 +38,10 @@ class FalconConfig(EasyDeLBaseConfig):
         num_attention_heads (`int`, *optional*, defaults to 71):
             Number of attention heads for each attention layer in the Transformer encoder.
         num_ln_in_parallel_attn (`int`, *optional*):
-            The number of layer norms in the parallel attention layer.
+            Number of separate layer normalizations when using parallel attention. When set to 2
+            with `new_decoder_architecture=True`, uses independent LayerNorms for the attention
+            and MLP parallel paths (ln_attn and ln_mlp). When 1 or 0, uses a single shared
+            LayerNorm (input_layernorm).
         layer_norm_epsilon (`float`, *optional*, defaults to 1e-5):
             The epsilon used by the layer normalization layers.
         initializer_range (`float`, *optional*, defaults to 0.02):
@@ -56,13 +57,24 @@ class FalconConfig(EasyDeLBaseConfig):
             Number of key and value heads for each attention layer in the Transformer encoder. Will default to
             `num_attention_heads` if not set.
         alibi (`bool`, *optional*):
-            Whether to use alibi attention.
+            Whether to use ALiBi (Attention with Linear Biases) for positional encoding instead
+            of RoPE. ALiBi adds learned linear biases to attention scores based on token distances,
+            enabling better extrapolation to longer sequences than seen during training. When False,
+            uses standard Rotary Position Embeddings (RoPE).
         new_decoder_architecture (`bool`, *optional*):
-            Whether to use the new decoder architecture.
+            Whether to use the improved decoder architecture with refined layer normalization
+            placement. When enabled, supports dual layer norms for parallel attention/MLP paths
+            via `num_ln_in_parallel_attn`. This architecture was introduced in later Falcon variants
+            for better training stability.
         multi_query (`bool`, *optional*, defaults to `True`):
-            Whether to use multi-query attention.
+            Whether to use Multi-Query Attention (MQA). When True, all query heads share a single
+            set of key and value heads, dramatically reducing memory bandwidth and KV cache size
+            during inference while maintaining quality. This is more aggressive than GQA (grouped-query).
         parallel_attn (`bool`, *optional*, defaults to `True`):
-            Whether to use parallel attention.
+            Whether to compute attention and MLP layers in parallel rather than sequentially.
+            When True, reduces the effective depth of each layer and improves training throughput,
+            as attention and FFN can be computed simultaneously and their outputs summed. This is
+            different from the standard sequential attention-then-FFN architecture.
         bias (`bool`, *optional*, defaults to `False`):
             Whether to use bias in the linear layers.
         max_position_embeddings (`int`, *optional*, defaults to 2048):
@@ -90,79 +102,42 @@ class FalconConfig(EasyDeLBaseConfig):
     """
 
     model_type: str = "falcon"
-    attribute_map: typing.ClassVar = {
-        "num_hidden_layers": "num_hidden_layers",
-        "num_attention_heads": "num_attention_heads",
-    }
 
     def __init__(
         self,
-        vocab_size=65024,
-        hidden_size=4544,
-        num_hidden_layers=32,
-        num_attention_heads=71,
-        num_ln_in_parallel_attn=None,
-        layer_norm_epsilon=1e-5,
-        initializer_range=0.02,
-        use_cache=True,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-        num_kv_heads=None,
-        alibi=False,
-        new_decoder_architecture=False,
-        multi_query=True,
-        parallel_attn=True,
-        bias=False,
-        max_position_embeddings=2048,
-        rope_theta=10000.0,
-        rope_scaling=None,
-        bos_token_id=11,
-        eos_token_id=11,
-        ffn_hidden_size=None,
-        ff_factor=None,
-        activation="gelu",
+        vocab_size: int = 65024,
+        hidden_size: int = 4544,
+        num_hidden_layers: int = 32,
+        num_attention_heads: int = 71,
+        num_ln_in_parallel_attn: int | None = None,
+        layer_norm_epsilon: float = 1e-5,
+        initializer_range: float = 0.02,
+        use_cache: bool = True,
+        hidden_dropout: float = 0.0,
+        attention_dropout: float = 0.0,
+        num_kv_heads: int | None = None,
+        alibi: bool = False,
+        new_decoder_architecture: bool = False,
+        multi_query: bool = True,
+        parallel_attn: bool = True,
+        bias: bool = False,
+        max_position_embeddings: int = 2048,
+        rope_theta: float = 10000.0,
+        rope_scaling: dict | None = None,
+        bos_token_id: int = 11,
+        eos_token_id: int = 11,
+        ffn_hidden_size: int | None = None,
+        ff_factor: int | None = None,
+        activation: str = "gelu",
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
-        """Initialize a new FalconConfig instance.
-
-        Args:
-          vocab_size (int, optional): Size of the vocabulary. Defaults to 65024.
-          hidden_size (int, optional): Dimensionality of hidden layers. Defaults to 4544.
-          num_hidden_layers (int, optional): Number of hidden layers. Defaults to 32.
-          num_attention_heads (int, optional): Number of attention heads. Defaults to 71.
-          num_ln_in_parallel_attn (int, optional): Number of layer norms in parallel attention. Defaults to None.
-          layer_norm_epsilon (float, optional): Epsilon for layer normalization. Defaults to 1e-5.
-          initializer_range (float, optional): Range for weight initialization. Defaults to 0.02.
-          use_cache (bool, optional): Whether to use KV cache. Defaults to True.
-          hidden_dropout (float, optional): Dropout probability for hidden layers. Defaults to 0.0.
-          attention_dropout (float, optional): Dropout probability for attention. Defaults to 0.0.
-          num_kv_heads (int, optional): Number of key/value heads. Defaults to None (same as num_attention_heads).
-          alibi (bool, optional): Whether to use alibi attention. Defaults to False.
-          new_decoder_architecture (bool, optional): Whether to use new decoder architecture. Defaults to False.
-          multi_query (bool, optional): Whether to use multi-query attention. Defaults to True.
-          parallel_attn (bool, optional): Whether to use parallel attention. Defaults to True.
-          bias (bool, optional): Whether to use bias in linear layers. Defaults to False.
-          max_position_embeddings (int, optional): Maximum sequence length. Defaults to 2048.
-          rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
-          rope_scaling (dict, optional): RoPE scaling configuration. Defaults to None.
-          bos_token_id (int, optional): Beginning of sequence token ID. Defaults to 11.
-          eos_token_id (int, optional): End of sequence token ID. Defaults to 11.
-          ffn_hidden_size (int, optional): Size of feed-forward hidden layer. Defaults to None.
-          ff_factor (int, optional): Factor for feed-forward size. Defaults to None.
-          activation (str, optional): Activation function. Defaults to "gelu".
-          gradient_checkpointing (EasyDeLGradientCheckPointers, optional):
-            Checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
-          bits (int, optional): Quantization bits. Defaults to None.
-          **kwargs: Additional arguments.
-        """
         self.vocab_size = vocab_size
         n_embed = kwargs.pop("n_embed", None)
         self.hidden_size = hidden_size if n_embed is None else n_embed
         self.num_hidden_layers = num_hidden_layers
-        if num_ln_in_parallel_attn is None:
-            num_ln_in_parallel_attn = 0
         self.num_ln_in_parallel_attn = num_ln_in_parallel_attn
         self.num_attention_heads = num_attention_heads
         self.layer_norm_epsilon = layer_norm_epsilon
@@ -194,37 +169,29 @@ class FalconConfig(EasyDeLBaseConfig):
         if ff_factor is None:
             ff_factor = ffn_hidden_size // hidden_size
         self.ff_factor = ff_factor
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, bits=bits, **kwargs)
 
     @property
     def rotary(self):
         return not self.alibi
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    @property
+    def num_key_value_heads(self):
+        """Alias for num_kv_heads to match UnifiedAttention expectations."""
+        return self.num_kv_heads
+
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"word_embeddings/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attention/query_key_value/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attention/dense/kernel", pmag.resolve(RowWise)),
-            (r"mlp/dense_h_to_4h/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/dense_4h_to_h/kernel", pmag.resolve(RowWise)),
-            (
-                r".*/(ln_attn|ln_mlp|input_layernorm|post_attention_layernorm|ln_f)/scale",
-                pmag.resolve(Replicated),
-            ),
-            (
-                r".*/(ln_attn|ln_mlp|input_layernorm|post_attention_layernorm|ln_f)/bias",
-                pmag.resolve(Replicated),
-            ),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (
-                r".*(query_key_value|dense|dense_h_to_4h|dense_4h_to_h|lm_head)/bias",
-                pmag.resolve(Replicated),
-            ),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None

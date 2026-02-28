@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,29 +31,36 @@ compared to non-preferred (rejected) responses, learning from human preference d
 All functions are JAX-compatible and support distributed training through sharding.
 """
 
+import collections.abc
 import typing as tp
 
 import flax
 import flax.nnx
 import jax
-import optax
+import optax  # pyright: ignore[reportMissingTypeStubs]
 from eformer.escale import with_sharding_constraint
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
-from ..training_utils import make_assertions_and_get_sizes, minibatch_call, update_metrics, update_state_respectfully
+from ..training_utils import (
+    make_assertions_and_get_sizes,
+    minibatch_call,
+    update_metrics,
+    update_state_respectfully,
+)
 
 
 def training_step(
     state: EasyDeLState,
-    batch: tp.Mapping[str, jax.Array],
+    batch: collections.abc.Mapping[str, jax.Array],
     loss_config: LossConfig | None = None,
     learning_rate_fn: optax.Schedule = None,
     partition_spec: PartitionSpec | None = None,
     gradient_accumulation_steps: int = 1,
     center_rewards_coefficient: float | None = None,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics]:
     """
     Performs a single training step by computing gradients via minibatch processing,
@@ -68,7 +75,7 @@ def training_step(
 
     Args:
         state (EasyDeLState): The current model state, which includes parameters and model graph.
-        batch (tp.Mapping[str, jax.Array]): A mapping of input arrays for the current batch.
+        batch (collections.abc.Mapping[str, jax.Array]): A mapping of input arrays for the current batch.
         loss_config (tp.Optional[LossConfig], optional): Configuration settings for the loss
             computation. Defaults to None.
         learning_rate_fn (optax.Schedule, optional): A schedule function for the learning rate.
@@ -87,7 +94,7 @@ def training_step(
                 - LossMetrics containing computed loss and other related metrics.
     """
     # Determine batch size, minibatch size, and enforce partition spec.
-    batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+    _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
         batch=batch,
         gradient_accumulation_steps=gradient_accumulation_steps,
         batch_partition_spec=partition_spec,
@@ -111,8 +118,9 @@ def training_step(
                 - The computed loss (scalar).
                 - Additional metrics (LossMetrics) produced during loss computation.
         """
-        # Merge the state with the provided tree update.
-        module = flax.nnx.merge(state.graphdef, tree, state.graphother)
+        if straight_through_emulator is not None:
+            tree = straight_through_emulator(tree)
+        module = state.merge(tree)
 
         rewards_chosen = module(
             input_ids=minibatch["input_ids_chosen"],
@@ -160,11 +168,11 @@ def training_step(
 
 def evaluation_step(
     state: EasyDeLState,
-    batch: tp.Mapping[str, jax.Array],
+    batch: collections.abc.Mapping[str, jax.Array],
     loss_config: LossConfig | None = None,
     partition_spec: PartitionSpec | None = None,
     center_rewards_coefficient: float | None = None,
-) -> tuple[tp.Any, LossMetrics]:
+) -> LossMetrics:
     """
     Performs a single evaluation step by computing loss metrics for the input batch.
 
@@ -175,7 +183,7 @@ def evaluation_step(
 
     Args:
         state (EasyDeLState): The current model state.
-        batch (tp.Mapping[str, jax.Array]): A mapping of input arrays for evaluation.
+        batch (collections.abc.Mapping[str, jax.Array]): A mapping of input arrays for evaluation.
         loss_config (tp.Optional[LossConfig], optional): Configuration for loss computation.
             Defaults to None.
         partition_spec (tp.Optional[PartitionSpec], optional): Specification for sharding the batch.

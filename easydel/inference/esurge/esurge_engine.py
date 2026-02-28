@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,33 +16,28 @@
 
 This module provides the eSurge engine, a high-performance text generation system
 built on JAX that offers efficient batched inference with advanced features like
-smart bytecode decoding, continuous batching, and comprehensive monitoring.
+continuous batching and comprehensive monitoring.
 
 Key Components:
     - eSurge: Main engine class for text generation
     - RequestOutput: Container for generation results and metrics
     - CompletionOutput: Individual completion within a batch
-    - SmartBytecodeDecoder: Intelligent UTF-8 sequence handler
 
 Features:
-    - **Smart Bytecode Decoding**: Prevents malformed UTF-8 characters (�) during
-      streaming by intelligently buffering incomplete tokens and using progressive
-      backtracking to find clean decode points.
     - **Continuous Batching**: Background scheduler thread processes requests
       continuously for optimal throughput.
     - **Context Management**: Automatic prompt truncation and token reservation
       with configurable strategies.
     - **Streaming Support**: Real-time token streaming with delta updates.
-    - **Monitoring**: Built-in Prometheus metrics, web dashboard, and console monitor.
+    - **Monitoring**: Built-in Prometheus metrics and console monitor (Grafana-ready).
 
 Usage Example:
     >>> from easydel.inference.esurge import eSurge
     >>> from easydel.inference.sampling_params import SamplingParams
     >>>
-    >>> # Initialize engine with smart decoding
+    >>> # Initialize engine
     >>> engine = eSurge(
     ...     model="model-name",
-    ...     bytecode_decode=True,  # Enable smart UTF-8 handling
     ...     max_model_len=8192,
     ...     reserve_tokens=800
     ... )
@@ -62,51 +57,110 @@ Technical Details:
     - Main thread: Handles API calls and request submission
     - Scheduler thread: Continuously processes queued requests
     - JAX computation: Executes model forward passes
-
-    Smart bytecode decoding addresses the common issue where byte-level tokenizers
-    (used by many modern LLMs) can split multi-byte UTF-8 characters across token
-    boundaries, causing malformed characters during streaming decode.
 """
 
 from __future__ import annotations
 
+import os
+import subprocess
 import threading
 import time
-import traceback
 import typing
-import uuid
-from collections.abc import Iterator
+from collections import deque
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Any
 
 import jax
-from eformer.loggings import get_logger
+from eformer.common_types import NOT_GIVEN, _Empty
 from jax import numpy as jnp
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from easydel.axis import register_attention_data_parallel_axis
 from easydel.inference.sampling_params import SamplingParams
 from easydel.utils import Registry
+from easydel.workers.esurge.pipeline import WorkerManager
 
-from ..decoders import SmartBytecodeDecoder
-from .engine_types import EngineCoreOutputs
-from .metrics import get_metrics_collector, initialize_metrics
-from .request import EngineRequest, EngineRequestStatus
+from .distributed import DistributedController, make_config_fingerprint, resolve_distributed_role
+from .logger import logger
+from .mixins import (
+    EngineIOMixin,
+    EngineLifecycleMixin,
+    EngineMonitoringMixin,
+    EngineParsingMixin,
+    EngineRequestsMixin,
+    EngineUtilsMixin,
+)
+from .multimodal import MultiModalManager
 from .runners import eSurgeRunner
 from .scheduler import Scheduler
-from .utils import truncate_tokens
 
 if typing.TYPE_CHECKING:
+    from easydel.inference.reasoning.abstract_reasoning import ReasoningParserName
+    from easydel.inference.tools.abstract_tool import ToolParserName
     from easydel.infra import EasyDeLBaseModule
 
-logger = get_logger("eSurgeEngine")
+# Configuration constants
+DEFAULT_DETOKENIZER_MAX_STATES = 1 << 16  # 65536 states for streaming decode
+DEFAULT_PAGE_SIZE_GPU_MIN = 256  # Minimum efficient page size for GPU
+DEFAULT_DECODE_INTERVAL_TOKENS = 16  # Decode every N tokens
+DEFAULT_DECODE_INTERVAL_SECS = 0.04  # Or decode every N seconds (20ms)
+# Default to fail-fast (1) so benchmark runs don't spin for hours on fatal errors.
+# Set `EASURGE_MAX_SCHEDULER_ERRORS=10` (or higher) to restore retry behavior.
+MAX_CONSECUTIVE_SCHEDULER_ERRORS = int(os.environ.get("EASURGE_MAX_SCHEDULER_ERRORS", "5"))
+WORKER_DRAIN_MAX_RETRIES = 3  # Maximum retry attempts for worker drain
+WORKER_DRAIN_INITIAL_DELAY = 0.1  # Initial retry delay in seconds
+SamplingCallable = typing.Callable[[SamplingParams, dict[str, typing.Any]], SamplingParams | None] | None
 
 
-def _set_requested_new(sp, n: int):
+def _set_requested_new(sp, n: int):  # pyright: ignore[reportUnusedFunction]
+    """Set the max_tokens or max_new_tokens attribute on a SamplingParams object.
+
+    Args:
+        sp: SamplingParams instance to modify.
+        n: Number of tokens to set.
+    """
     if hasattr(sp, "max_tokens"):
         sp.max_tokens = int(n)
     if hasattr(sp, "max_new_tokens"):
         sp.max_new_tokens = int(n)
+
+
+def _normalize_data_parallelism_axis(axis: str) -> str:
+    """Normalize and validate the requested data-parallel axis name."""
+    axis_name = str(axis).strip()
+    if not axis_name:
+        raise ValueError("`data_parallelism_axis` must be a non-empty string.")
+    return axis_name
+
+
+def _with_data_parallel_axis(partition_axis: Any, data_parallelism_axis: str) -> Any:
+    """Return partition-axis metadata with an updated data-parallel axis."""
+    if partition_axis is None:
+        return {"data_parallel_axis": data_parallelism_axis}
+
+    if isinstance(partition_axis, dict):
+        merged = dict(partition_axis)
+        merged["data_parallel_axis"] = data_parallelism_axis
+        return merged
+
+    if hasattr(partition_axis, "data_parallel_axis"):
+        try:
+            partition_axis.data_parallel_axis = data_parallelism_axis
+            return partition_axis
+        except Exception:
+            pass
+
+    attrs = getattr(partition_axis, "__dict__", None)
+    if isinstance(attrs, dict) and attrs:
+        merged = dict(attrs)
+        merged["data_parallel_axis"] = data_parallelism_axis
+        try:
+            return type(partition_axis)(**merged)
+        except Exception:
+            return merged
+
+    return {"data_parallel_axis": data_parallelism_axis}
 
 
 @dataclass
@@ -131,6 +185,8 @@ class CompletionOutput:
     cumulative_logprob: float | None = None
     logprobs: list[dict[int, float]] | None = None
     finish_reason: str | None = None
+    tool_calls: list | None = None
+    reasoning_content: str | None = None
 
 
 @dataclass
@@ -160,8 +216,8 @@ class RequestOutput:
     """
 
     request_id: str
-    prompt: str
-    prompt_token_ids: list[int]
+    prompt: str | list[str]
+    prompt_token_ids: list[list[int]] | list[int]
     outputs: list[CompletionOutput]
     finished: bool = False
     metrics: dict[str, Any] | None = None
@@ -176,6 +232,11 @@ class RequestOutput:
 
     update_seq: int = 0
     delta_seq: int = 0
+
+    tool_calls: list | None = None
+    delta_tool_calls: list | None = None
+    reasoning_content: str | None = None
+    delta_reasoning_content: str | None = None
 
     def get_text(self) -> str:
         """Get the generated text from the first completion output.
@@ -204,40 +265,33 @@ class RequestOutput:
 
 
 @Registry.register("serve", "esurge")
-class eSurge:
+class eSurge(
+    EngineMonitoringMixin, EngineParsingMixin, EngineRequestsMixin, EngineIOMixin, EngineLifecycleMixin, EngineUtilsMixin
+):
     """High-level engine interface for text generation with eSurge.
 
     eSurge is a high-performance inference engine built on JAX that provides:
     - Efficient batched inference with paged attention
     - Continuous batching with background scheduling
     - Streaming generation with delta text tracking
-    - Smart bytecode decoding for handling malformed UTF-8 sequences
     - Comprehensive monitoring and metrics
     - Thread-safe request handling
     - Dynamic context management with automatic prompt truncation
 
     The engine runs a background scheduler thread that continuously processes
-    requests from the queue, enabling high throughput and low latency. It includes
-    advanced features like smart decoding to handle tokenizers that split multi-byte
-    UTF-8 characters across token boundaries, preventing malformed characters (�)
-    during streaming.
+    requests from the queue, enabling high throughput and low latency.
 
     Key Features:
-        - **Smart Bytecode Decoding**: Automatically handles incomplete UTF-8 sequences
-          by buffering partial tokens and using progressive backtracking to find clean
-          decode points.
         - **Context Management**: Automatically manages context length with configurable
           truncation strategies and token reservation.
         - **Streaming Support**: Efficient incremental decoding with configurable
           intervals for optimal performance.
-        - **Monitoring**: Built-in Prometheus metrics, web dashboard, and console
-          monitoring capabilities.
+        - **Monitoring**: Built-in Prometheus metrics and console monitoring (visualize with Grafana).
 
     Example:
-        >>> # Initialize with smart decoding enabled
+        >>> # Initialize engine
         >>> engine = eSurge(
         ...     model="model-name",
-        ...     bytecode_decode=True,  # Enable smart UTF-8 handling
         ...     max_model_len=8192,
         ...     reserve_tokens=800  # Reserve tokens for generation
         ... )
@@ -255,15 +309,22 @@ class eSurge:
         dtype: jnp.dtype = jnp.bfloat16,
         max_model_len: int = 8192,
         min_input_pad: int = 16,
+        min_token_pad: int | None = None,
         max_num_seqs: int = 256,
-        max_num_batched_tokens: int | None = None,
+        max_num_seq_buckets: list[int] | None = None,
+        max_num_batched_tokens: int | None | _Empty = NOT_GIVEN,
         hbm_utilization: float = 0.85,
         page_size: int = 128,
+        use_aot_forward: bool = True,
+        bind_graphstate_for_aot: bool = False,
         enable_prefix_caching: bool = True,
         auto_shard_model: bool = True,
         sharding_axis_dims: tuple[int, ...] = (1, 1, 1, -1, 1),
         compile_runner: bool = True,
         runner_verbose: bool = False,
+        overlap_execution: bool = False,
+        sampler_metrics: bool = False,
+        data_parallelism_axis: str = "dp",
         esurge_name: str | None = None,
         reserve_tokens: int | None = None,
         auto_truncate_prompt: bool = True,
@@ -272,24 +333,62 @@ class eSurge:
         truncate_mode: typing.Literal["left", "right", "middle"] = "left",
         prefer_preserve_prompt: bool = True,
         decode_truncated_prompt: bool = True,
-        bytecode_decode: bool = True,
+        destroy_pages_on_pause: bool = True,
+        detokenizer_max_states: int = DEFAULT_DETOKENIZER_MAX_STATES,
+        tokenizer_endpoint: str | None = None,
+        detokenizer_endpoint: str | None = None,
+        max_request_outputs: int | None = 1000,
+        idle_reset_seconds: float | None = None,
+        idle_reset_min_interval: float = 60.0,
+        sampling_params_callback: SamplingCallable = None,
+        extra_eos_token_ids: list[int] | None = None,
+        extra_stops: str | list[str] | None = None,
+        silent_mode: bool = False,
+        processor: Any | None = None,
+        resolution_buckets: list[tuple[int, int]] | None = None,
+        vision_cache_capacity_mb: int = 1024,
+        tool_parser: ToolParserName | None = None,
+        reasoning_parser: ReasoningParserName | None = None,
+        distributed_mode: bool = False,
+        distributed_role: typing.Literal["auto", "leader", "worker"] = "auto",
+        distributed_service_name: str | None = None,
+        distributed_world_size: int | None = None,
+        distributed_rank: int | None = None,
+        distributed_control_port: int = 19666,
+        distributed_control_bind_host: str = "0.0.0.0",
+        distributed_advertise_addr: str | None = None,
+        distributed_auth_token: str | None = None,
+        distributed_step_timeout_s: float = 30.0,
+        distributed_connect_timeout_s: float = 15.0,
+        distributed_verify_sampling_digest: bool = True,
         **kwargs,
     ):
         """Initialize the eSurge engine.
 
         Args:
             model: Model path (HuggingFace hub) or preloaded EasyDeL model instance.
-            tokenizer: Tokenizer path or instance. If None, loads from model path.
+            tokenizer: Deprecated alias for `processor`. Tokenizer path or instance.
             dtype: JAX dtype for model computations (default: bfloat16).
             max_model_len: Maximum sequence length the model can handle.
             min_input_pad: Minimum padding for input sequences.
+            min_token_pad: Optional minimum token bucket size for compilation. When
+                smaller than `min_input_pad`, this allows decode steps like `tok=1/b1`
+                instead of `tok=1/b16`, at the cost of more compilation variants.
             max_num_seqs: Maximum number of concurrent sequences.
+            max_num_seq_buckets: Optional explicit request-capacity buckets used for
+                compilation (e.g., [1, 2, 4, 8, 16, 32]). When provided, the runner
+                compiles these bucket sizes and selects the smallest that can fit
+                the current active batch.
             max_num_batched_tokens: Maximum tokens per batch (auto-computed if None).
             hbm_utilization: Target HBM memory utilization (0.0-1.0).
             page_size: Page size for paged attention KV cache. Recommended >=256 for GPUs.
+            bind_graphstate_for_aot: Whether AOT model-step compilations should
+                close over graphstate/graphother as compile-time constants.
+                Default: False.
             enable_prefix_caching: Enable caching of common prefixes for efficiency.
             auto_shard_model: Automatically shard model across devices.
-            sharding_axis_dims: Sharding configuration for model parallelism.
+            sharding_axis_dims: Base sharding configuration for model parallelism.
+                Default order is ``(dp, fsdp, ep, tp, sp)``.
             compile_runner: JIT pre-compile the runner for better performance.
             runner_verbose: Enable verbose logging in runner.
             esurge_name: Optional custom name for this engine instance.
@@ -309,32 +408,87 @@ class eSurge:
                 capping new tokens first before truncating the prompt.
             decode_truncated_prompt: Re-decode truncated prompt to update the text
                 representation when truncation occurs.
-            bytecode_decode: Enable smart bytecode decoding for handling malformed
-                UTF-8 sequences. This prevents "�" characters during streaming when
-                tokens split multi-byte UTF-8 characters. Uses intelligent buffering
-                and progressive backtracking to find clean decode points.
+            overlap_execution: Enable double-buffered model execution to overlap
+                scheduler work with device execution (experimental).
+            sampler_metrics: Enable the lightweight sampler JIT for recording
+                token log-probabilities on-device.
+            data_parallelism_axis: Mesh axis name used as the data-parallel page
+                axis for KV-cache sharding and slot localization. Defaults to
+                ``"dp"``. Set to ``"ep"`` to run data parallelism over the expert axis.
+            detokenizer_max_states: Maximum number of streaming decode states
+                the detokenizer worker will keep resident (power-of-two recommended).
+            destroy_pages_on_pause: When True, destroying the ragged KV cache upon
+                pause() to free memory, and lazily reinitializing it on resume().
+            tokenizer_endpoint: ZMQ endpoint of the external tokenizer worker.
+            detokenizer_endpoint: ZMQ endpoint of the external detokenizer worker.
+            max_request_outputs: Maximum number of completed RequestOutput objects
+                to retain in memory for post-hoc access. Set to None for unlimited
+                retention or <=0 to disable retention entirely.
+            idle_reset_seconds: If set, automatically pause/resume the engine after
+                this many seconds of continuous idleness (no running/pending requests).
+                Useful for clearing stale state under long-running workloads.
+            idle_reset_min_interval: Minimum seconds between idle resets to avoid
+                reset loops when traffic is sparse.
+            sampling_params_callback: Optional callable that can inspect/modify
+                the SamplingParams for each submitted request. Receives a cloned
+                SamplingParams instance and request metadata dict containing
+                "request_id", "prompt", and "engine". May return a new instance
+                or mutate the provided one in-place.
+            extra_eos_token_ids: Additional EOS token IDs beyond the tokenizer's default.
+                These will be treated as end-of-sequence tokens for all requests unless
+                overridden in SamplingParams.
+            extra_stops: Additional stop strings applied to every request. These are
+                merged into per-request ``SamplingParams.stop`` at runtime and
+                de-duplicated while preserving existing stop order.
+            silent_mode: If True, suppress informational eSurge engine logs.
+            processor: Unified text/multimodal processor. Can be a tokenizer or an
+                HF processor (with an embedded tokenizer). If None, falls back to
+                `tokenizer` and then to loading from `model` when `model` is a string.
+            tool_parser: Name of the tool-call parser to use for automatic function-call
+                extraction (e.g., "hermes", "mistral", "llama3_json"). When set, the
+                engine runs the parser in ``_process_engine_outputs()`` so that
+                ``RequestOutput.tool_calls`` / ``RequestOutput.delta_tool_calls`` are
+                populated directly. If None, tool-call detection is left to the
+                API server layer. See ``ToolParserManager`` for available parsers.
+            reasoning_parser: Name of the reasoning parser to use for extracting
+                chain-of-thought content (e.g., "deepseek_r1", "qwen3", "mistral").
+                When set, the engine separates reasoning from content so that
+                ``RequestOutput.reasoning_content`` / ``RequestOutput.delta_reasoning_content``
+                are populated directly. If None, no reasoning extraction is performed.
+                See ``ReasoningParserManager`` for available parsers.
+            distributed_mode: Enable lockstep multi-host serving mode. Rank 0
+                acts as leader and all other ranks are worker executors.
+            distributed_role: Role override for distributed mode. Use ``\"auto\"``
+                (default) to map rank 0 -> leader and others -> worker.
+            distributed_service_name: DNS service name resolved into host
+                membership for fixed world-size serving.
+            distributed_world_size: Expected number of hosts in the service.
+            distributed_rank: Optional rank override. Defaults to JAX process
+                index when distributed mode is enabled.
+            distributed_control_port: ZMQ control-plane port.
+            distributed_control_bind_host: Bind host for worker control server.
+            distributed_advertise_addr: Optional advertised address override.
+            distributed_auth_token: Shared secret used to authenticate
+                control-plane requests.
+            distributed_step_timeout_s: Worker step reply timeout in seconds.
+            distributed_connect_timeout_s: Worker connect/handshake timeout.
+            distributed_verify_sampling_digest: Validate sampled-token digest
+                from workers against leader output each step.
             **kwargs: Additional configuration passed to model loading.
 
         Raises:
             ValueError: If tokenizer not provided and cannot be inferred, or if
                 configuration parameters are invalid.
-
-        Note:
-            The bytecode_decode feature is particularly important for models using
-            byte-level tokenizers (like many modern LLMs) where token boundaries
-            may not align with UTF-8 character boundaries. When enabled, it ensures
-            smooth streaming without malformed characters.
         """
-        from easydel import AutoEasyDeLModelForCausalLM, EasyDeLBaseConfigDict
+        from easydel.infra import EasyDeLBaseConfigDict
         from easydel.layers.attention import AttentionMechanisms
+        from easydel.modules.auto import AutoEasyDeLModelForCausalLM
 
-        if jax.default_backend() != "tpu" and page_size <= 128:
-            logger.warning(
-                "for better performance and to utilize GPUs kernels (or even just on CPUs) "
-                "better it's recommended to use `page_size>=256`."
-            )
+        self.silent_mode = silent_mode
+        self._info = logger.info if not self.silent_mode else lambda *args, **kwargs: None
+
         if reserve_tokens is None:
-            reserve_tokens = max_model_len // 10
+            reserve_tokens = max_num_seqs
 
         if max_model_len <= reserve_tokens:
             raise ValueError(f"Configuration error: max_model_len={max_model_len} <= reserve_tokens={reserve_tokens}")
@@ -342,77 +496,336 @@ class eSurge:
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
         self.page_size = page_size
+        self.data_parallelism_axis = _normalize_data_parallelism_axis(data_parallelism_axis)
+        register_attention_data_parallel_axis(self.data_parallelism_axis)
+        self.distributed_mode = bool(distributed_mode)
+        self.distributed_service_name = distributed_service_name
+        self.distributed_control_port = int(distributed_control_port)
+        self.distributed_control_bind_host = str(distributed_control_bind_host)
+        self.distributed_advertise_addr = distributed_advertise_addr
+        self.distributed_step_timeout_s = float(distributed_step_timeout_s)
+        self.distributed_connect_timeout_s = float(distributed_connect_timeout_s)
+        self.distributed_verify_sampling_digest = bool(distributed_verify_sampling_digest)
+        self._distributed_controller: DistributedController | None = None
+
+        if self.distributed_mode:
+            if not distributed_auth_token:
+                raise ValueError("`distributed_auth_token` must be provided when distributed_mode=True.")
+            if distributed_world_size is None:
+                raise ValueError("`distributed_world_size` must be provided when distributed_mode=True.")
+            if overlap_execution:
+                raise ValueError(
+                    "`overlap_execution=True` is not supported with distributed_mode=True. "
+                    "Use overlap_execution=False for lockstep multi-host serving."
+                )
+
+            world_size = int(distributed_world_size)
+            if world_size <= 0:
+                raise ValueError(f"`distributed_world_size` must be positive, got {distributed_world_size}.")
+
+            rank = int(distributed_rank) if distributed_rank is not None else int(jax.process_index())
+            if rank < 0 or rank >= world_size:
+                raise ValueError(
+                    f"`distributed_rank` out of range: rank={rank}, world_size={world_size}. "
+                    "Ensure JAX distributed init and DNS membership agree."
+                )
+
+            role = resolve_distributed_role(distributed_role, rank)
+
+            self.distributed_role = role
+            self.distributed_world_size = world_size
+            self.distributed_rank = rank
+            self.distributed_auth_token = str(distributed_auth_token)
+        else:
+            self.distributed_role = "leader"
+            self.distributed_world_size = 1
+            self.distributed_rank = 0
+            self.distributed_auth_token = ""
+
         if kwargs.pop("use_combined_forward", None) is not None:
             logger.warning("`use_combined_forward` is deprecated (the fused step will be used now).")
-        if kwargs.pop("use_aot_forward", None) is not None:
-            logger.warning("`use_aot_forward` is deprecated (the fused step will be used now).")
+        # `processor` is the unified interface for text + multimodal workflows.
+        # Backward-compat: if `processor` isn't provided, fall back to `tokenizer`.
+        if tokenizer is not None and processor is not None and tokenizer is not processor:
+            logger.warning("Both `tokenizer` and `processor` were provided; `processor` will be used for multimodal.")
+
+        processor_obj: Any | None = processor if processor is not None else tokenizer
+        processor_source: str | None = None
+
+        if processor_obj is None:
+            if isinstance(model, str):
+                processor_source = model
+                processor_obj = AutoTokenizer.from_pretrained(model)
+            else:
+                raise ValueError("Processor must be provided when using a preloaded model.")
+        elif isinstance(processor_obj, str):
+            processor_source = processor_obj
+            processor_obj = AutoTokenizer.from_pretrained(processor_obj)
+        else:
+            processor_source = getattr(processor_obj, "name_or_path", None)
+
+        tokenizer_obj: PreTrainedTokenizerBase | None = None
+        if isinstance(processor_obj, PreTrainedTokenizerBase):
+            tokenizer_obj = processor_obj
+        else:
+            maybe_tok = getattr(processor_obj, "tokenizer", None)
+            if isinstance(maybe_tok, PreTrainedTokenizerBase):
+                tokenizer_obj = maybe_tok
+
+        if tokenizer_obj is None:
+            if isinstance(tokenizer, PreTrainedTokenizerBase):
+                tokenizer_obj = tokenizer
+            elif isinstance(tokenizer, str):
+                processor_source = processor_source or tokenizer
+                tokenizer_obj = AutoTokenizer.from_pretrained(tokenizer)
+            else:
+                source = processor_source or (model if isinstance(model, str) else None)
+                if source is None:
+                    raise ValueError(
+                        "Tokenizer must be provided (or inferable from processor) when using a preloaded model."
+                    )
+                tokenizer_obj = AutoTokenizer.from_pretrained(source)
+
+        tokenizer_source = (
+            getattr(tokenizer_obj, "name_or_path", None)
+            or processor_source
+            or (model if isinstance(model, str) else None)
+        )
+        if tokenizer_source is None:
+            raise ValueError("Could not infer a tokenizer source for tokenizer/detokenizer workers.")
+
+        self.processor = processor_obj
+        self.tokenizer = tokenizer_obj
+
+        # Vision-language model support
+        self._multimodal_manager: MultiModalManager | None = None
+        if self.processor is not None:
+            self._multimodal_manager = MultiModalManager(
+                processor=self.processor,
+                model=None if isinstance(model, str) else model,
+                resolution_buckets=resolution_buckets,
+                cache_capacity_mb=vision_cache_capacity_mb,
+                enable_cache=True,
+            )
+
+        self._monitoring_server = None
+        self._monitoring_urls: dict[str, str] | None = None
+        self._monitoring_initialized = False
+        self._grafana_container_name: str | None = None
+        self._grafana_container_id: str | None = None
+        self._grafana_process: subprocess.Popen | None = None
+        self._grafana_temp_dir: str | None = None
+        self._grafana_url: str | None = None
+        self._esurge_name = esurge_name
+        self._scheduler_running = False
+        self.destroy_pages_on_pause = destroy_pages_on_pause
+        self._kv_cache_valid = True
+        self._paused = False
+        self._sampling_params_callback = sampling_params_callback
+
+        # Detokenizer cleanup tracking
+        self._failed_detokenizer_resets: set[str] = set()
+        self._detokenizer_cleanup_threshold = 100  # Clean up after this many failures
+
+        # Idle reset configuration
+        self._idle_reset_seconds = float(idle_reset_seconds) if idle_reset_seconds else None
+        self._idle_reset_min_interval = float(idle_reset_min_interval)
+        self._idle_reset_last_activity = time.time()
+        self._idle_reset_last_reset = 0.0
+        self._idle_monitor_event = threading.Event()
+        self._idle_monitor_thread: threading.Thread | None = None
+
+        # Tool calling and reasoning parser initialization
+        self.tool_parser_name = tool_parser
+        self.reasoning_parser_name = reasoning_parser
+        self._tool_parser_class = None
+        self._reasoning_parser_class = None
+
+        if tool_parser:
+            try:
+                from easydel.inference.tools import ToolParserManager
+
+                self._tool_parser_class = ToolParserManager.get_tool_parser(tool_parser)
+                if not silent_mode:
+                    logger.info("Initialized tool parser: %s", tool_parser)
+            except KeyError:
+                logger.warning("Tool parser '%s' not found, function calling disabled", tool_parser)
+
+        if reasoning_parser:
+            try:
+                from easydel.inference.reasoning import ReasoningParserManager
+
+                self._reasoning_parser_class = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
+                if not silent_mode:
+                    logger.info("Initialized reasoning parser: %s", reasoning_parser)
+            except KeyError:
+                logger.warning("Reasoning parser '%s' not found, reasoning disabled", reasoning_parser)
+
+        tokenizer_endpoint = tokenizer_endpoint or os.environ.get("EASURGE_TOKENIZER_ENDPOINT")
+        detokenizer_endpoint = detokenizer_endpoint or os.environ.get("EASURGE_DETOKENIZER_ENDPOINT")
+
+        self._worker_manager = WorkerManager(tokenizer_source)
+        self._tokenizer_client, self._detokenizer_client = self._worker_manager.start(
+            detokenizer_max_states=detokenizer_max_states,
+            tokenizer_endpoint=tokenizer_endpoint,
+            detokenizer_endpoint=detokenizer_endpoint,
+        )
+        self._tokenizer_endpoint = self._worker_manager.tokenizer_endpoint
+        self._detokenizer_endpoint = self._worker_manager.detokenizer_endpoint
+
         if isinstance(model, str):
-            self.model = AutoEasyDeLModelForCausalLM.from_pretrained(
+            backend = jax.default_backend()
+            preferred_attn_mechanism = (
+                AttentionMechanisms.UNIFIED_ATTENTION
+                if backend == "gpu"
+                else AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3
+            )
+            user_provided_attn = "attn_mechanism" in kwargs
+            requested_attn = kwargs.get("attn_mechanism") if user_provided_attn else None
+            if requested_attn is None:
+                user_provided_attn = False
+
+            if user_provided_attn:
+                attn_value = (
+                    requested_attn.value
+                    if isinstance(requested_attn, AttentionMechanisms)
+                    else str(requested_attn)
+                    if requested_attn is not None
+                    else None
+                )
+                if backend == "gpu" and attn_value in (
+                    AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2.value,
+                    AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3.value,
+                ):
+                    logger.warning(
+                        "GPU backend detected: `unified_attention` is preferred for eSurge inference; "
+                        f"got attn_mechanism={attn_value!r}."
+                    )
+                elif backend != "gpu" and attn_value == AttentionMechanisms.PAGED_FLASH_ATTENTION.value:
+                    logger.warning(
+                        "Paged flash attention is CUDA-only; non-GPU backends are not supported. "
+                        f"got attn_mechanism={attn_value!r}."
+                    )
+                elif backend == "tpu" and attn_value == AttentionMechanisms.UNIFIED_ATTENTION.value:
+                    logger.warning(
+                        "TPU backend detected: `ragged_page_attention_v3` is preferred for eSurge inference; "
+                        f"got attn_mechanism={attn_value!r}."
+                    )
+                elif backend == "tpu" and attn_value == AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2.value:
+                    logger.warning(
+                        "TPU backend detected: `ragged_page_attention_v3` is preferred for eSurge inference; "
+                        f"got attn_mechanism={attn_value!r}."
+                    )
+
+            sharding_axis_names = tuple(kwargs.pop("sharding_axis_names", ("dp", "fsdp", "ep", "tp", "sp")))
+            sharding_axis_dims_resolved = tuple(int(v) for v in sharding_axis_dims)
+            sharding_axis_names_resolved = tuple(str(v) for v in sharding_axis_names)
+            if self.data_parallelism_axis not in sharding_axis_names_resolved:
+                logger.warning(
+                    "`data_parallelism_axis=%r` not found in `sharding_axis_names=%r`; "
+                    "KV page sharding will behave as unsharded for that axis.",
+                    self.data_parallelism_axis,
+                    sharding_axis_names_resolved,
+                )
+
+            config_kwargs = dict(kwargs.pop("config_kwargs", {}) or {})
+            config_partition_axis = config_kwargs.pop("partition_axis", None)
+            kwargs_partition_axis = kwargs.pop("partition_axis", None)
+            resolved_partition_axis = _with_data_parallel_axis(
+                kwargs_partition_axis if kwargs_partition_axis is not None else config_partition_axis,
+                self.data_parallelism_axis,
+            )
+
+            model = AutoEasyDeLModelForCausalLM.from_pretrained(
                 model,
                 dtype=dtype,
                 param_dtype=dtype,
                 precision=jax.lax.Precision.DEFAULT,
                 auto_shard_model=auto_shard_model,
-                sharding_axis_dims=sharding_axis_dims,
+                sharding_axis_dims=sharding_axis_dims_resolved,
+                sharding_axis_names=sharding_axis_names_resolved,
+                partition_axis=resolved_partition_axis,
                 config_kwargs=EasyDeLBaseConfigDict(
-                    attn_mechanism=kwargs.get("attn_mechanism", AttentionMechanisms.RAGGED_PAGE_ATTENTION),
+                    attn_mechanism=requested_attn if user_provided_attn else preferred_attn_mechanism,
                     attn_dtype=dtype,
                     kvdtype=dtype,
                     freq_max_position_embeddings=max_model_len,
                     mask_max_position_embeddings=max_model_len,
-                    **kwargs.get("config_kwargs", {}),
+                    **config_kwargs,
                 ),
                 **{k: v for k, v in kwargs.items() if k not in ["attn_mechanism", "config_kwargs"]},
             )
-        else:
-            model = model.update_module(attn_mechanism="ragged_page_attention")
-            self.model = model
 
-        if tokenizer is None:
-            if isinstance(model, str):
-                self.tokenizer = AutoTokenizer.from_pretrained(model)
-            else:
-                raise ValueError("Tokenizer must be provided when using preloaded model")
-        elif isinstance(tokenizer, str):
-            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
-        else:
-            self.tokenizer = tokenizer
+        self._apply_data_parallel_axis_to_model(model)
 
-        self._monitoring_server = None
-        self._dashboard = None
-        self._dashboard_thread = None
-        self._dashboard_urls = None
-        self._monitoring_initialized = False
-        self._esurge_name = esurge_name
-        self._bytecode_decode = bytecode_decode
-        self._smart_decoder = SmartBytecodeDecoder(self.tokenizer) if bytecode_decode else None
-        self._scheduler_running = False
+        if self._multimodal_manager is not None and self._multimodal_manager.model is None:
+            self._multimodal_manager.model = model
+
+        # Profiling state
+        self._profiling_active = False
+        self._profiling_steps_remaining = 0
+        self._profiling_output_dir: str | None = None
+        self._profiling_host_level: int | None = None
+        self._profiling_python_level: int | None = None
+        self._possible_name = self._get_model_name(model)
+
         self.runner = eSurgeRunner(
-            model=self.model,
+            model=model.esurge_compatible_model,
             hbm_utilization=hbm_utilization,
             page_size=page_size,
             max_model_len=max_model_len,
             min_input_pad=min_input_pad,
             max_num_seqs=max_num_seqs,
+            max_num_seq_buckets=max_num_seq_buckets,
+            min_token_pad=min_token_pad,
+            use_aot_forward=use_aot_forward,
+            bind_graphstate_for_aot=bind_graphstate_for_aot,
             verbose=runner_verbose,
+            enable_overlap_execution=overlap_execution,
+            enable_sampler_metrics=sampler_metrics,
         )
+        self._overlap_execution = overlap_execution
+        if max_num_batched_tokens is NOT_GIVEN and jax.default_backend() == "gpu":
+            max_num_batched_tokens = min(max(2048, max_num_seqs), max_model_len)
+            logger.info(
+                f"GPU backend detected and `max_num_batched_tokens` was not provided; defaulting to {max_num_batched_tokens} tokens/step. "
+                "Pass an explicit int to override, or pass `None` to disable this auto-default "
+                "(falls back to `max_model_len`)."
+            )
+        elif max_num_batched_tokens is NOT_GIVEN and jax.default_backend() == "tpu":
+            max_num_batched_tokens = min(max(8192, max_num_seqs), max_model_len)
+            logger.info(
+                f"TPU backend detected and `max_num_batched_tokens` was not provided; defaulting to {max_num_batched_tokens} tokens/step. "
+                "Pass an explicit int to override, or pass `None` to disable this auto-default "
+                "(falls back to `max_model_len`)."
+            )
+        elif max_num_batched_tokens is NOT_GIVEN:
+            max_num_batched_tokens = None
+
         if compile_runner:
-            self.runner.compile()
+            # Limit compilation to the scheduler's per-step token budget when provided.
+            # This avoids compiling long-context token buckets (e.g. 32K/64K) when
+            # the scheduler will only ever emit smaller batches (e.g. 512/2048).
+            self.runner.compile(max_num_batched_tokens=max_num_batched_tokens)
 
         self.scheduler = Scheduler.from_runner(
             self.runner,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_prefix_caching=enable_prefix_caching,
         )
+        self._scheduler_max_num_batched_tokens = max_num_batched_tokens
+        self._scheduler_enable_prefix_caching = enable_prefix_caching
 
         # Streaming decode cadence
-        self.decode_interval_tokens = 4
-        self.decode_interval_secs = 0.02
+        self.decode_interval_tokens = DEFAULT_DECODE_INTERVAL_TOKENS
+        self.decode_interval_secs = DEFAULT_DECODE_INTERVAL_SECS
 
         # State
         self._request_counter = 0
         self._active_requests: dict[str, dict] = {}
         self._request_outputs: dict[str, RequestOutput] = {}
+        self._max_request_outputs = None if max_request_outputs is None else int(max_request_outputs)
+        self._finished_request_ids: deque[str] = deque()
 
         # Per-request events to support many concurrent streams
         self._request_events: dict[str, threading.Event] = {}
@@ -423,6 +836,8 @@ class eSurge:
         self.truncate_mode = truncate_mode
         self.prefer_preserve_prompt = prefer_preserve_prompt
         self.decode_truncated_prompt = decode_truncated_prompt
+        self.extra_eos_token_ids = extra_eos_token_ids or []
+        self.extra_stops = self._normalize_stop_sequences(extra_stops)
         # Locks and signals
         self._scheduler_lock = threading.RLock()
         self._request_lock = threading.RLock()
@@ -433,10 +848,104 @@ class eSurge:
         # Scheduler thread
         self._scheduler_thread: threading.Thread | None = None
         self._scheduler_running = False
+        self._scheduler_exception: BaseException | None = None
+        self._scheduler_exception_tb: str | None = None
+
+        generation_config = getattr(model, "generation_config", None)
+        if isinstance(generation_config, dict):
+            self._generation_config_dict = dict(generation_config)
+        elif generation_config is not None and hasattr(generation_config, "to_dict"):
+            try:
+                self._generation_config_dict = generation_config.to_dict()
+            except Exception:
+                self._generation_config_dict = {}
+                logger.debug("Failed to serialize model generation_config; continuing without it", exc_info=True)
+        else:
+            self._generation_config_dict = {}
+
+        def _coerce_token_ids(raw: Any) -> list[int]:
+            if raw is None:
+                return []
+            candidates = raw if isinstance(raw, (list, tuple, set)) else [raw]
+            token_ids: list[int] = []
+            for candidate in candidates:
+                if candidate is None:
+                    continue
+                try:
+                    token_id = int(candidate)
+                except (TypeError, ValueError):
+                    logger.debug("Ignoring non-integer EOS token candidate: %r", candidate)
+                    continue
+                token_ids.append(token_id)
+            return token_ids
+
+        tokenizer_eos_ids = _coerce_token_ids(getattr(self.tokenizer, "eos_token_id", None))
+        generation_config_eos_ids = _coerce_token_ids(self._generation_config_dict.get("eos_token_id"))
+        engine_extra_eos_ids = _coerce_token_ids(self.extra_eos_token_ids)
+
+        combined_eos_ids: list[int] = []
+        seen_eos_ids: set[int] = set()
+        for token_id in [*tokenizer_eos_ids, *generation_config_eos_ids, *engine_extra_eos_ids]:
+            if token_id in seen_eos_ids:
+                continue
+            seen_eos_ids.add(token_id)
+            combined_eos_ids.append(token_id)
+
+        self._generation_config_eos_token_ids = generation_config_eos_ids
+        self.__eos_ids = combined_eos_ids
+        self.__eos_set = set(combined_eos_ids)
+        self._primary_eos_token_id = self.__eos_ids[0] if self.__eos_ids else None
+        # Publicly-named aliases for mixins/helpers to avoid class-name mangling.
+        self._eos_ids = self.__eos_ids
+        self._eos_set = self.__eos_set
+
+        if self.distributed_mode:
+            distributed_config = {
+                "max_model_len": int(self.max_model_len),
+                "max_num_seqs": int(self.max_num_seqs),
+                "page_size": int(self.page_size),
+                "data_parallelism_axis": str(self.data_parallelism_axis),
+                "max_num_batched_tokens": (
+                    int(self.scheduler.max_num_scheduled_tokens)
+                    if self.scheduler.max_num_scheduled_tokens is not None
+                    else None
+                ),
+                "scheduler_policy": str(
+                    self.scheduler.policy.value if hasattr(self.scheduler.policy, "value") else self.scheduler.policy
+                ),
+            }
+            self._distributed_config_fingerprint = make_config_fingerprint(distributed_config)
+            self._distributed_controller = DistributedController(
+                enabled=True,
+                role=self.distributed_role,
+                rank=self.distributed_rank,
+                world_size=self.distributed_world_size,
+                service_name=self.distributed_service_name,
+                control_port=self.distributed_control_port,
+                control_bind_host=self.distributed_control_bind_host,
+                advertise_addr=self.distributed_advertise_addr,
+                auth_token=self.distributed_auth_token,
+                step_timeout_s=self.distributed_step_timeout_s,
+                connect_timeout_s=self.distributed_connect_timeout_s,
+                verify_sampling_digest=self.distributed_verify_sampling_digest,
+                config_fingerprint=self._distributed_config_fingerprint,
+                execute_step=self._distributed_execute_step,
+            )
+        else:
+            self._distributed_config_fingerprint = None
 
         self.initiate()
 
     def _calculate_model_size(self, graphstate) -> str:
+        """Calculate the model size in billions of parameters.
+
+        Args:
+            graphstate: The model's graph state containing parameter arrays.
+
+        Returns:
+            String representation of model size in billions (e.g., "7.00").
+            Returns "unknown" if calculation fails.
+        """
         try:
             num_params = sum(n.size for n in jax.tree_util.tree_flatten(graphstate)[0])
             return f"{num_params / 1e9:.2f}"
@@ -444,1198 +953,95 @@ class eSurge:
             return "unknown"
 
     def _get_model_type(self, model) -> str:
+        """Get the model type from its configuration.
+
+        Args:
+            model: The EasyDeL model instance.
+
+        Returns:
+            Lowercase model type string (e.g., "llama", "mistral", "unknown").
+        """
         return getattr(model.config, "model_type", "unknown").lower()
 
     def _get_model_name(self, model) -> str:
+        """Generate a human-readable model name.
+
+        Args:
+            model: The EasyDeL model instance.
+
+        Returns:
+            String in format "{model_type}-{size}b" (e.g., "llama-7.00b").
+        """
         model_type = self._get_model_type(model)
         model_size = self._calculate_model_size(model.graphstate)
         return f"{model_type}-{model_size}b"
 
     @cached_property
     def esurge_name(self) -> str:
-        return self._esurge_name or self._get_model_name(self.model)
-
-    @property
-    def bytecode_decode(self) -> bool:
-        """Get the bytecode decoding setting.
+        """Get the engine's display name.
 
         Returns:
-            True if smart bytecode decoding is enabled for handling malformed
-            UTF-8 sequences during token streaming.
-
-        Example:
-            >>> if engine.bytecode_decode:
-            ...     print("Smart UTF-8 handling is enabled")
+            Custom name if provided during initialization, otherwise an
+            auto-generated name based on model type and size.
         """
-        return self._bytecode_decode
+        return self._esurge_name or self._possible_name
 
-    @property
-    def smart_decoder(self) -> SmartBytecodeDecoder | None:
-        """Get the smart bytecode decoder instance.
-
-        Returns:
-            SmartBytecodeDecoder instance if bytecode_decode is enabled, else None.
-            The decoder handles buffering of incomplete tokens and progressive
-            backtracking to find clean UTF-8 decode points.
-
-        Example:
-            >>> if engine.smart_decoder:
-            ...     print("Decoder is active and handling UTF-8 sequences")
-        """
-        return self._smart_decoder
-
-    def initiate(self) -> None:
-        """Start the background scheduler thread.
-
-        Initiates a daemon thread that continuously runs the scheduler loop,
-        processing requests from the queue and updating outputs. This must
-        be called before using generate() or stream() methods.
-
-        The scheduler thread will:
-        1. Schedule requests from the waiting queue
-        2. Execute model forward passes
-        3. Update request outputs with generated tokens
-        4. Signal waiting threads when updates are available
-        """
-        with self._scheduler_lock:
-            if self._scheduler_running:
-                logger.info("Scheduler loop is already running")
-                return
-
-            def _scheduler_loop():
-                logger.info("Starting background scheduler loop")
-                while self._scheduler_running:
-                    try:
-                        scheduler_output = self.scheduler.schedule()
-                        model_output = self.runner.execute_model(scheduler_output)
-                        engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
-                        if engine_outputs:
-                            self._process_engine_outputs(engine_outputs)
-                    except Exception as e:
-                        traceback.print_exc()
-                        logger.error(f"Error in scheduler loop: {e}")
-                        time.sleep(0.01)
-                logger.info("Background scheduler loop stopped")
-
-            self._scheduler_running = True
-            self._scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True)
-            self._scheduler_thread.start()
-            logger.info("Background scheduler initiated")
-
-    def terminate(self) -> None:
-        """Stop the background scheduler thread.
-
-        Gracefully shuts down the scheduler loop and waits for the thread
-        to terminate. Should be called when the engine is no longer needed
-        to free resources.
-        """
-        with self._scheduler_lock:
-            if not self._scheduler_running:
-                logger.info("Scheduler loop is not running")
-                return
-            logger.info("Stopping background scheduler loop...")
-            self._scheduler_running = False
-            if self._scheduler_thread:
-                self._scheduler_thread.join(timeout=5.0)
-                if self._scheduler_thread.is_alive():
-                    logger.warning("Scheduler thread did not stop gracefully")
-                self._scheduler_thread = None
-            logger.info("Background scheduler terminated")
-
-    def _format_chat_prompt(
+    def set_sampling_params_callback(
         self,
-        messages: list[dict[str, str]],
-        add_generation_prompt: bool = True,
-        chat_template: str | None = None,
-        tools: list[dict] | None = None,
-    ) -> str:
-        """Format chat messages into a prompt string using the tokenizer's chat template.
-
-        Converts a list of chat messages into a formatted prompt string that can be
-        passed to the model for generation. Uses the tokenizer's built-in chat template
-        or a custom template if provided.
+        callback: typing.Callable[[SamplingParams, dict[str, typing.Any]], SamplingParams | None] | None,
+    ) -> None:
+        """Register or clear the sampling-params callback.
 
         Args:
-            messages: List of message dictionaries with 'role' and 'content' keys.
-                Roles can be 'system', 'user', 'assistant', etc.
-            add_generation_prompt: Whether to add the generation prompt token/string
-                at the end to indicate the model should generate a response.
-            chat_template: Optional custom chat template to override the tokenizer's
-                default template. Should be a Jinja2 template string.
-            tools: Optional list of tool/function definitions that the model can use.
-                Format depends on the specific model's tool calling conventions.
-
-        Returns:
-            Formatted prompt string ready for tokenization and generation.
-
-        Example:
-            >>> messages = [
-            ...     {"role": "system", "content": "You are a helpful assistant."},
-            ...     {"role": "user", "content": "What is 2+2?"}
-            ... ]
-            >>> prompt = engine._format_chat_prompt(messages)
-            >>> # Returns formatted string like: "<|system|>You are a helpful assistant.<|user|>What is 2+2?<|assistant|>"
-
-        Note:
-            The exact format depends on the tokenizer's chat template. Different models
-            use different special tokens and formatting conventions.
-        """  # noqa
-        return self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            tools=tools,
-            add_generation_prompt=add_generation_prompt,
-            chat_template=chat_template,
-        )
-
-    def generate(
-        self,
-        prompts: str | list[str],
-        sampling_params: SamplingParams | None = None,
-        request_id: str | list[str] | None = None,
-        use_tqdm: bool = True,
-        bytecode_decode: bool | None = None,
-    ) -> list[RequestOutput]:
-        """Generate completions for one or more prompts (blocking).
-
-        Synchronous batch generation that waits for all completions to finish
-        before returning. Suitable for batch processing scenarios where you need
-        all results at once.
-
-        Args:
-            prompts: Single prompt string or list of prompts to generate from.
-            sampling_params: Generation parameters controlling temperature, top_p,
-                max_tokens, etc. Defaults to SamplingParams(max_tokens=128) if None.
-            request_id: Optional request ID(s) for tracking. Auto-generated if None.
-                Can be a single string (for single prompt) or list of strings.
-            use_tqdm: Show progress bar for batch generation. Useful for tracking
-                progress with multiple prompts.
-            bytecode_decode: Override the instance's bytecode_decode setting for this
-                specific call. When True, enables smart UTF-8 handling for this request.
-                When None, uses the instance's default setting.
-
-        Returns:
-            List of RequestOutput objects containing:
-                - Generated text in the `text` field
-                - Token IDs in the `token_ids` field
-                - Performance metrics (tokens/sec, latency, etc.)
-                - Finish reason ('stop', 'length', 'eos_token')
-
-        Raises:
-            RuntimeError: If background scheduler is not running. Call initiate() first.
-            ValueError: If prompts and request_ids have mismatched lengths.
-
-        Example:
-            >>> # Single prompt generation
-            >>> outputs = engine.generate(
-            ...     "What is AI?",
-            ...     SamplingParams(max_tokens=100, temperature=0.7)
-            ... )
-            >>> print(outputs[0].get_text())
-            >>>
-            >>> # Batch generation with progress bar
-            >>> prompts = ["Question 1?", "Question 2?", "Question 3?"]
-            >>> outputs = engine.generate(prompts, use_tqdm=True)
-            >>> for i, output in enumerate(outputs):
-            ...     print(f"Prompt {i}: {output.get_text()[:50]}...")
-            >>>
-            >>> # Override bytecode decoding for specific request
-            >>> outputs = engine.generate(
-            ...     "Generate UTF-8 text",
-            ...     bytecode_decode=True  # Enable smart decoding
-            ... )
-        """
-        if isinstance(prompts, str):
-            prompts = [prompts]
-
-        if request_id is None:
-            request_ids = [self._generate_request_id() for _ in prompts]
-        elif isinstance(request_id, str):
-            request_ids = [request_id]
-        else:
-            request_ids = request_id
-
-        if sampling_params is None:
-            sampling_params = SamplingParams(max_tokens=128)
-
-        # Override bytecode_decode if specified
-        original_bytecode_decode = self._bytecode_decode
-        if bytecode_decode is not None:
-            self._bytecode_decode = bytecode_decode
-            if bytecode_decode and self._smart_decoder is None:
-                self._smart_decoder = SmartBytecodeDecoder(self.tokenizer)
-
-        try:
-            for prompt, req_id in zip(prompts, request_ids, strict=False):
-                self._add_request(req_id, prompt, sampling_params)
-
-            outputs = []
-            pbar = None
-            if use_tqdm:
-                from tqdm import tqdm
-
-                pbar = tqdm(total=len(prompts), desc="Generating")
-
-            completed = set()
-
-            if not self._scheduler_running:
-                raise RuntimeError("Background scheduler is not running. Call initiate() first.")
-
-            while len(completed) < len(prompts):
-                self._output_event.wait(timeout=0.1)
-                self._output_event.clear()
-                with self._output_lock:
-                    for req_id in request_ids:
-                        if req_id not in completed and req_id in self._request_outputs:
-                            output = self._request_outputs[req_id]
-                            if output.finished:
-                                completed.add(req_id)
-                                outputs.append(output)
-                                if pbar:
-                                    pbar.update(1)
-
-            if pbar:
-                pbar.close()
-            return outputs
-        finally:
-            # Restore original bytecode_decode setting
-            if bytecode_decode is not None:
-                self._bytecode_decode = original_bytecode_decode
-                if not original_bytecode_decode:
-                    self._smart_decoder = None
-
-    def stream(
-        self,
-        prompts: str | list[str],
-        sampling_params: SamplingParams | None = None,
-        request_id: str | None = None,
-        bytecode_decode: bool | None = None,
-    ) -> Iterator[RequestOutput]:
-        """Stream generation output as tokens are produced.
-
-        Yields RequestOutput objects incrementally as new tokens are generated,
-        enabling real-time streaming of generated text. Perfect for interactive
-        applications and chat interfaces.
-
-        Args:
-            prompts: Single prompt string or list with one prompt. For multiple
-                prompts, use generate() instead.
-            sampling_params: Generation parameters controlling temperature, top_p,
-                max_tokens, etc. Defaults to SamplingParams(max_tokens=128).
-            request_id: Optional request ID for tracking. Auto-generated if None.
-            bytecode_decode: Override the instance's bytecode_decode setting for this
-                specific stream. When True, enables smart UTF-8 handling to prevent
-                malformed characters during streaming. When None, uses instance default.
-
-        Yields:
-            RequestOutput objects with incremental updates:
-                - delta_text: Only the newly generated text since last yield
-                - accumulated_text: Full text generated so far
-                - finished: True when generation is complete
-                - tokens_per_second: Current generation throughput
-                - num_generated_tokens: Total tokens generated so far
-
-        Raises:
-            ValueError: If empty prompt list provided.
-            RuntimeError: If scheduler not running or request setup fails.
-
-        Example:
-            >>> # Basic streaming
-            >>> for output in engine.stream("Tell me a story"):
-            ...     if output.delta_text:
-            ...         print(output.delta_text, end="", flush=True)
-            ...     if output.finished:
-            ...         break
-            >>>
-            >>> # Streaming with smart UTF-8 handling
-            >>> for output in engine.stream("Generate emoji text", bytecode_decode=True):
-            ...     print(output.delta_text, end="", flush=True)
-            >>>
-            >>> # Monitor generation speed
-            >>> for output in engine.stream("Long prompt here..."):
-            ...     if output.delta_text:
-            ...         print(output.delta_text, end="")
-            ...     if output.num_generated_tokens % 10 == 0:
-            ...         print(f"\n[{output.tokens_per_second:.1f} tok/s]", end="")
-
-        Note:
-            The bytecode_decode parameter is particularly useful when streaming
-            text that may contain emojis, special characters, or non-ASCII text,
-            as it prevents the appearance of � characters when tokens split
-            multi-byte UTF-8 sequences.
-        """
-        if isinstance(prompts, list):
-            if len(prompts) == 0:
-                raise ValueError("Empty prompt list provided")
-            prompt = prompts[0]
-        else:
-            prompt = prompts
-
-        if request_id is None:
-            request_id = self._generate_request_id()
-
-        if sampling_params is None:
-            sampling_params = SamplingParams(max_tokens=128)
-
-        # Override bytecode_decode if specified
-        original_bytecode_decode = self._bytecode_decode
-        if bytecode_decode is not None:
-            self._bytecode_decode = bytecode_decode
-            if bytecode_decode and self._smart_decoder is None:
-                self._smart_decoder = SmartBytecodeDecoder(self.tokenizer)
-
-        try:
-            self._add_request(request_id, prompt, sampling_params)
-
-            if not self._scheduler_running:
-                raise RuntimeError("Background scheduler is not running. Call initiate() first.")
-
-            with self._request_lock:
-                req_event = self._request_events.get(request_id)
-            if req_event is None:
-                raise RuntimeError("Request event missing")
-
-            last_update_seq = -1
-
-            while True:
-                req_event.wait(timeout=1.0)
-                req_event.clear()
-
-                snapshot = None
-                with self._output_lock:
-                    ro = self._request_outputs.get(request_id)
-                    if ro is None:
-                        break
-
-                    if ro.update_seq != last_update_seq:
-                        # Snapshot without holding the lock during yield
-                        outputs_copy = []
-                        for comp in ro.outputs:
-                            outputs_copy.append(
-                                CompletionOutput(
-                                    index=comp.index,
-                                    text=comp.text,
-                                    token_ids=list(comp.token_ids),
-                                    cumulative_logprob=comp.cumulative_logprob,
-                                    logprobs=[dict(lp) for lp in comp.logprobs] if comp.logprobs else None,
-                                    finish_reason=comp.finish_reason,
-                                )
-                            )
-
-                        snapshot = RequestOutput(
-                            request_id=ro.request_id,
-                            prompt=ro.prompt,
-                            prompt_token_ids=list(ro.prompt_token_ids),
-                            outputs=outputs_copy,
-                            finished=ro.finished,
-                            metrics=dict(ro.metrics) if ro.metrics is not None else None,
-                            accumulated_text=ro.accumulated_text,
-                            delta_text=ro.delta_text,
-                            tokens_per_second=ro.tokens_per_second,
-                            num_generated_tokens=ro.num_generated_tokens,
-                            time_spent_generating=ro.time_spent_generating,
-                            first_token_time=ro.first_token_time,
-                            processing_time=ro.processing_time,
-                            update_seq=ro.update_seq,
-                        )
-                        last_update_seq = ro.update_seq
-
-                if snapshot is not None:
-                    yield snapshot
-                    if snapshot.finished:
-                        break
-
-            # Cleanup per-request event (output is preserved for generate or post-hoc access)
-            with self._request_lock:
-                self._request_events.pop(request_id, None)
-        finally:
-            # Restore original bytecode_decode setting
-            if bytecode_decode is not None:
-                self._bytecode_decode = original_bytecode_decode
-                if not original_bytecode_decode:
-                    self._smart_decoder = None
-
-    def chat(
-        self,
-        messages: list[dict[str, str]],
-        tools: list[dict] | None = None,
-        sampling_params: SamplingParams | None = None,
-        request_id: str | None = None,
-        stream: bool = False,
-        bytecode_decode: bool | None = None,
-        chat_template: str | None = None,
-    ):
-        """High-level chat interface compatible with vLLM and OpenAI APIs.
-
-        Provides a convenient chat-based interface for conversational AI applications.
-        Automatically formats messages using the model's chat template and handles
-        both streaming and non-streaming responses.
-
-        Args:
-            messages: List of message dictionaries representing the conversation history.
-                Each message must have 'role' and 'content' keys. Supported roles are
-                typically 'system', 'user', and 'assistant', but may vary by model.
-                Example: [{"role": "user", "content": "Hello!"}]
-            tools: Optional list of tool/function definitions for function calling.
-                Format should match the model's expected tool schema. Tools allow the
-                model to request function calls as part of its response.
-            sampling_params: Generation parameters controlling temperature, top_p,
-                max_tokens, etc. Defaults to SamplingParams(max_tokens=128) if None.
-            request_id: Optional unique identifier for tracking this request.
-                Auto-generated if None.
-            stream: If True, returns an iterator yielding incremental RequestOutput
-                objects with delta_text for real-time streaming. If False, returns
-                a single RequestOutput with the complete response.
-            bytecode_decode: Override the instance's bytecode_decode setting for this
-                specific chat. When True, enables smart UTF-8 handling to prevent
-                malformed characters. When None, uses the instance's default.
-            chat_template: Optional custom Jinja2 template to override the tokenizer's
-                default chat template. Useful for models with non-standard formats.
-
-        Returns:
-            - If stream=False: Single RequestOutput object containing the complete
-              assistant response with all metrics and generated text.
-            - If stream=True: Iterator[RequestOutput] yielding incremental updates
-              with delta_text containing newly generated text chunks.
-
-        Raises:
-            ValueError: If messages format is invalid or empty.
-            RuntimeError: If scheduler is not running or tokenizer lacks chat template.
-
-        Example:
-            >>> # Non-streaming chat
-            >>> messages = [
-            ...     {"role": "system", "content": "You are a helpful assistant."},
-            ...     {"role": "user", "content": "Explain quantum computing"}
-            ... ]
-            >>> response = engine.chat(messages, sampling_params=SamplingParams(max_tokens=200))
-            >>> print(response.get_text())
-            >>>
-            >>> # Streaming chat with function calling
-            >>> tools = [{
-            ...     "type": "function",
-            ...     "function": {
-            ...         "name": "get_weather",
-            ...         "description": "Get weather for a location",
-            ...         "parameters": {...}
-            ...     }
-            ... }]
-            >>> for chunk in engine.chat(messages, tools=tools, stream=True):
-            ...     print(chunk.delta_text, end="", flush=True)
-            >>>
-            >>> # Custom chat template
-            >>> custom_template = "{% for message in messages %}...{% endfor %}"
-            >>> response = engine.chat(messages, chat_template=custom_template)
-
-        Note:
-            This method provides compatibility with OpenAI's chat completions API
-            and vLLM's chat interface, making it easy to migrate existing applications.
-            The exact behavior of tool calling and special tokens depends on the
-            specific model being used.
-        """
-        prompt = self._format_chat_prompt(
-            messages,
-            tools=tools,
-            add_generation_prompt=True,
-            chat_template=chat_template,
-        )
-        if stream:
-            return self.stream(
-                prompt,
-                sampling_params=sampling_params,
-                request_id=request_id,
-                bytecode_decode=bytecode_decode,
-            )
-        else:
-            outs = self.generate(
-                prompt,
-                sampling_params=sampling_params,
-                request_id=request_id,
-                use_tqdm=False,
-                bytecode_decode=bytecode_decode,
-            )
-            # generate() returns a list; chat is single prompt, so return the first
-            return outs[0]
-
-    def _add_request(self, request_id: str, prompt: str, sampling_params: SamplingParams) -> None:
-        """Add a new request to the scheduler queue with intelligent context management.
-
-        Internal method that tokenizes the prompt, applies context length management
-        policies, creates request tracking structures, and adds the request to the
-        scheduler for processing. Handles prompt truncation and token reservation
-        to ensure generation fits within model constraints.
-
-        Args:
-            request_id: Unique identifier for the request.
-            prompt: Text prompt to generate from. May be truncated based on
-                context management settings.
-            sampling_params: Generation parameters including max_tokens/max_new_tokens.
-
-        Context Management:
-            The method implements a sophisticated context management strategy:
-            1. Calculates available token budget (max_model_len - reserve_tokens)
-            2. If prompt exceeds budget:
-               - Truncates based on truncate_mode (left/right/middle)
-               - Or raises error if strict_context=True
-            3. Adjusts max_new_tokens to fit within remaining context
-            4. Prioritizes based on prefer_preserve_prompt setting
-
-        Smart Decoding Setup:
-            When bytecode_decode is enabled, initializes:
-            - buffered_tokens: Empty list for incomplete token buffering
-            - previous_decoded_text: Empty string for tracking decoded state
-
-        Truncation Strategies:
-            - "left": Removes tokens from beginning (keeps recent context)
-            - "right": Removes tokens from end (keeps initial context)
-            - "middle": Removes tokens from middle (keeps both ends)
-
-        Note:
-            This method ensures that prompt_len + max_new_tokens + reserve_tokens
-            never exceeds max_model_len, preventing OOM errors during generation.
+            callback: Callable receiving a cloned SamplingParams and metadata
+                dict (``request_id``, ``prompt``, ``engine``). Return a new
+                SamplingParams, mutate the provided one, or return None to
+                keep the original values. Pass None to disable the callback.
         """
 
-        # ---- Config knobs ----
-        max_model_len = int(self.runner.max_model_len)
-
-        def _get_requested_new(sp):
-            if hasattr(sp, "max_tokens") and sp.max_tokens is not None:
-                return int(sp.max_tokens)
-            if hasattr(sp, "max_new_tokens") and sp.max_new_tokens is not None:
-                return int(sp.max_new_tokens)
-            return 0
-
-        requested_new = _get_requested_new(sampling_params)
-        original_requested_new = requested_new
-
-        tokenizer_output = self.tokenizer(prompt, return_tensors=None)
-        token_ids = tokenizer_output["input_ids"]
-        if token_ids and isinstance(token_ids[0], list):
-            token_ids = token_ids[0]
-        prompt_len = len(token_ids)
-
-        max_prompt_budget = max(0, max_model_len - self.reserve_tokens)
-        truncated = False
-        tokens_dropped = 0
-
-        if prompt_len > max_prompt_budget:
-            if not self.auto_truncate_prompt and self.strict_context:
-                raise ValueError(
-                    f"Prompt too long: length={prompt_len} > budget={max_prompt_budget} "
-                    f"(model_max={max_model_len}, reserve={self.reserve_tokens})."
-                )
-            new_tokens, dropped = truncate_tokens(token_ids, max_prompt_budget, self.truncate_mode)
-            token_ids = new_tokens
-            prompt_len = len(token_ids)
-            truncated = dropped > 0
-            tokens_dropped += dropped
-            logger.warn(
-                f"Truncated prompt by {dropped} tokens to fit model budget "
-                f"(mode={self.truncate_mode}, new_len={prompt_len}, budget={max_prompt_budget})."
-            )
-
-        allowed_new_if_keep_prompt = max(0, max_model_len - prompt_len)
-
-        if requested_new > allowed_new_if_keep_prompt:
-            do_cap_first = self.prefer_preserve_prompt or not self.auto_truncate_prompt
-
-            if do_cap_first:
-                if self.auto_cap_new_tokens:
-                    logger.warn(
-                        f"Capping max_new_tokens from {requested_new} to {allowed_new_if_keep_prompt} "
-                        f"to preserve prompt (prompt_len={prompt_len}, reserve={self.reserve_tokens}, "
-                        f"model_max={max_model_len})."
-                    )
-                    requested_new = allowed_new_if_keep_prompt
-                    _set_requested_new(sampling_params, requested_new)
-                else:
-                    if self.strict_context:
-                        raise ValueError(
-                            f"Requested max_new_tokens={requested_new} exceeds allowed={allowed_new_if_keep_prompt} "
-                            f"for prompt_len={prompt_len}."
-                        )
-                    logger.warn(
-                        f"auto_cap_new_tokens disabled but strict_context=False; "
-                        f"capping new tokens to {allowed_new_if_keep_prompt}."
-                    )
-                    requested_new = allowed_new_if_keep_prompt
-                    _set_requested_new(sampling_params, requested_new)
-            else:
-                target_prompt_budget = max(0, max_model_len - requested_new - self.reserve_tokens)
-                if target_prompt_budget == 0 and requested_new > 0:
-                    if self.auto_cap_new_tokens:
-                        logger.warn(
-                            f"Requested max_new_tokens={requested_new} leaves no room for prompt; "
-                            f"capping to {allowed_new_if_keep_prompt} to preserve prompt."
-                        )
-                        requested_new = allowed_new_if_keep_prompt
-                        _set_requested_new(sampling_params, requested_new)
-                    else:
-                        if self.strict_context:
-                            raise ValueError("Requested output too large; would require dropping entire prompt.")
-                        requested_new = allowed_new_if_keep_prompt
-                        _set_requested_new(sampling_params, requested_new)
-                else:
-                    if prompt_len > target_prompt_budget:
-                        new_tokens, dropped = truncate_tokens(token_ids, target_prompt_budget, self.truncate_mode)
-                        token_ids = new_tokens
-                        prompt_len = len(token_ids)
-                        truncated = truncated or dropped > 0
-                        tokens_dropped += dropped
-                        logger.info(
-                            f"Truncated prompt by {dropped} tokens (mode={self.truncate_mode}) "
-                            f"to honor requested max_new_tokens={requested_new}. "
-                            f"New prompt_len={prompt_len}, target_prompt_budget={target_prompt_budget}."
-                        )
-
-        allowed_new_final = max(0, max_model_len - prompt_len - self.reserve_tokens)
-        if requested_new > allowed_new_final:
-            if self.strict_context and not self.auto_cap_new_tokens:
-                raise ValueError(
-                    f"After adjustments, requested_new={requested_new} still exceeds allowed={allowed_new_final}."
-                )
-            logger.warn(
-                f"Final cap: max_new_tokens {requested_new} -> {allowed_new_final} "
-                f"(prompt_len={prompt_len}, reserve={self.reserve_tokens}, model_max={max_model_len})."
-            )
-            requested_new = allowed_new_final
-            _set_requested_new(sampling_params, requested_new)
-
-        prompt_for_engine = prompt
-        if truncated and self.decode_truncated_prompt:
-            try:
-                prompt_for_engine = self.tokenizer.decode(token_ids, skip_special_tokens=False)
-            except Exception:
-                prompt_for_engine = prompt
-                logger.warn("Failed to decode truncated prompt; keeping original prompt text.")
-
-        start_ts = time.perf_counter()
-        ev = threading.Event()
-
-        with self._request_lock:
-            self._request_events[request_id] = ev
-            self._active_requests[request_id] = {
-                "prompt": prompt_for_engine,
-                "prompt_token_ids": token_ids,
-                "generated_tokens": [],
-                "last_decoded_index": 0,
-                "start_time": start_ts,
-                "first_token_time": None,
-                "last_decode_time": start_ts,
-                "truncated": truncated,
-                "tokens_dropped": tokens_dropped,
-                "requested_new_tokens_original": original_requested_new,
-                "requested_new_tokens_final": requested_new,
-                "reserve_tokens": self.reserve_tokens,
-                "max_model_len": max_model_len,
-                "buffered_tokens": [],  # For smart bytecode decoding
-                "previous_decoded_text": "",  # Track previously decoded text
-            }
-
-        metrics_collector = get_metrics_collector()
-        if metrics_collector:
-            metrics_collector.start_request(request_id, len(token_ids))
-
-        with self._output_lock:
-            self._request_outputs[request_id] = RequestOutput(
-                request_id=request_id,
-                prompt=prompt_for_engine,
-                prompt_token_ids=token_ids,
-                outputs=[CompletionOutput(index=0, text="", token_ids=[])],
-                finished=False,
-                accumulated_text="",
-                delta_text="",
-                tokens_per_second=0.0,
-                num_generated_tokens=0,
-                time_spent_generating=0.0,
-                first_token_time=None,
-                processing_time=0.0,
-                update_seq=0,
-                delta_seq=0,
-            )
-
-        self.scheduler.add_request(
-            EngineRequest(
-                request_id=request_id,
-                prompt_token_ids=token_ids,
-                sampling_params=sampling_params,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
-        )
-
-        logger.info(
-            f"Queued request {request_id}: prompt_len={prompt_len}, "
-            f"max_tokens={requested_new}, reserve={self.reserve_tokens}, "
-            f"model_max={max_model_len}, dropped={tokens_dropped}"
-        )
-
-    def _generate_request_id(self) -> str:
-        """Generate a unique request ID.
-
-        Returns:
-            Unique request ID with format 'req-{uuid}-{counter}'.
-        """
-        with self._counter_lock:
-            self._request_counter += 1
-            return f"req-{uuid.uuid4().hex}-{self._request_counter}"
-
-    def abort_request(self, request_id: str) -> None:
-        """Abort an in-progress request.
-
-        Marks the request as aborted and signals any waiting threads.
-        The request will be removed from the scheduler queue if still waiting.
-
-        Args:
-            request_id: ID of the request to abort.
-        """
-        with self._scheduler_lock:
-            if request_id in self.scheduler.requests:
-                self.scheduler.requests[request_id].status = EngineRequestStatus.FINISHED_ABORTED
-
-        with self._request_lock, self._output_lock:
-            self._active_requests.pop(request_id, None)
-            if request_id in self._request_outputs:
-                ro = self._request_outputs[request_id]
-                ro.finished = True
-                ro.outputs[0].finish_reason = "aborted"
-                ro.update_seq += 1
-
-        # Notify both per-request and global waiters
-        with self._request_lock:
-            ev = self._request_events.get(request_id)
-        if ev:
-            ev.set()
-        self._output_event.set()
-
-    @property
-    def num_pending_requests(self) -> int:
-        """Get the number of requests waiting in queue.
-
-        Returns:
-            Count of requests in the waiting queue.
-        """
-        with self._scheduler_lock:
-            return len(self.scheduler.waiting)
-
-    @property
-    def num_running_requests(self) -> int:
-        """Get the number of actively running requests.
-
-        Returns:
-            Count of requests currently being processed.
-        """
-        with self._scheduler_lock:
-            return len(self.scheduler.running)
-
-    def _process_engine_outputs(self, engine_outputs: dict[int, EngineCoreOutputs]) -> None:
-        """Process engine outputs and update request outputs (thread-safe).
-
-        Core method that processes tokens from the model, performs incremental
-        decoding, updates metrics, and signals waiting threads. Uses interval-based
-        decoding to reduce tokenizer overhead during streaming. When bytecode_decode
-        is enabled, employs smart decoding to handle malformed UTF-8 sequences.
-
-        Args:
-            engine_outputs: Dictionary mapping client IDs to engine outputs containing
-                new tokens, completion status, and metadata.
-
-        Processing Flow:
-            1. Extracts new tokens from engine outputs
-            2. Performs interval-based decoding (every 4 tokens or 20ms)
-            3. If bytecode_decode enabled:
-               - Buffers incomplete tokens that would produce malformed chars
-               - Uses progressive backtracking to find clean decode points
-               - Maintains previous decoded text for accurate diffing
-            4. Updates accumulated and delta text fields
-            5. Tracks performance metrics (TTFT, tokens/sec)
-            6. Handles request completion with final token flush
-            7. Signals per-request events for streaming consumers
-
-        Smart Decoding Logic:
-            When bytecode_decode is active, the method:
-            - Attempts to decode new tokens with any buffered tokens
-            - If malformed characters detected, backtracks to find last clean point
-            - Buffers problematic tokens for next iteration
-            - On completion, flushes all remaining buffered tokens
-
-        Thread Safety:
-            Uses request_lock and output_lock to ensure atomic updates across
-            multiple concurrent requests and streaming consumers.
-        """
-        metrics_collector = get_metrics_collector()
-
-        # Update both request_data and public outputs atomically
-        with self._request_lock, self._output_lock:
-            for client_outputs in engine_outputs.values():
-                for engine_output in client_outputs.outputs:
-                    request_id = engine_output.request_id
-                    ro = self._request_outputs.get(request_id)
-                    rd = self._active_requests.get(request_id)
-                    if ro is None or rd is None:
-                        continue
-
-                    text_changed = False
-                    new_tokens = engine_output.new_token_ids
-                    now = time.perf_counter()
-                    elapsed = now - rd["start_time"]
-                    if new_tokens:
-                        rd["generated_tokens"].extend(new_tokens)
-                        num_generated = len(rd["generated_tokens"])
-
-                        if rd["first_token_time"] is None and num_generated > 0:
-                            rd["first_token_time"] = now - rd["start_time"]
-                            if metrics_collector:
-                                metrics_collector.record_first_token(request_id)
-
-                        if metrics_collector:
-                            metrics_collector.add_generated_tokens(request_id, len(new_tokens))
-
-                        last_idx = rd["last_decoded_index"]
-                        should_decode = (
-                            num_generated - last_idx >= self.decode_interval_tokens
-                            or (now - rd.get("last_decode_time", now)) >= self.decode_interval_secs
-                        )
-                        if should_decode and num_generated > last_idx:
-                            if self._bytecode_decode and self._smart_decoder:
-                                # Optimized smart bytecode decoding
-                                new_tokens = rd["generated_tokens"][last_idx:]
-                                buffered_tokens = rd.get("buffered_tokens", [])
-                                previous_text = rd.get("previous_decoded_text", "")
-
-                                # Decode with recovery to handle malformed UTF-8
-                                delta, new_buffered_tokens, had_malformed = self._smart_decoder.decode_with_recovery(
-                                    new_tokens,
-                                    previous_text,
-                                    buffered_tokens,
-                                )
-
-                                rd["buffered_tokens"] = new_buffered_tokens
-                                if had_malformed and new_buffered_tokens:
-                                    new_accumulated_text = previous_text + delta
-                                else:
-                                    try:
-                                        full_decoded = self.tokenizer.decode(
-                                            rd["generated_tokens"],
-                                            skip_special_tokens=True,
-                                        )
-                                        new_accumulated_text = (
-                                            full_decoded
-                                            if not self._smart_decoder.contains_malformed_chars(full_decoded)
-                                            else previous_text + delta
-                                        )
-                                    except Exception:
-                                        new_accumulated_text = previous_text + delta
-                                ro.accumulated_text = new_accumulated_text
-                                rd["previous_decoded_text"] = new_accumulated_text
-                            else:
-                                delta = self.tokenizer.decode(
-                                    rd["generated_tokens"][last_idx:], skip_special_tokens=True
-                                )
-                                ro.accumulated_text += delta
-
-                            rd["last_decoded_index"] = num_generated
-                            rd["last_decode_time"] = now
-                            ro.delta_text = delta
-                            ro.delta_seq += 1
-                            text_changed = True
-
-                            comp = ro.outputs[0]
-                            comp.text = ro.accumulated_text
-                            comp.token_ids = list(rd["generated_tokens"])
-
-                        ro.num_generated_tokens = len(rd["generated_tokens"])
-
-                        elapsed = now - rd["start_time"]
-                        ro.processing_time = elapsed
-                        ro.time_spent_generating = elapsed
-                        ro.first_token_time = rd["first_token_time"]
-
-                        if rd["first_token_time"] is not None and num_generated > 0:
-                            generation_time = elapsed - rd["first_token_time"]
-                            ro.tokens_per_second = num_generated / generation_time if generation_time > 0 else 0.0
-                        else:
-                            ro.tokens_per_second = 0.0
-
-                        ro.num_generated_tokens = num_generated
-
-                    if engine_output.finished:
-                        comp = ro.outputs[0]
-                        ro.finished = True
-                        comp.finish_reason = (
-                            str(engine_output.finish_reason) if engine_output.finish_reason else "finished"
-                        )
-
-                        num_generated = len(rd["generated_tokens"])
-                        last_idx = rd["last_decoded_index"]
-                        if num_generated > last_idx:
-                            if self._bytecode_decode and self._smart_decoder:
-                                new_tokens = rd["generated_tokens"][last_idx:]
-                                buffered_tokens = rd.get("buffered_tokens", [])
-
-                                all_remaining_tokens = new_tokens + buffered_tokens
-                                if all_remaining_tokens:
-                                    previous_text = rd.get("previous_decoded_text", "")
-                                    try:
-                                        full_decoded = self.tokenizer.decode(
-                                            rd["generated_tokens"], skip_special_tokens=True
-                                        )
-                                        if full_decoded.startswith(previous_text):
-                                            delta = full_decoded[len(previous_text) :]
-                                            ro.accumulated_text = full_decoded
-                                        else:
-                                            delta, _, _ = self._smart_decoder.decode_with_recovery(
-                                                all_remaining_tokens, previous_text, []
-                                            )
-                                            ro.accumulated_text = previous_text + delta
-                                    except Exception:
-                                        delta, _, _ = self._smart_decoder.decode_with_recovery(
-                                            all_remaining_tokens, previous_text, []
-                                        )
-                                        ro.accumulated_text = previous_text + delta
-                                else:
-                                    delta = ""
-                            else:
-                                delta = self.tokenizer.decode(
-                                    rd["generated_tokens"][last_idx:],
-                                    skip_special_tokens=True,
-                                )
-                                ro.accumulated_text += delta
-
-                            ro.delta_text = delta
-                            ro.delta_seq += 1
-                            comp.text = ro.accumulated_text
-                            comp.token_ids = list(rd["generated_tokens"])
-                            rd["last_decoded_index"] = num_generated
-                            text_changed = True
-
-                        num_prompt_tokens = (
-                            len(rd["prompt_token_ids"]) if "prompt_token_ids" in rd else len(ro.prompt_token_ids)
-                        )
-                        num_generated_tokens = len(rd["generated_tokens"])
-
-                        ro.processing_time = elapsed
-                        ro.time_spent_generating = elapsed
-                        ro.num_generated_tokens = num_generated_tokens
-                        ro.first_token_time = rd.get("first_token_time")
-
-                        if ro.first_token_time is not None and num_generated_tokens > 0:
-                            generation_time = elapsed - ro.first_token_time
-                            ro.tokens_per_second = num_generated_tokens / generation_time if generation_time > 0 else 0.0
-                        else:
-                            ro.tokens_per_second = 0.0
-
-                        ro.metrics = {
-                            "prompt_tokens": num_prompt_tokens,
-                            "generated_tokens": num_generated_tokens,
-                            "total_tokens": num_prompt_tokens + num_generated_tokens,
-                            "processing_time": elapsed,
-                            "first_token_time": ro.first_token_time,
-                            "tokens_per_second": ro.tokens_per_second,
-                        }
-
-                        if metrics_collector:
-                            metrics_collector.complete_request(
-                                request_id,
-                                finish_reason=comp.finish_reason,
-                            )
-
-                    ro.update_seq += 1
-                    if text_changed or engine_output.finished:
-                        ev = self._request_events.get(request_id)
-                        if ev:
-                            ev.set()
-
-        self._output_event.set()
-
-    def start_monitoring(
-        self,
-        dashboard_port: int = 11481,
-        prometheus_port: int = 11184,
-        dashboard_host: str = "0.0.0.0",
-        enable_prometheus: bool = True,
-        enable_dashboard: bool = True,
-        enable_console: bool = False,
-        log_file: str | None = None,
-        log_interval: float = 10.0,
-        history_size: int = 1000,
-        enable_detailed_logging: bool = True,
-    ) -> dict[str, str]:
-        """Start monitoring services for the engine.
-
-        Initializes various monitoring and observability services including
-        Prometheus metrics, web dashboard, and console monitor.
-
-        Args:
-            dashboard_port: Port for web dashboard server.
-            prometheus_port: Port for Prometheus metrics endpoint.
-            dashboard_host: Host address to bind services to.
-            enable_prometheus: Start Prometheus metrics server.
-            enable_dashboard: Start web dashboard with real-time metrics.
-            enable_console: Start console monitor with rich display.
-            log_file: Optional file path for metrics logging.
-            log_interval: Interval in seconds between metric logs.
-            history_size: Number of historical metrics to retain.
-            enable_detailed_logging: Enable detailed metric logging.
-
-        Returns:
-            Dictionary of service URLs:
-            - 'prometheus': Prometheus metrics endpoint
-            - 'dashboard': Web dashboard URL
-            - 'health': Health check endpoint
-            - 'api': API metrics endpoint
-
-        Example:
-            >>> urls = engine.start_monitoring(dashboard_port=8080)
-            >>> print(f"Dashboard: {urls['dashboard']}")
-        """
-        if self._monitoring_initialized:
-            logger.info("Monitoring already initialized for this eSurge instance")
-            return self._dashboard_urls
-
-        logger.info("Starting eSurge monitoring services...")
-
-        if not get_metrics_collector():
-            initialize_metrics(
-                log_file=log_file,
-                log_interval=log_interval,
-                history_size=history_size,
-                enable_detailed_logging=enable_detailed_logging,
-            )
-            logger.info(" Metrics collection initialized")
-
-        urls = {}
-
-        if enable_prometheus:
-            try:
-                from .monitoring import start_monitoring_server
-
-                self._monitoring_server = start_monitoring_server(
-                    prometheus_port=prometheus_port,
-                    update_interval=1.0,
-                )
-                urls["prometheus"] = f"http://{dashboard_host}:{prometheus_port}/metrics"
-                logger.info(f" Prometheus metrics: {urls['prometheus']}")
-            except ImportError:
-                logger.info(" Prometheus monitoring unavailable (install prometheus-client)")
-            except Exception as e:
-                logger.info(f" Failed to start Prometheus server: {e}")
-
-        if enable_dashboard:
-            try:
-                from .dashboard import create_dashboard
-
-                self._dashboard = create_dashboard(
-                    host=dashboard_host,
-                    port=dashboard_port,
-                    debug=False,
-                )
-
-                def run_dashboard():
-                    self._dashboard.run(log_level="warning")
-
-                self._dashboard_thread = threading.Thread(target=run_dashboard, daemon=True)
-                self._dashboard_thread.start()
-                urls["dashboard"] = f"http://{dashboard_host}:{dashboard_port}"
-                urls["health"] = f"http://{dashboard_host}:{dashboard_port}/health"
-                urls["api"] = f"http://{dashboard_host}:{dashboard_port}/api/metrics"
-                logger.info(f" Web dashboard: {urls['dashboard']}")
-                logger.info(f" Health check: {urls['health']}")
-            except ImportError:
-                logger.info(" Web dashboard unavailable (install fastapi uvicorn)")
-            except Exception as e:
-                logger.info(f" Failed to start dashboard: {e}")
-
-        if enable_console:
-            try:
-                from .monitoring import start_console_monitor
-
-                logger.info(" Starting console monitor...")
-                start_console_monitor(refresh_rate=1.0)
-            except ImportError:
-                logger.info(" Console monitor unavailable (install rich)")
-            except Exception as e:
-                logger.info(f" Failed to start console monitor: {e}")
-
-        self._monitoring_initialized = True
-        if urls:
-            logger.info(" Monitoring services started successfully!")
-            logger.info(" Metrics will be automatically collected during inference")
-            if enable_dashboard:
-                logger.info(f" Open {urls['dashboard']} to view real-time metrics")
-        else:
-            logger.info(" No monitoring services were started successfully")
-        self._dashboard_urls = urls
-        return urls
-
-    def stop_monitoring(self) -> None:
-        """Stop all monitoring services.
-
-        Gracefully shuts down Prometheus server, dashboard, and console monitor
-        if they are running.
-        """
-        if not self._monitoring_initialized:
-            logger.info("No monitoring services to stop")
+        self._sampling_params_callback = callback
+
+    def _apply_data_parallel_axis_to_model(self, model: EasyDeLBaseModule) -> None:
+        """Patch model config partition axes so eSurge KV-cache uses the requested DP axis."""
+        cfg = getattr(model, "config", None)
+        if cfg is None:
             return
-        logger.info("Stopping eSurge monitoring services...")
 
-        if self._monitoring_server:
+        maybe_text_cfg = getattr(cfg, "get_text_config", None)
+        text_cfg = maybe_text_cfg() if callable(maybe_text_cfg) else None
+
+        seen: set[int] = set()
+        for target_cfg in (cfg, text_cfg):
+            if target_cfg is None or id(target_cfg) in seen:
+                continue
+            seen.add(id(target_cfg))
+            current_axis = getattr(target_cfg, "partition_axis", None)
+            updated_axis = _with_data_parallel_axis(current_axis, self.data_parallelism_axis)
             try:
-                self._monitoring_server.stop()
-                logger.info(" Prometheus server stopped")
-            except Exception as e:
-                logger.info(f" Error stopping Prometheus server: {e}")
-            self._monitoring_server = None
+                target_cfg.partition_axis = updated_axis
+            except Exception:
+                logger.warning(
+                    "Failed to update model partition_axis with data_parallelism_axis=%r",
+                    self.data_parallelism_axis,
+                )
 
-        if self._dashboard_thread and self._dashboard_thread.is_alive():
-            try:
-                logger.info(" Dashboard server will stop with process")
-            except Exception as e:
-                logger.info(f" Error stopping dashboard: {e}")
-            self._dashboard_thread = None
-            self._dashboard = None
+    def _distributed_execute_step(self, scheduler_output):
+        """Execute a single scheduler step on worker ranks via control-plane RPC."""
 
-        self._monitoring_initialized = False
-        logger.info(" Monitoring services stopped")
-
-    def get_metrics_summary(self) -> dict[str, Any]:
-        """Get current performance metrics summary.
-
-        Returns:
-            Dictionary containing:
-            - requests_per_second: Current request throughput
-            - average_latency: Average request latency
-            - average_ttft: Average time to first token
-            - average_throughput: Average tokens/second
-            - total_completed: Total completed requests
-            - total_failed: Total failed requests
-            - total_tokens: Total tokens generated
-            - active_requests: Currently active requests
-            - queue_size: Pending requests in queue
-            - running_requests: Currently running requests
-        """
-        metrics_collector = get_metrics_collector()
-        if not metrics_collector:
-            return {"error": "Metrics collection not initialized"}
-        system_metrics = metrics_collector.get_system_metrics()
-        return {
-            "requests_per_second": system_metrics.requests_per_second,
-            "average_latency": system_metrics.average_latency,
-            "average_ttft": system_metrics.average_ttft,
-            "average_throughput": system_metrics.average_throughput,
-            "total_completed": system_metrics.total_requests_completed,
-            "total_failed": system_metrics.total_requests_failed,
-            "total_tokens": system_metrics.total_tokens_generated,
-            "active_requests": len(self._active_requests),
-            "queue_size": self.num_pending_requests,
-            "running_requests": self.num_running_requests,
-        }
-
-    @property
-    def monitoring_active(self) -> bool:
-        return self._monitoring_initialized
+        with self._scheduler_lock:
+            return self.runner.execute_model(scheduler_output)
 
     def __del__(self):
-        if self._scheduler_running:
+        """Destructor that cleans up resources.
+
+        Attempts to gracefully terminate all running services including:
+        - Background scheduler thread
+        - Monitoring services (Prometheus, Grafana)
+        - Profiler trace
+        - Worker processes (tokenizer/detokenizer)
+        - Model runner
+        """
+        if getattr(self, "_scheduler_running", False):
             try:
                 self.terminate()
             except Exception:
@@ -1645,13 +1051,39 @@ class eSurge:
                 self.stop_monitoring()
             except Exception:
                 pass
+        if getattr(self, "_profiling_active", False):
+            try:
+                self.stop_profiling()
+            except Exception:
+                pass
+        if hasattr(self, "_worker_manager"):
+            try:
+                self._worker_manager.shutdown()
+            except Exception:
+                pass
+        if getattr(self, "_distributed_controller", None) is not None:
+            try:
+                self._distributed_controller.shutdown()
+            except Exception:
+                pass
+        if hasattr(self, "runner"):
+            try:
+                self.runner.shutdown()
+            except Exception:
+                pass
 
     def __repr__(self):
+        """Return a detailed string representation of the engine.
+
+        Returns:
+            Multi-line string with all key configuration parameters.
+        """
         attrs = [
             f"name={self.esurge_name!r}",
             f"max_model_len={self.max_model_len}",
             f"max_num_seqs={self.max_num_seqs}",
             f"page_size={self.page_size}",
+            f"data_parallelism_axis={self.data_parallelism_axis!r}",
             f"reserve_tokens={self.reserve_tokens}",
             f"auto_truncate_prompt={self.auto_truncate_prompt}",
             f"auto_cap_new_tokens={self.auto_cap_new_tokens}",
@@ -1659,7 +1091,12 @@ class eSurge:
             f"truncate_mode={self.truncate_mode!r}",
             f"prefer_preserve_prompt={self.prefer_preserve_prompt}",
             f"decode_truncated_prompt={self.decode_truncated_prompt}",
-            f"bytecode_decode={self._bytecode_decode}",
+            f"extra_eos_token_ids={self.extra_eos_token_ids}",
+            f"extra_stops={self.extra_stops!r}",
+            f"distributed_mode={self.distributed_mode}",
+            f"distributed_role={self.distributed_role!r}",
+            f"distributed_rank={self.distributed_rank}",
+            f"distributed_world_size={self.distributed_world_size}",
             f"scheduler_running={self._scheduler_running}",
         ]
         return "eSurge(\n  " + ",\n  ".join(attrs) + "\n)"

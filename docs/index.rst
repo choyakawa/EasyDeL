@@ -9,7 +9,7 @@ Key Features
 - **Diverse Model Support**: Seamlessly support for Transformers, Mamba, RWKV, Vision Models and more
 - **Advanced Trainers**: Specialized trainers like DPOTrainer, ORPOTrainer, SFTTrainer, and VideoCLM Trainer
 - **Vision Model Support**: Comprehensive support for vision-to-vision tasks, image-text-to-image generation, and image-to-text processing
-- **Production-Ready Serving**: Includes vInference engine for efficient LLM inference and API endpoints compatible with OpenAI standards
+- **Production-Ready Serving**: Includes eSurge and vWhisper engines plus OpenAI-compatible endpoints
 - **Quantization and Bit Operations**: Supports various quantization methods including NF4, A8BIT, A8Q, and A4Q for optimized inference and training
 - **Performance Optimization**: Integrates FlashAttention, RingAttention, and other performance-enhancing features
 - **Model Conversion**: Supports automatic conversion between JAX-EasyDeL and PyTorch-HF models
@@ -55,33 +55,10 @@ Inference and Serving Solutions
 EasyDeL provides powerful, production-ready serving solutions:
 
 - **eSurge Engine**: High-performance inference engine with advanced KV cache management and paged attention
-- **vInference Engine**: Optimized for efficient inference of large language models
-- **vInference API Server**: Provides OpenAI-compatible endpoints for easy integration
 - **vWhisper Inference**: Specialized inference engine for audio transcription and translation
 - **Multimodal Support**: Process text, images, and audio with unified APIs
 - **Streaming Generation**: Optimized for low-latency response streaming
 - **Quantization Options**: Multiple precision options for optimal performance/quality trade-offs
-
-
-Installation on TPU Pods
------------------------
-
-For distributed installation on TPU pods, use the ``install_on_hosts`` script:
-
-.. code-block:: bash
-
-    python -m easydel.scripts.install_on_hosts --tpu-type v4-16 --source github
-
-This will install EasyDel and all required dependencies across all hosts in the specified TPU pod.
-Supported TPU types include v2, v3, v4, v5e, and v5p pod slices.
-
-For other TPU types you may need to overwrite that or customize the script.
-
-Options:
-- ``--source``: Choose between PyPI package (``pypi``) or latest GitHub version (``github``)
-- ``--tpu-type``: Specify your TPU pod slice type (default: v4-16)
-- ``--num-tpu-hosts``: Override default host count if needed
-
 
 Future Updates and Vision 🚀
 ============================
@@ -119,26 +96,76 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
    :caption: Contents:
 
    getting_started
+   install.md
+   ray_upgrade.md
+   contributing
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Infrastructure:
+
+   infra/index
+   infra/overview.md
+   environment_variables.md
+   infra/base_config.md
+   infra/base_module.md
+   infra/customization.md
+   infra/adding_models.md
+   infra/elarge_model.md
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Data Management:
+
+   easydata/README.md
+   easydata/quickstart.md
+   easydata/sources.md
+   easydata/transforms.md
+   easydata/mixing.md
+   easydata/pretokenization.md
+   easydata/streaming.md
+   easydata/pipeline.md
+   easydata/caching.md
+   easydata/trainer_integration.md
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Trainers:
+
    trainers/base_trainer
    trainers/trainer_protocol
    trainers/ray_distributed_trainer.md
-   install.md
-   contributing
-   api_docs/apis
-   esurge
-   esurge_examples
-   whisper_api.md
-   vinference_api.md
-	 vsurge_example
-   vsurge_api_server_example
+   trainers/sft.md
    trainers/dpo.md
    trainers/grpo.md
    trainers/orpo.md
-   trainers/sft.md
    trainers/reward.md
-   multimodality/vision_language.md
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Inference:
+
+   esurge
+   esurge_examples
+   whisper_api.md
+
+.. toctree::
+   :maxdepth: 2
+   :caption: CLI & Scripts:
+
+   scripts/index.md
+   scripts/model_conversion.md
+   scripts/hf_download_to_gcs.md
+   scripts/elarge_cli.md
+   scripts/model_cards.md
+   scripts/dev_tools.md
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Advanced:
+
    multimodality/audio_language.md
-   multimodality/inference.md
+   api_docs/apis
    trc-welcome.md
 
 

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -87,29 +87,29 @@ class MambaConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vocab_size=50280,
-        hidden_size=768,
-        state_size=16,
-        num_hidden_layers=32,
-        layer_norm_epsilon=1e-5,
-        pad_token_id=0,
-        bos_token_id=0,
-        eos_token_id=0,
-        expand=2,
-        conv_kernel=4,
-        use_bias=False,
-        use_conv_bias=True,
-        hidden_act="silu",
-        initializer_range=0.1,
-        residual_in_fp32=True,
-        time_step_rank="auto",
-        time_step_scale=1.0,
-        time_step_min=0.001,
-        time_step_max=0.1,
-        time_step_init_scheme="random",
-        time_step_floor=1e-4,
-        rescale_prenorm_residual=False,
-        use_cache=True,
+        vocab_size: int = 50280,
+        hidden_size: int = 768,
+        state_size: int = 16,
+        num_hidden_layers: int = 32,
+        layer_norm_epsilon: float = 1e-5,
+        pad_token_id: int = 0,
+        bos_token_id: int = 0,
+        eos_token_id: int = 0,
+        expand: int = 2,
+        conv_kernel: int = 4,
+        use_bias: bool = False,
+        use_conv_bias: bool = True,
+        hidden_act: str = "silu",
+        initializer_range: float = 0.1,
+        residual_in_fp32: bool = True,
+        time_step_rank: str | int = "auto",
+        time_step_scale: float = 1.0,
+        time_step_min: float = 0.001,
+        time_step_max: float = 0.1,
+        time_step_init_scheme: str = "random",
+        time_step_floor: float = 1e-4,
+        rescale_prenorm_residual: bool = False,
+        use_cache: bool = True,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         use_mambapy: bool = False,
         **kwargs,
@@ -142,44 +142,15 @@ class MambaConfig(EasyDeLBaseConfig):
         self.use_mambapy = use_mambapy
         super().__init__(**kwargs)
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for distributing the Mamba model parameters across multiple devices.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
 
-        These rules define how parameters should be partitioned when using techniques like
-        Fully Sharded Data Parallelism (FSDP), Sharded Parallelism (SP), and Tensor Parallelism (TP).
-        Each rule consists of a regex pattern matching parameter names and a corresponding PartitionSpec.
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
 
         Returns:
-            tuple: A tuple of tuples where each inner tuple contains:
-                - A regex pattern matching parameter names
-                - A PartitionSpec object specifying how to partition matching parameters
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        return (
-            # Embeddings
-            ("backbone/embeddings/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-            # Language model head
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("lm_head/bias", PartitionSpec("tp")),
-            # Mixer layers
-            ("mixer/in_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("mixer/in_proj/bias", PartitionSpec("tp")),
-            ("mixer/out_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-            ("mixer/out_proj/bias", PartitionSpec(("fsdp", "sp"))),
-            # Conv1d in mixer (3D kernel)
-            ("mixer/conv1d/kernel", PartitionSpec(None, None, "tp")),
-            ("mixer/conv1d/bias", PartitionSpec("tp")),
-            # State space parameters
-            ("mixer/A_log", PartitionSpec("tp", None)),
-            ("mixer/D", PartitionSpec("tp")),
-            # Projections
-            ("mixer/dt_proj/kernel", PartitionSpec(None, "tp")),
-            ("mixer/dt_proj/bias", PartitionSpec("tp")),
-            ("mixer/x_proj/kernel", PartitionSpec("tp", None)),
-            ("mixer/x_proj/bias", PartitionSpec(None)),
-            # Normalization layers
-            ("backbone/layers/.*/norm/kernel", PartitionSpec(None)),
-            ("backbone/norm_f/kernel", PartitionSpec(None)),
-            # Catch-all
-            (".*", PartitionSpec(None)),
-        )
+        return None

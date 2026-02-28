@@ -1,4 +1,13 @@
+# pyright: reportPrivateLocalImportUsage=false
+
+import os
 import time
+
+os.environ["HF_DATASETS_CACHE"] = "/dev/shm/huggingface-dataset"
+os.environ["HF_HOME"] = "/dev/shm/huggingface"
+os.environ["ENABLE_DISTRIBUTED_INIT"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "0"
+os.environ["EASYDEL_AUTO"] = "1"
 
 import jax
 from flax import nnx as nn
@@ -16,9 +25,14 @@ def main():
     sharding_axis_dims = (1, 1, 1, -1, 1)
     max_model_len = 2048
 
-    pretrained_model_name_or_path = "Qwen/Qwen3-0.6B"
+    _base = ed.AutoEasyDeLModelForCausalLM
+    # _base = ed.AutoEasyDeLModelForImageTextToText
 
-    model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+    pretrained_model_name_or_path = "Qwen/Qwen3-4B"
+    # pretrained_model_name_or_path = "Qwen/Qwen2-VL-7B-Instruct"
+    # pretrained_model_name_or_path = "Qwen/Qwen2.5-0.5B-Instruct"
+
+    model = _base.from_pretrained(
         pretrained_model_name_or_path,
         auto_shard_model=True,
         param_dtype=jnp.bfloat16,
@@ -28,11 +42,10 @@ def main():
             freq_max_position_embeddings=max_model_len,
             mask_max_position_embeddings=max_model_len,
             kvdtype=jnp.bfloat16,
-            attn_mechanism=ed.AttentionMechanisms.SDPA,
-            decode_attn_mechanism=ed.AttentionMechanisms.REGRESSIVE_DECODE,
-            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,  # change this if u go OOM
+            attn_mechanism=ed.AttentionMechanisms.BLOCKSPARSE,
+            decode_attn_mechanism=ed.AttentionMechanisms.VANILLA,
+            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
         ),
-        quantization_method=ed.EasyDeLQuantizationMethods.NONE,
         precision=jax.lax.Precision.DEFAULT,
     )
     model.eval()
@@ -54,12 +67,14 @@ def main():
 
     ids = tokenizer.apply_chat_template(
         messages,
-        return_tensors="jax",
+        return_tensors="np",
         return_dict=True,
         max_length=max_model_len // 2,
         padding="max_length",
         padding_side="left",
         add_generation_prompt=True,
+        truncation=True,
+        truncation_side="left",
     )
 
     model.generation_config.max_new_tokens = max_model_len // 2
@@ -68,7 +83,7 @@ def main():
     model.generation_config.top_p = 0.95
     static_argnums = (0, 5)
 
-    @ed.ejit(static_argnums=static_argnums)
+    @ed.ejit(static_argnums=static_argnums)  # pyright: ignore[reportUntypedFunctionDecorator]
     def generate(
         graphdef,
         graphstate,
@@ -92,7 +107,7 @@ def main():
         model.generation_config,
     )
 
-    print(tokenizer.decode(output.sequences[0], skip_special_tokens=True))
+    print(tokenizer.decode(output.sequences[0][max_model_len // 2 :], skip_special_tokens=True))
     time_spent = time.time()
     output = generate(
         *model.split_module(),
@@ -101,9 +116,9 @@ def main():
         model.generation_config,
     )
     time_spent = time.time() - time_spent
-    tokens = jnp.sum(output.sequences[0][max_model_len - 1024 :] != 128001)
-    print(tokens / time_spent)
-    print(tokens)
+    tokens = jnp.sum(output.sequences[0][max_model_len // 2 :] != tokenizer.pad_token_id)
+    print("TPS:", tokens / time_spent)
+    print("Num Tokens Generated", tokens)
 
 
 if __name__ == "__main__":

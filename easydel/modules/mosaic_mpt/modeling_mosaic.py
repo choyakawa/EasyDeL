@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,30 +16,34 @@
 import math
 from functools import cached_property, partial
 
-import chex
 import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from einops import rearrange
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
-from jax import lax
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
-from easydel.infra.utils import auto_remat, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
+from easydel.infra.utils import auto_remat
+from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import BaseCausalLMModule
 
 from .mosaic_configuration import MptConfig as MptConfig
 
@@ -68,6 +72,7 @@ class MptMLP(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the MptMLP module.
 
@@ -86,7 +91,6 @@ class MptMLP(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.up_proj = linear_class(
             self.config.hidden_size,
@@ -103,7 +107,24 @@ class MptMLP(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: chex.Array, residual: chex.Array):
+    def __call__(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        residual: Float[Array, "batch seq_len hidden_dim"],
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Forward pass of the MptMLP module.
+
+        Applies a two-layer feed-forward network with GELU activation.
+        The computation is: dropout(down_proj(gelu(up_proj(hidden_states)))) + residual.
+
+        Args:
+            hidden_states: Input hidden states of shape (batch_size, sequence_length, hidden_dim).
+            residual: Residual connection tensor of shape (batch_size, sequence_length, hidden_dim)
+                to be added to the output.
+
+        Returns:
+            Output hidden states with residual connection of shape (batch_size, sequence_length, hidden_dim).
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -120,27 +141,21 @@ class MptMLP(nn.Module):
         return self.hidden_dropout(hidden_states) + residual
 
 
-class MptAttention(AttentionModule):
-    """MPT Attention module.
+class MptAttention(UnifiedAttention):
+    """MPT Attention module with ALiBi positional bias.
 
-    This module implements the multi-head attention mechanism used in the MPT model.
-    It supports ALiBi positional bias and allows for different attention implementations.
+    Inherits from UnifiedAttention.
+    Uses fused QKV projection and ALiBi (Attention with Linear Biases) for positional information.
+    Overrides forward_alibi to handle custom ALiBi bias computation with masking.
 
     Attributes:
         config (MptConfig): Configuration object for the model.
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        hidden_size (int): Dimensionality of the hidden states.
-        Wqkv (ParallelLinear): Combined linear layer for query, key, and value projections.
-        out_proj (ParallelLinear): Linear layer for the output projection.
-        dropout (nn.Dropout): Dropout layer applied after the output projection.
-        n_heads (int): Number of attention heads.
-        max_seq_length (int): Maximum sequence length supported.
-        head_dim (int): Dimensionality of each attention head.
-        softmax_scale (float): Scale factor for the softmax function.
-        attention_performer (FlexibleAttentionModule): Module to perform the core attention computation.
+        Wqkv (ColumnParallelLinear): Fused linear layer for query, key, and value projections.
+        out_proj (RowParallelLinear): Linear layer for the output projection.
+        resid_dropout (nn.Dropout): Dropout layer applied after the output projection.
     """
 
     def __init__(
@@ -151,22 +166,49 @@ class MptAttention(AttentionModule):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
-        """Initializes the MptAttention module.
+        """Initialize MPT attention with ALiBi support.
 
         Args:
-            config (MptConfig): The configuration object for the MPT model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config: Configuration object for the MPT model.
+            dtype: Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
+            precision: Precision setting for JAX operations. Defaults to None.
+            rngs: Random number generators.
+            layer_idx: Index of this layer in the transformer stack.
         """
-        super().__init__(config=config)
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
-        self.hidden_size = config.hidden_size
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+            attention_type="alibi",
+            causal=True,
+        )
+
+    def define_network(
+        self,
+        config: MptConfig,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        precision: jax.lax.PrecisionLike,
+        rngs: nn.Rngs,
+    ):
+        """Define MPT-specific network with fused QKV projection.
+
+        Creates the query/key/value projection layer (Wqkv), output projection (out_proj),
+        dropout, attention performer, and ALiBi slopes.
+
+        Args:
+            config: Configuration object for the MPT model.
+            dtype: Data type for computation.
+            param_dtype: Data type for parameters.
+            precision: Precision setting for JAX operations.
+            rngs: Random number generators.
+        """
         self.Wqkv = ColumnParallelLinear(
             config.hidden_size,
             config.hidden_size * 3,
@@ -176,8 +218,8 @@ class MptAttention(AttentionModule):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
+
         self.out_proj = RowParallelLinear(
             config.hidden_size,
             config.hidden_size,
@@ -187,65 +229,101 @@ class MptAttention(AttentionModule):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.dropout = nn.Dropout(
-            self.config.attn_config.attn_pdrop,
+
+        self.resid_dropout = nn.Dropout(
+            config.attn_config.attn_pdrop,
             rngs=rngs,
         )
 
-        self.hidden_size = self.config.hidden_size
-        self.n_heads = self.config.n_heads
-        self.max_seq_length = self.config.max_seq_len
-        self.head_dim = self.hidden_size // self.n_heads
-        self.softmax_scale = self.config.attn_config.softmax_scale
+        self.attention_performer = self._create_attention_performer(config, rngs)
+        self._create_alibi_slopes(config)
 
-        if self.softmax_scale is None:
-            self.softmax_scale = 1 / math.sqrt(self.hidden_size / self.n_heads)
+    def _create_attention_performer(self, config: MptConfig, rngs: nn.Rngs):
+        """Create attention performer with MPT-specific settings.
 
-        self.attention_performer = FlexibleAttentionModule(
+        Args:
+            config: Configuration object for the MPT model.
+            rngs: Random number generators.
+
+        Returns:
+            FlexibleAttentionModule configured for MPT attention.
+        """
+        softmax_scale = config.attn_config.softmax_scale
+        if softmax_scale is None:
+            softmax_scale = 1 / math.sqrt(self.head_dim)
+
+        return FlexibleAttentionModule(
             rngs=rngs,
-            dropout_prob=self.config.attn_config.attn_pdrop,
+            dropout_prob=float(config.attn_config.attn_pdrop) if config.attn_config.attn_pdrop is not None else 0.0,
             base_config=config,
-            softmax_scale=self.head_dim**-0.5,
+            softmax_scale=softmax_scale,
         )
 
-    def __call__(
+    def _compute_alibi_bias(self, sequence_length):
+        """Compute ALiBi positional bias tensor.
+
+        Args:
+            sequence_length: Maximum sequence length for the ALiBi tensor.
+
+        Returns:
+            ALiBi bias tensor of shape (1, num_heads, sequence_length, sequence_length).
+        """
+        config: MptConfig = self.config
+        return build_mpt_alibi_tensor(config.n_heads, sequence_length, config.attn_config.alibi_bias_max)
+
+    def forward_alibi(
         self,
-        hidden_states: chex.Array,
-        position_bias: chex.Array | tuple[chex.Array, chex.Array],
-        attention_mask: chex.Array,
-        causal_mask: chex.Array | bool | None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
-        fcm_mask: chex.Array | None = None,
-    ):
-        inp_shape = hidden_states.shape
-        mixed_qkv = self.Wqkv(hidden_states)
+        alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
+    ) -> AttentionLayerOutput:
+        """Forward pass with ALiBi positional bias and fused QKV projection.
+
+        Implements attention with ALiBi (Attention with Linear Biases) for positional
+        encoding. Uses a fused QKV projection for efficiency.
+
+        Important: ALiBi does not enforce causality by itself, so causal masking
+        is applied via `mask_info` and the `causal` flag.
+
+        Args:
+            hidden_states: Input hidden states of shape (batch_size, seq_len, hidden_dim).
+            mask_info: Mask information for attention computation.
+            position_ids: Position indices of shape (batch_size, seq_len).
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER).
+            cache_view: Cache view for key/value states in generation.
+            cache_metadata: Metadata for cache handling.
+            output_attentions: Whether to return attention weights.
+            alibi: Optional pre-computed ALiBi bias tensor. If None, computed internally.
+
+        Returns:
+            AttentionLayerOutput containing attention output, optional attention weights,
+            and updated cache view.
+        """
+        batch_size, sequence_length = hidden_states.shape[:2]
+
+        mixed_qkv = checkpoint_name(self.Wqkv(hidden_states), "attn_qkv")
         query_states, key_states, value_states = jnp.split(mixed_qkv, 3, -1)
 
-        query_states = rearrange(
-            query_states,
-            "b s (h d) -> b s h d",
-            h=self.config.n_heads,
-        )
-        key_states = rearrange(
-            key_states,
-            "b s (h d) -> b s h d",
-            h=self.config.n_heads,
-        )
-        value_states = rearrange(
-            value_states,
-            "b s (h d) -> b s h d",
-            h=self.config.n_heads,
-        )
+        query_states = rearrange(query_states, "b s (h d) -> b s h d", h=self.config.n_heads)
+        key_states = rearrange(key_states, "b s (h d) -> b s h d", h=self.config.n_heads)
+        value_states = rearrange(value_states, "b s (h d) -> b s h d", h=self.config.n_heads)
+
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
+
+        causal_for_kernel = self.causal
+        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+            causal_for_kernel = False
+
         (
             key_states,
             value_states,
-            attention_mask,
+            mask_info,
             _,
             cache_view,
             cache_metadata,
@@ -255,49 +333,54 @@ class MptAttention(AttentionModule):
             value=value_states,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            fcm_mask=fcm_mask,
+            mask_info=mask_info,
         )
-        if position_bias is not None:
-            position_bias_query_index = max(0, position_bias.shape[2] - query_states.shape[1])
-            position_bias_key_index = max(0, position_bias.shape[3] - key_states.shape[1])
 
-            position_bias = position_bias[
-                :,
-                :,
-                position_bias_query_index:,
-                position_bias_key_index:,
-            ]
-        attention_mask = attention_mask.repeat(position_bias.shape[1], 1)
-        attention_bias = lax.select(
-            attention_mask.astype("bool"),
-            jnp.full(attention_mask.shape, 0.0).astype(self.dtype) + position_bias.astype(self.dtype),
-            jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-        )
+        if alibi is None:
+            alibi_bias = self._compute_alibi_bias(self.config.max_seq_len)
+        else:
+            alibi_bias = alibi
+
+        alibi_bias = jnp.asarray(alibi_bias, dtype=self.dtype)
+        if alibi_bias.ndim == 3:
+            alibi_bias = alibi_bias[None, ...]
+        elif alibi_bias.ndim == 2:
+            alibi_bias = alibi_bias[None, :, None, :]
+
+        q_len = query_states.shape[1]
+        kv_len = key_states.shape[1]
+
+        if alibi_bias.shape[-1] != kv_len:
+            start_k = max(0, alibi_bias.shape[-1] - kv_len)
+            alibi_bias = alibi_bias[..., start_k:]
+
+        if alibi_bias.shape[0] == 1 and batch_size != 1:
+            alibi_bias = jnp.broadcast_to(alibi_bias, (batch_size, *alibi_bias.shape[1:]))
+
+        if alibi_bias.shape[-2] == 1 and q_len != 1:
+            alibi_bias = jnp.broadcast_to(alibi_bias, (*alibi_bias.shape[:-2], q_len, kv_len))
+        elif alibi_bias.shape[-2] != q_len:
+            start_q = max(0, alibi_bias.shape[-2] - q_len)
+            alibi_bias = alibi_bias[..., start_q:, :]
 
         attention = self.attention_performer.forward(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
             mode=mode,
-            bias=attention_bias,
+            bias=alibi_bias,
             cache_metadata=cache_metadata,
             cache_view=cache_view,
-            init_bias=lambda: attention_bias,
-            attention_mask=None,
-            segment_ids=segment_ids,
-            causal=False,
+            init_bias=None,
+            mask_info=mask_info,
+            causal=causal_for_kernel,
         )
 
-        attn_output = checkpoint_name(
-            self.out_proj(
-                self.shard_attention_prod(
-                    attention.attention_outputs.reshape(inp_shape),
-                )
-            ),
-            name="attn_output",
+        attn_output = self.shard_attention_prod(
+            attention.attention_outputs.reshape(batch_size, sequence_length, self.config.hidden_size)
         )
+        attn_output = checkpoint_name(self.out_proj(attn_output), name="attn_output")
+        attn_output = self.resid_dropout(attn_output)
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -319,9 +402,9 @@ class MptBlock(nn.Module):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         rngs (nn.Rngs): Random number generators.
-        norm_1 (nn.LayerNorm): Layer normalization before the attention layer.
+        norm_1 (LayerNorm): Layer normalization before the attention layer.
         attn (MptAttention): The self-attention module.
-        norm_2 (nn.LayerNorm): Layer normalization before the MLP layer.
+        norm_2 (LayerNorm): Layer normalization before the MLP layer.
         ffn (MptMLP): The feed-forward (MLP) module.
         resid_attn_dropout (nn.Dropout): Dropout applied after the attention layer's residual connection.
     """
@@ -334,6 +417,7 @@ class MptBlock(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the MptBlock module.
 
@@ -359,7 +443,7 @@ class MptBlock(nn.Module):
             exclude_names=config.gradient_checkpointing_targets,
         )
 
-        self.norm_1 = nn.LayerNorm(
+        self.norm_1 = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_epsilon,
             dtype=dtype,
@@ -373,9 +457,10 @@ class MptBlock(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
-        self.norm_2 = nn.LayerNorm(
+        self.norm_2 = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_epsilon,
             dtype=dtype,
@@ -389,6 +474,7 @@ class MptBlock(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
         self.dropout_rate = self.config.attn_config.attn_pdrop
@@ -396,28 +482,46 @@ class MptBlock(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        position_bias: chex.Array | tuple[chex.Array, chex.Array],
-        attention_mask: chex.Array,
-        causal_mask: chex.Array | bool | None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
-        fcm_mask: chex.Array | None = None,
-    ):
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+        position_bias: Float[Array, "batch heads seq_len seq_len"] | None = None,
+    ) -> DecoderLayerOutput:
+        """Forward pass of the MptBlock.
+
+        Applies pre-norm architecture: LayerNorm -> Attention -> Residual -> LayerNorm -> MLP -> Residual.
+        Uses ALiBi positional encoding through the position_bias parameter.
+
+        Args:
+            hidden_states: Input hidden states of shape (batch_size, seq_len, hidden_dim).
+            mask_info: Mask information for attention computation.
+            position_ids: Position indices of shape (batch_size, seq_len).
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER).
+            cache_view: Cache view for key/value states in generation.
+            cache_metadata: Metadata for cache handling.
+            output_attentions: Whether to return attention weights.
+            frequencies: Unused, kept for interface compatibility.
+            position_bias: ALiBi positional bias tensor of shape (batch, heads, seq_len, seq_len).
+
+        Returns:
+            DecoderLayerOutput containing hidden states, optional attention weights,
+            and updated cache view.
+        """
         attn_outputs = self.attn(
             self.norm_1(hidden_states),
-            position_bias,
-            attention_mask,
-            causal_mask,
+            mask_info,
+            position_ids,
             mode,
-            segment_ids,
             cache_view,
             cache_metadata,
             output_attentions,
-            fcm_mask,
+            frequencies,
+            alibi=position_bias,
         )
 
         hidden_states = self.resid_attn_dropout(attn_outputs.attention_output) + hidden_states
@@ -443,7 +547,7 @@ def build_mpt_alibi_tensor(num_heads, sequence_length, alibi_bias_max=8):
         alibi_bias_max (int, optional): The maximum bias value allowed by ALiBi. Defaults to 8.
 
     Returns:
-        chex.Array: The ALiBi tensor of shape (1, num_heads, sequence_length, sequence_length).
+        Array: The ALiBi tensor of shape (1, num_heads, sequence_length, sequence_length).
     """
     alibi = jnp.arange(
         1 - sequence_length,
@@ -491,11 +595,11 @@ class MptModel(EasyDeLBaseModule):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         rngs (nn.Rngs): Random number generators.
-        wte (nn.Embed): Token embedding layer.
+        wte (Embed): Token embedding layer.
         emb_drop (nn.Dropout): Dropout layer applied after embeddings.
         blocks (tp.List[MptBlock]): List of transformer blocks.
-        norm_f (nn.LayerNorm): Final layer normalization.
-        alibi (chex.Array, optional): Precomputed ALiBi tensor if using ALiBi.
+        norm_f (LayerNorm): Final layer normalization.
+        alibi (Array, optional): Precomputed ALiBi tensor if using ALiBi.
     """
 
     def __init__(
@@ -523,7 +627,7 @@ class MptModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.wte = nn.Embed(
+        self.wte = Embed(
             num_embeddings=config.vocab_size,
             features=config.d_model,
             rngs=rngs,
@@ -531,18 +635,21 @@ class MptModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
         )
 
-        self.blocks = [
-            MptBlock(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(self.config.n_layers)
-        ]
+        self.blocks = nn.List(
+            [
+                MptBlock(
+                    config=config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(self.config.n_layers)
+            ]
+        )
 
-        self.norm_f = nn.LayerNorm(
+        self.norm_f = LayerNorm(
             config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -553,6 +660,12 @@ class MptModel(EasyDeLBaseModule):
 
     @cached_property
     def alibi(self):
+        """Compute and cache the ALiBi positional bias tensor.
+
+        Returns:
+            ALiBi tensor of shape (1, num_heads, max_seq_len, max_seq_len) containing
+            position-dependent attention biases.
+        """
         return build_mpt_alibi_tensor(
             sequence_length=self.config.max_seq_len,
             num_heads=self.config.n_heads,
@@ -560,16 +673,50 @@ class MptModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        output_attentions: bool | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
+        """Forward pass through the MPT transformer model.
+
+        Processes input tokens through learned token embeddings (no explicit positional
+        embeddings - uses ALiBi), multiple transformer blocks, and final layer normalization.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, sequence_length). Either this
+                or `inputs_embeds` must be provided but not both.
+            inputs_embeds: Pre-computed input embeddings of shape (batch_size, sequence_length,
+                hidden_size). Use instead of `input_ids` for custom embeddings.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) indicating
+                which tokens to attend to (True) and which to ignore (False).
+            mask_info: Pre-computed mask information. If provided, overrides `attention_mask`.
+            position_ids: Position indices of shape (batch_size, sequence_length). Used for
+                ALiBi bias computation.
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER). Auto-detected if None.
+            past_key_values: Cached key/value states for efficient autoregressive generation.
+            cache_metadata: Metadata for paged attention mechanisms.
+            output_attentions: Whether to return attention weights from all layers.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutput containing:
+                - last_hidden_state: Final layer output of shape (batch, seq_len, hidden_size)
+                - past_key_values: Updated cache for next generation step
+                - hidden_states: Tuple of all layer outputs if output_hidden_states=True
+                - attentions: Tuple of attention weights if output_attentions=True
+
+        Raises:
+            ValueError: If both `input_ids` and `inputs_embeds` are provided, or if neither
+                is provided.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
+        """
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -578,21 +725,19 @@ class MptModel(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids.astype("i4"))
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
 
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-        else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
-
-        if attention_mask.ndim == 2:
-            attention_mask = jnp.expand_dims(attention_mask, (1, 2))
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
 
         hidden_states = inputs_embeds
         if mode is None:
@@ -607,14 +752,14 @@ class MptModel(EasyDeLBaseModule):
         for idx, block in enumerate(self.blocks):
             layer_outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                causal_mask=self.causal_mask,
-                output_attentions=output_attentions,
+                mask_info=mask_info,
+                position_ids=position_ids,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
+                output_attentions=output_attentions,
+                frequencies=None,
                 position_bias=self.alibi,
-                segment_ids=segment_ids,
             )
             hidden_states = layer_outputs.hidden_states
             if output_attentions:
@@ -661,12 +806,12 @@ class MptModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=MptConfig, model_type="mpt")
-class MptForCausalLM(EasyDeLBaseModule):
-    """MPT model with a language modeling head.
+class MptForCausalLM(BaseCausalLMModule[MptModel, MptConfig]):
+    """MPT model with a language modeling head for causal language modeling.
 
-    This model extends the base MptModel by adding a linear layer (lm_head)
-    on top to predict the next token in a sequence, making it suitable for causal
-    language modeling tasks.
+    This model extends the base MptModel by adding a linear layer on top to
+    predict the next token in a sequence, making it suitable for causal language
+    modeling tasks. It uses ALiBi for positional encoding.
 
     Attributes:
         config (MptConfig): Configuration object for the model.
@@ -674,10 +819,13 @@ class MptForCausalLM(EasyDeLBaseModule):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         rngs (nn.Rngs): Random number generators.
-        transformer (MptModel): The core MPT transformer model.
-        lm_head (ColumnParallelLinear, optional): The language modeling head. If `use_lm_head`
-            in the config is True (tying embeddings), this will be None.
+        transformer (MptModel): The base MPT transformer model.
+        lm_head (nn.Linear): Linear layer for language modeling predictions.
     """
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "mpt"
+    _config_class = MptConfig
 
     def __init__(
         self,
@@ -688,107 +836,22 @@ class MptForCausalLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the MptForCausalLM model.
+        """Initialize the MPT causal language model.
 
         Args:
-            config (MptConfig): The configuration object for the MPT model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config: Configuration object for the MPT model.
+            dtype: Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
+            precision: Precision setting for JAX operations. Defaults to None.
+            rngs: Random number generators.
         """
         super().__init__(
             config=config,
+            base_model_class=MptModel,
+            base_model_name="transformer",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            lm_head_bias=config.use_bias if hasattr(config, "use_bias") else False,
         )
-        self.transformer = MptModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            use_bias=config.use_bias,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-
-    def __call__(
-        self,
-        input_ids: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        output_attentions: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        apply_lm_head: bool = True,
-        output_hidden_states: bool | None = None,
-    ) -> BaseModelOutput:
-        outputs: BaseModelOutput = self.transformer(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
-            inputs_embeds=inputs_embeds,
-            mode=mode,
-            past_key_values=past_key_values,
-            cache_metadata=cache_metadata,
-            output_hidden_states=output_hidden_states,
-            output_attentions=output_attentions,
-        )
-
-        logits = None
-        if apply_lm_head:
-            logits = self.apply_lm_head(outputs.last_hidden_state)
-
-        return CausalLMOutput(
-            logits=logits,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            past_key_values=outputs.past_key_values,
-        )
-
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
-        """
-        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
-
-    def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
-        return self.transformer.get_decoder()
-
-    def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        """
-        return self.lm_head
-
-    def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
-        return self.transformer.get_embedding()

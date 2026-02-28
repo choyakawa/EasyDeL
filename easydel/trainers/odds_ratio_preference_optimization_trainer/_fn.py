@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,29 +31,37 @@ which provides better gradient properties and eliminates the need for a referenc
 All functions are JAX-compatible and support distributed training.
 """
 
+import collections.abc
 import typing as tp
 
-import chex
 import jax
 from eformer.escale import with_sharding_constraint
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
+from jaxtyping import Array
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics, dynamic_cross_entropy_loss
 
-from ..training_utils import make_assertions_and_get_sizes, minibatch_call, update_metrics, update_state_respectfully
+from ..training_utils import (
+    filter_kwargs_for_callable,
+    make_assertions_and_get_sizes,
+    minibatch_call,
+    sanitize_model_call_kwargs,
+    update_metrics,
+    update_state_respectfully,
+)
 
 
 def concatenated_forward(
     state: EasyDeLState,
-    batch: tp.Mapping[str, list | chex.Array],
+    batch: collections.abc.Mapping[str, list | Array],
     is_encoder_decoder: bool,
     label_pad_token_id: int,
     padding_value: tp.Any,
     max_length: int | None = None,
-) -> tuple[chex.Array, chex.Array, chex.Array, chex.Array, chex.Array, chex.Array]:
+) -> tuple[Array, Array, Array, Array, Array, Array]:
     """
     Computes log-probabilities and logits for both chosen and rejected examples by concatenating
     the inputs and performing a forward pass through the model.
@@ -65,7 +73,7 @@ def concatenated_forward(
 
     Args:
         state (EasyDeLState): The current state of the model containing parameters and the model itself.
-        batch (tp.Mapping[str, tp.Union[tp.List, chex.Array]]): A dictionary containing input arrays for
+        batch (collections.abc.Mapping[str, tp.Union[tp.List, Array]]): A dictionary containing input arrays for
             chosen and rejected examples as well as other necessary inputs.
         is_encoder_decoder (bool): Flag indicating whether the model is an encoder-decoder.
         label_pad_token_id (int): The token ID used to mark padding positions in the labels.
@@ -73,7 +81,7 @@ def concatenated_forward(
         max_length (int | None, optional): Maximum length for the inputs (if applicable). Defaults to None.
 
     Returns:
-        tp.Tuple[chex.Array, chex.Array, chex.Array, chex.Array, chex.Array, chex.Array]:
+        tp.Tuple[Array, Array, Array, Array, Array, Array]:
             A tuple containing:
                 - chosen_log_probs: Log probabilities for the chosen examples.
                 - rejected_log_probs: Log probabilities for the rejected examples.
@@ -100,11 +108,33 @@ def concatenated_forward(
     )
 
     # Forward pass through the model.
-    all_logits = state.model(
-        input_ids=concatenated_batch["concatenated_input_ids"],
-        attention_mask=concatenated_batch["concatenated_attention_mask"],
+    call_kwargs = {
+        "input_ids": concatenated_batch["concatenated_input_ids"],
+        "attention_mask": concatenated_batch["concatenated_attention_mask"],
         **model_kwargs,
-    ).logits
+    }
+    call_kwargs = filter_kwargs_for_callable(state.model.__call__, call_kwargs)
+    call_kwargs = sanitize_model_call_kwargs(call_kwargs)
+    all_logits = state.model(**call_kwargs).logits
+
+    effective_labels = concatenated_batch["concatenated_labels"]
+    if is_encoder_decoder and effective_labels.shape != all_logits.shape[:-1]:
+        candidate_labels = call_kwargs.get("labels")
+        if candidate_labels is None:
+            candidate_labels = call_kwargs.get("decoder_input_ids")
+        if candidate_labels is None:
+            candidate_labels = call_kwargs.get("input_ids")
+        if candidate_labels is not None and candidate_labels.shape == all_logits.shape[:-1]:
+            effective_labels = candidate_labels
+        else:
+            target_seq_len = all_logits.shape[1]
+            current_seq_len = effective_labels.shape[1]
+            if current_seq_len >= target_seq_len:
+                effective_labels = effective_labels[:, :target_seq_len]
+            else:
+                pad_shape = (effective_labels.shape[0], target_seq_len - current_seq_len)
+                pad_values = jnp.full(pad_shape, label_pad_token_id, dtype=effective_labels.dtype)
+                effective_labels = jnp.concatenate((effective_labels, pad_values), axis=1)
 
     def cross_entropy_loss(logits, labels):
         """
@@ -113,11 +143,11 @@ def concatenated_forward(
         For non encoder-decoder models, the logits and labels are shifted appropriately.
 
         Args:
-            logits (chex.Array): Logits produced by the model.
-            labels (chex.Array): Ground truth labels.
+            logits (Array): Logits produced by the model.
+            labels (Array): Ground truth labels.
 
         Returns:
-            tp.Tuple[chex.Array, chex.Array]: The computed loss and accuracy.
+            tp.Tuple[Array, Array]: The computed loss and accuracy.
         """
         if not is_encoder_decoder:
             logits = logits[..., :-1, :]
@@ -131,7 +161,7 @@ def concatenated_forward(
 
     # Set labels for computing loss.
     if is_encoder_decoder:
-        labels = concatenated_batch["concatenated_labels"]
+        labels = effective_labels
     else:
         labels = concatenated_batch["concatenated_input_ids"]
         attention_mask = concatenated_batch["concatenated_attention_mask"]
@@ -146,7 +176,7 @@ def concatenated_forward(
     # Compute log probabilities for the entire batch.
     all_log_probs = get_batch_logps(
         all_logits,
-        concatenated_batch["concatenated_labels"],
+        effective_labels,
         average_log_prob=True,
         is_encoder_decoder=is_encoder_decoder,
         label_pad_token_id=label_pad_token_id,
@@ -168,12 +198,12 @@ def concatenated_forward(
 
 
 def get_batch_logps(
-    logits: chex.Array,
-    labels: chex.Array,
+    logits: Array,
+    labels: Array,
     average_log_prob: bool = False,
     label_pad_token_id: int = -100,
     is_encoder_decoder: bool = False,
-) -> chex.Array:
+) -> Array:
     """
     Computes the log probabilities for a batch of sequences given the model logits and labels.
 
@@ -181,8 +211,8 @@ def get_batch_logps(
     token corresponding to the label. It also masks out the padding tokens using `label_pad_token_id`.
 
     Args:
-        logits (chex.Array): The logits output by the model with shape (..., sequence_length, vocab_size).
-        labels (chex.Array): The ground truth labels with shape matching logits except for the vocabulary dimension.
+        logits (Array): The logits output by the model with shape (..., sequence_length, vocab_size).
+        labels (Array): The ground truth labels with shape matching logits except for the vocabulary dimension.
         average_log_prob (bool, optional): If True, returns the average log probability per sequence.
             Otherwise, returns the sum of log probabilities per sequence. Defaults to False.
         label_pad_token_id (int, optional): The token ID used for padding in the labels. Defaults to -100.
@@ -190,7 +220,7 @@ def get_batch_logps(
             Defaults to False.
 
     Returns:
-        chex.Array: An array of log probabilities for each sequence in the batch.
+        Array: An array of log probabilities for each sequence in the batch.
     """
     if logits.shape[:-1] != labels.shape:
         raise ValueError("Logits (batch and sequence length dim) and labels must have the same shape.")
@@ -217,9 +247,9 @@ def get_batch_logps(
 
 
 def concatenated_inputs(
-    batch: dict[str, list | chex.Array],
+    batch: dict[str, list | Array],
     is_encoder_decoder: bool = False,
-) -> dict[str, chex.Array]:
+) -> dict[str, Array]:
     """
     Concatenates chosen and rejected examples from the batch into unified arrays.
 
@@ -228,14 +258,14 @@ def concatenated_inputs(
     model, the prompt inputs and attention masks are also repeated accordingly.
 
     Args:
-        batch (tp.Dict[str, tp.Union[tp.List, chex.Array]]): A dictionary containing the batch of data.
+        batch (tp.Dict[str, tp.Union[tp.List, Array]]): A dictionary containing the batch of data.
             Expected keys include those starting with "chosen", "rejected", "prompt_input_ids", and
             "prompt_attention_mask".
         is_encoder_decoder (bool, optional): Indicates whether the model is encoder-decoder.
             Defaults to False.
 
     Returns:
-        tp.Dict[str, chex.Array]: A dictionary containing concatenated arrays with keys prefixed with
+        tp.Dict[str, Array]: A dictionary containing concatenated arrays with keys prefixed with
             "concatenated".
     """
     concatenated_batch = {}
@@ -263,9 +293,9 @@ def concatenated_inputs(
 
 def odds_ratio_loss(
     beta: float,
-    policy_chosen_logps: chex.Array,
-    policy_rejected_logps: chex.Array,
-) -> tuple[chex.Array, chex.Array, chex.Array, chex.Array, chex.Array]:
+    policy_chosen_logps: Array,
+    policy_rejected_logps: Array,
+) -> tuple[Array, Array, Array, Array, Array]:
     """
     Computes the odds ratio loss used for training based on the log probabilities of chosen and rejected examples.
 
@@ -276,11 +306,11 @@ def odds_ratio_loss(
 
     Args:
         beta (float): A scaling hyperparameter applied to the loss and rewards.
-        policy_chosen_logps (chex.Array): Log probabilities for the chosen examples.
-        policy_rejected_logps (chex.Array): Log probabilities for the rejected examples.
+        policy_chosen_logps (Array): Log probabilities for the chosen examples.
+        policy_rejected_logps (Array): Log probabilities for the rejected examples.
 
     Returns:
-        tp.Tuple[chex.Array, chex.Array, chex.Array, chex.Array, chex.Array]:
+        tp.Tuple[Array, Array, Array, Array, Array]:
             A tuple containing:
                 - losses: The computed odds ratio loss.
                 - chosen_rewards: Rewards computed from the chosen log probabilities (detached).
@@ -311,6 +341,7 @@ def orpo_step(
     loss_config: LossConfig | None = None,
     partition_spec: PartitionSpec | None = None,
     gradient_accumulation_steps: int = 1,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """
     Performs a single training or evaluation step for the ORPO method.
@@ -341,7 +372,7 @@ def orpo_step(
             - In "train" mode: A tuple containing the updated model state and the computed loss metrics.
             - In "eval" mode: The computed loss metrics.
     """
-    batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+    _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
         batch=batch,
         batch_partition_spec=partition_spec,
         gradient_accumulation_steps=gradient_accumulation_steps if mode == "train" else 1,
@@ -362,9 +393,11 @@ def orpo_step(
             batch (tp.Dict): The input batch data.
 
         Returns:
-            tp.Tuple[chex.Array, LossMetrics]: The computed loss and a LossMetrics object containing
+            tp.Tuple[Array, LossMetrics]: The computed loss and a LossMetrics object containing
             additional metrics.
         """
+        if mode == "train" and straight_through_emulator is not None:
+            tree = straight_through_emulator(tree)
         (
             mean_chosen_logits,
             mean_rejected_logits,

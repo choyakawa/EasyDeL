@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,55 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""eSurge adapter for lm-evaluation-harness compatibility.
+
+This module provides an adapter class that enables EasyDeL's eSurge inference
+engine to be used with the lm-evaluation-harness benchmarking framework.
+
+The adapter implements the required interface methods for text generation,
+log-likelihood computation, and tokenization that lm-eval expects.
+
+Classes:
+    eSurgeLMEvalAdapter: Main adapter class implementing the lm-eval LM interface.
+
+Functions:
+    _chunked: Split a list into chunks of a given size.
+    _trim_stop_sequences: Remove stop sequences from generated text.
+    _get_rolling_token_windows: Generate rolling windows for perplexity computation.
+    _make_disjoint_window: Split context and continuation for rolling evaluation.
+
+Example:
+    >>> from easydel.inference import eSurge
+    >>> from easydel.inference.evaluations import eSurgeLMEvalAdapter
+    >>> from lm_eval.evaluator import simple_evaluate
+    >>>
+    >>> surge = eSurge(model, processor, max_num_seqs=4)
+    >>> adapter = eSurgeLMEvalAdapter(
+    ...     surge=surge,
+    ...     processor=processor,
+    ...     max_length=4096,
+    ...     max_new_tokens=256
+    ... )
+    >>>
+    >>> results = simple_evaluate(
+    ...     model=adapter,
+    ...     tasks=["hellaswag"],
+    ...     batch_size=4
+    ... )
+"""
+
+from __future__ import annotations
+
+import re
+import uuid
+from collections.abc import Iterable
+from contextlib import nullcontext
+from typing import Any
+
+import jax
+import jax.numpy as jnp
 from eformer.loggings import get_logger
+from jax.scipy.special import logsumexp
 
 from easydel.infra.utils import ProcessingClassType
 
@@ -22,21 +70,240 @@ logger = get_logger("eSurgeLMEvalAdapter")
 
 try:
     from lm_eval.api.model import LM  # type:ignore
-except Exception as e:
-    LM = object
-    logger.warning(
-        f"consider installing lm_eval if you want to use `eSurgeLMEvalAdapter` (err : {e}).",
-        stacklevel=1,
-    )
+except Exception:
+    LM = object  # type: ignore[misc]
+    err = "consider installing easydel[torch, lm_eval] if you want to use `eSurgeLMEvalAdapter`."
+    logger.warning(err, stacklevel=1)
+
+_DEFAULT_REQUEST_ID_PREFIX = "lm_eval"
+_DEFAULT_MATH_ANSWER_TASK_HINTS = (
+    "gsm8k",
+    "mgsm",
+    "afrimgsm",
+    "tinygsm8k",
+    "gsm_plus",
+)
+_STRICT_MATH_ANSWER_RE = re.compile(r"####\s*(-?[0-9\.\,]+)")
+_BOXED_ANSWER_RE = re.compile(r"\\boxed\{([^{}]+)\}")
+_NUMBER_RE = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
 
 
-class eSurgeLMEvalAdapter(LM):
+def _chunked(seq: list[Any], size: int) -> Iterable[list[Any]]:
+    """Split a sequence into chunks of a specified size.
+
+    Args:
+        seq: The list to split into chunks.
+        size: Maximum size of each chunk. Must be positive.
+
+    Yields:
+        Lists of at most `size` elements from the input sequence.
+
+    Raises:
+        ValueError: If size is not positive.
+
+    Example:
+        >>> list(_chunked([1, 2, 3, 4, 5], 2))
+        [[1, 2], [3, 4], [5]]
+    """
+    if size <= 0:
+        raise ValueError("chunk size must be > 0")
+    for start in range(0, len(seq), size):
+        yield seq[start : start + size]
+
+
+def _trim_stop_sequences(text: str, stop: list[str]) -> str:
+    """Remove everything after the first occurrence of any stop sequence.
+
+    Args:
+        text: The text to trim.
+        stop: List of stop sequences. Empty strings are ignored.
+
+    Returns:
+        The text trimmed at the earliest stop sequence, or the original
+        text if no stop sequences are found.
+
+    Example:
+        >>> _trim_stop_sequences("Hello world! How are you?", ["!", "?"])
+        'Hello world'
+    """
+    if not stop:
+        return text
+    earliest = None
+    for s in stop:
+        if not s:
+            continue
+        idx = text.find(s)
+        if idx == -1:
+            continue
+        if earliest is None or idx < earliest:
+            earliest = idx
+    return text if earliest is None else text[:earliest]
+
+
+def _is_math_answer_task(task_name: str | None, task_hints: tuple[str, ...]) -> bool:
+    if not task_name:
+        return False
+    normalized = task_name.lower()
+    return any(hint in normalized for hint in task_hints)
+
+
+def _normalize_number_candidate(candidate: str) -> str | None:
+    candidate = candidate.strip()
+    if not candidate:
+        return None
+    if "=" in candidate:
+        candidate = candidate.rsplit("=", maxsplit=1)[-1].strip()
+    candidate = candidate.replace("$", "").replace(",", "").rstrip(".")
+    match = _NUMBER_RE.search(candidate)
+    if match is None:
+        return None
+    return match.group(0)
+
+
+def _extract_math_answer(generation: str) -> str | None:
+    strict_match = _STRICT_MATH_ANSWER_RE.search(generation)
+    if strict_match is not None:
+        return _normalize_number_candidate(strict_match.group(1))
+
+    boxed_matches = _BOXED_ANSWER_RE.findall(generation)
+    for boxed in reversed(boxed_matches):
+        boxed_value = _normalize_number_candidate(boxed)
+        if boxed_value is not None:
+            return boxed_value
+
+    numeric_matches = _NUMBER_RE.findall(generation)
+    if not numeric_matches:
+        return None
+    return _normalize_number_candidate(numeric_matches[-1])
+
+
+def _normalize_math_generation(generation: str) -> str:
+    if _STRICT_MATH_ANSWER_RE.search(generation) is not None:
+        return generation
+
+    answer = _extract_math_answer(generation)
+    if answer is None:
+        return generation
+
+    normalized = generation.rstrip()
+    if not normalized:
+        return f"#### {answer}"
+    return f"{normalized}\n#### {answer}"
+
+
+def _get_rolling_token_windows(
+    token_list: list[int],
+    *,
+    prefix_token: int,
+    max_seq_len: int,
+    context_len: int,
+) -> Iterable[tuple[list[int], list[int]]]:
+    """Generate rolling token windows for perplexity computation.
+
+    Port of `lm_eval.utils.get_rolling_token_windows` (v0.4.9.1).
+    Generates overlapping windows of tokens for computing rolling
+    log-likelihood scores.
+
+    Args:
+        token_list: List of token IDs to process.
+        prefix_token: Token ID to prepend to the first window.
+        max_seq_len: Maximum sequence length for each window.
+        context_len: Number of context tokens to include. Must be
+            in range [1, max_seq_len].
+
+    Yields:
+        Tuples of (context_tokens, target_tokens) where context_tokens
+        are the input and target_tokens are what we predict.
+
+    Raises:
+        ValueError: If context_len is not in valid range.
+
+    Example:
+        >>> list(_get_rolling_token_windows(
+        ...     [1, 2, 3, 4],
+        ...     prefix_token=0,
+        ...     max_seq_len=3,
+        ...     context_len=1
+        ... ))
+        [([0, 1, 2], [1, 2, 3]), ([2, 3], [3, 4])]
+    """
+    if not token_list:
+        return
+    if not (1 <= context_len <= max_seq_len):
+        raise ValueError(f"context_len must be in [1, {max_seq_len}], got {context_len}")
+
+    pred_len = max_seq_len - context_len + 1
+    predicted = 0
+
+    # Special handling for first window: predict all tokens.
+    first_seq_len = min(max_seq_len, len(token_list))
+    yield [prefix_token, *token_list[: first_seq_len - 1]], token_list[:first_seq_len]
+    predicted += first_seq_len
+
+    while predicted < len(token_list):
+        window_pred_len = min(len(token_list) - predicted, pred_len)
+        window_end = predicted + window_pred_len
+        yield (
+            token_list[window_end - max_seq_len - 1 : window_end - 1],
+            token_list[window_end - window_pred_len : window_end],
+        )
+        predicted += window_pred_len
+
+
+def _make_disjoint_window(context: list[int], continuation: list[int]) -> tuple[list[int], list[int]]:
+    """Make context and continuation disjoint for rolling evaluation.
+
+    Port of `lm_eval.utils.make_disjoint_window` (v0.4.9.1).
+    Adjusts the context to not overlap with continuation tokens
+    except for the necessary prediction overlap.
+
+    Args:
+        context: Context token IDs.
+        continuation: Continuation token IDs to predict.
+
+    Returns:
+        Tuple of (adjusted_context, continuation) where adjusted_context
+        has been trimmed to avoid overlap with continuation.
+
+    Example:
+        >>> _make_disjoint_window([1, 2, 3], [3, 4])
+        ([1, 2], [3, 4])
+    """
+    if not continuation:
+        return context, continuation
+    return context[: len(context) - (len(continuation) - 1)], continuation
+
+
+class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
     """Adapter for EasyDeL models to be compatible with lm-evaluation-harness.
 
-    This class inherits from lm_eval.api.model.LM to ensure compatibility with the harness,
-    allowing EasyDeL models to be evaluated using the lm-evaluation-harness framework.
-    It wraps an `eSurge` instance for efficient inference with advanced features like
-    smart bytecode decoding and context management.
+    This class inherits from lm_eval.api.model.LM to ensure compatibility with
+    the lm-evaluation-harness framework, allowing EasyDeL models to be evaluated
+    using standard benchmarks.
+
+    The adapter wraps an `eSurge` instance for efficient inference with advanced
+    features like paged attention and continuous batching.
+
+    Attributes:
+        max_length: Maximum context length for the model.
+        tokenizer: The tokenizer/processor for text encoding/decoding.
+        temperature: Sampling temperature.
+        max_new_tokens: Maximum tokens to generate per request.
+        top_p: Top-p sampling parameter.
+        surge: The eSurge inference engine instance.
+        model: Direct reference to the underlying model (if available).
+        setup_complete: Whether the engine has been initialized.
+
+    Example:
+        >>> from easydel.inference import eSurge
+        >>> from easydel.inference.evaluations import eSurgeLMEvalAdapter
+        >>>
+        >>> surge = eSurge(model, processor)
+        >>> adapter = eSurgeLMEvalAdapter(surge, processor, max_length=4096)
+        >>>
+        >>> # Use with lm-eval
+        >>> from lm_eval.evaluator import simple_evaluate
+        >>> results = simple_evaluate(model=adapter, tasks=["hellaswag"])
     """
 
     def __init__(
@@ -48,17 +315,33 @@ class eSurgeLMEvalAdapter(LM):
         top_p: float = 0.95,
         temperature: float = 0.0,
         batch_size: int | None = None,
+        normalize_math_answers: bool = True,
+        math_answer_task_hints: tuple[str, ...] | list[str] | None = None,
     ):
-        """Initializes the eSurgeLMEvalAdapter.
+        """Initialize the eSurgeLMEvalAdapter.
 
         Args:
             surge: An instance of `eSurge` for model inference.
             processor: The tokenizer/processor associated with the model.
-            max_length: The maximum context length for the model. Defaults to 8192.
-            max_new_tokens: Maximum number of tokens to generate. Defaults to 2048.
+                Must have `encode`, `decode`, `eos_token_id`, and optionally
+                `pad_token_id` attributes.
+            max_length: The maximum context length for the model.
+                Defaults to 8192.
+            max_new_tokens: Maximum number of tokens to generate.
+                Defaults to 2048.
             top_p: Top-p sampling parameter. Defaults to 0.95.
             temperature: Sampling temperature. Defaults to 0.0 (greedy).
-            batch_size: Optional batch size override. If None, uses surge's max_num_seqs.
+            batch_size: Optional batch size override. If None, uses
+                surge's max_num_seqs setting.
+            normalize_math_answers: If True, normalize math-style generations for
+                GSM-like tasks by appending a `#### <number>` line when possible.
+            math_answer_task_hints: Optional task-name hints used to decide where
+                math normalization is applied. Matching is case-insensitive and
+                substring-based.
+
+        Note:
+            The processor's padding_side is automatically set to "left"
+            for proper left-padding behavior during batch processing.
         """
         super().__init__()
         self.max_length = max_length
@@ -71,18 +354,33 @@ class eSurgeLMEvalAdapter(LM):
         self.temperature = temperature
         self.max_new_tokens = max_new_tokens
         self.top_p = top_p
+        self.normalize_math_answers = normalize_math_answers
+        if math_answer_task_hints is None:
+            raw_task_hints: Iterable[str] = _DEFAULT_MATH_ANSWER_TASK_HINTS
+        elif isinstance(math_answer_task_hints, str):
+            raw_task_hints = (math_answer_task_hints,)
+        elif isinstance(math_answer_task_hints, Iterable):
+            raw_task_hints = math_answer_task_hints
+        else:
+            raise TypeError("math_answer_task_hints must be None, a string, or an iterable of strings")
+        self.math_answer_task_hints = tuple(
+            hint_text for hint in raw_task_hints if (hint_text := str(hint).strip().lower())
+        )
 
         self.surge = surge
         self._batch_size = batch_size or surge.max_num_seqs
-        self.model = None
+        self.model = getattr(getattr(surge, "runner", None), "model", None)
+        self._scoring_model = None
+        self._scoring_logits_fn = None
         self.setup_complete = False
         self._setup()
 
     def _setup(self):
         """Set up the eSurge engine.
 
-        Ensures the eSurge scheduler is running. Unlike vSurge, eSurge
-        automatically initiates its scheduler in __init__, so we just verify it's running.
+        Ensures the eSurge scheduler is running. The scheduler should
+        auto-initialize at construction, but this method guards against
+        any edge cases where it may not be running.
         """
         if self.setup_complete:
             return
@@ -97,10 +395,60 @@ class eSurgeLMEvalAdapter(LM):
     def stop(self):
         """Stop the eSurge engine.
 
-        Terminates the underlying `eSurge` scheduler thread.
+        Terminates the underlying `eSurge` scheduler thread. This should
+        be called when the adapter is no longer needed to free resources.
         """
         if self.surge:
             self.surge.terminate()
+
+    def _build_scoring_model(self):
+        """Build a scoring model that supports direct teacher-forced forward passes.
+
+        eSurge's runtime model commonly uses ragged-page attention and requires
+        cache metadata. For lm-eval loglikelihood scoring we need plain forward
+        passes over full token sequences, so we construct a non-paged variant
+        from the same parameters when needed.
+        """
+        if self.model is None:
+            raise RuntimeError("Scoring model is not available on the eSurge engine (missing `surge.runner.model`).")
+
+        text_config_getter = getattr(getattr(self.model, "config", None), "get_text_config", None)
+        text_config = text_config_getter() if callable(text_config_getter) else getattr(self.model, "config", None)
+        attn_mechanism = getattr(text_config, "attn_mechanism", None)
+        if hasattr(attn_mechanism, "value"):
+            attn_mechanism = attn_mechanism.value
+        attn_mechanism = str(attn_mechanism).lower() if attn_mechanism is not None else ""
+
+        if attn_mechanism in {"ragged_page_attention_v2", "ragged_page_attention_v3", "paged_flash_attention"}:
+            try:
+                compat_graphdef = self.model.new_graphdef(
+                    recursive_update=True,
+                    attn_mechanism="vanilla",
+                    decode_attn_mechanism="vanilla",
+                )
+                return self.model.merge_module(compat_graphdef, self.model.graphstate, self.model.graphother)
+            except Exception:
+                logger.warning(
+                    "Failed to build non-paged scoring model; falling back to eSurge runner model.",
+                    exc_info=True,
+                )
+        return self.model
+
+    def _get_scoring_model(self):
+        if self._scoring_model is None:
+            self._scoring_model = self._build_scoring_model()
+        return self._scoring_model
+
+    def _get_scoring_logits_fn(self):
+        """Return a cached jitted forward that outputs logits only."""
+        if self._scoring_logits_fn is None:
+            scoring_model = self._get_scoring_model()
+
+            def _forward(input_ids, attention_mask):
+                return scoring_model(input_ids=input_ids, attention_mask=attention_mask).logits
+
+            self._scoring_logits_fn = jax.jit(_forward)
+        return self._scoring_logits_fn
 
     def _generate(
         self,
@@ -115,18 +463,20 @@ class eSurgeLMEvalAdapter(LM):
         Args:
             prompts: List of prompts to generate responses for.
             max_tokens: Maximum number of tokens to generate per prompt.
-            temperature: Sampling temperature.
-            top_p: Top-p sampling parameter.
-            stop_sequences: List of lists of stop sequences, one list per prompt.
-                            Generation stops if any sequence in the corresponding list is encountered.
+                Defaults to self.max_gen_toks.
+            temperature: Sampling temperature. Defaults to self.temperature.
+            top_p: Top-p sampling parameter. Defaults to self.top_p.
+            stop_sequences: List of lists of stop sequences, one list per
+                prompt. Generation stops if any sequence in the corresponding
+                list is encountered.
 
         Returns:
-            List of generated responses.
+            List of generated response strings, one per prompt.
         """
         if not self.setup_complete:
             self._setup()
 
-        import easydel as ed
+        from easydel.inference.sampling_params import SamplingParams
 
         if max_tokens is None:
             max_tokens = self.max_gen_toks
@@ -137,61 +487,70 @@ class eSurgeLMEvalAdapter(LM):
         if temperature is None:
             temperature = self.temperature
 
-        # Create sampling params for each prompt
-        sampling_params_list = []
-        for i, _ in enumerate(prompts):
-            current_stop_seq = None
-            if stop_sequences and i < len(stop_sequences):
-                current_stop_seq = stop_sequences[i]
+        if not prompts:
+            return []
 
-            sampling_params_list.append(
-                ed.SamplingParams(
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stop=current_stop_seq if current_stop_seq else [],
-                    n=1,
-                )
+        normalized_stops: list[list[str]] = []
+        if stop_sequences is None:
+            normalized_stops = [[] for _ in prompts]
+        else:
+            for i in range(len(prompts)):
+                stops = stop_sequences[i] if i < len(stop_sequences) else []
+                normalized_stops.append([str(s) for s in (stops or [])])
+
+        # eSurge doesn't accept per-prompt SamplingParams; group by stop sequences.
+        groups: dict[tuple[int, float, float, tuple[str, ...]], list[int]] = {}
+        for i, stops in enumerate(normalized_stops):
+            key = (int(max_tokens), float(temperature), float(top_p), tuple(stops))
+            groups.setdefault(key, []).append(i)
+
+        outputs: list[str] = [""] * len(prompts)
+        for (mt, temp, tp, stops_tuple), indices in groups.items():
+            group_prompts = [prompts[i] for i in indices]
+            request_ids = [f"{_DEFAULT_REQUEST_ID_PREFIX}-{uuid.uuid4().hex}" for _ in group_prompts]
+            sampling_params = SamplingParams(
+                max_tokens=mt,
+                temperature=temp,
+                top_p=tp,
+                stop=list(stops_tuple),
+                n=1,
             )
 
-        # Use eSurge's generate method
-        results = self.surge.generate(
-            prompts=prompts,
-            sampling_params=sampling_params_list[0]
-            if len(set(str(sp) for sp in sampling_params_list)) == 1
-            else sampling_params_list,
-            use_tqdm=True,
-            bytecode_decode=self.surge.bytecode_decode,  # Use engine's bytecode_decode setting
-        )
+            # eSurge.generate may return outputs in completion order; re-map via request_id.
+            results = self.surge.generate(
+                prompts=group_prompts,
+                sampling_params=sampling_params,
+                request_id=request_ids,
+                use_tqdm=False,
+            )
+            by_id = {r.request_id: r for r in results}
+            for prompt_index, request_id in zip(indices, request_ids, strict=False):
+                if request_id not in by_id:
+                    raise RuntimeError(
+                        f"eSurge.generate returned {len(results)}/{len(request_ids)} outputs; missing {request_id!r}."
+                    )
+                text = by_id[request_id].get_text()
+                outputs[prompt_index] = _trim_stop_sequences(text, list(stops_tuple))
 
-        generated_texts = []
-        for i, result in enumerate(results):
-            text = result.get_text()
-            # Apply stop sequences if present
-            if stop_sequences and i < len(stop_sequences):
-                for stop in stop_sequences[i]:
-                    if stop in text:
-                        text = text[: text.find(stop)]
-            generated_texts.append(text)
-
-        assert len(generated_texts) == len(prompts), (
-            f"Mismatch between prompts sent ({len(prompts)}) and results received "
-            f"({len(generated_texts)}) from surge.generate!."
-        )
-
-        return generated_texts
+        return outputs
 
     def _extract_choice_from_generation(self, generation: str) -> str:
         """Extract a multiple-choice answer (A, B, C, D) from generated text.
 
+        Uses pattern matching to identify answer choices in various formats
+        commonly used by language models.
+
         Args:
-            generation: The generated text string.
+            generation: The generated text string to extract from.
 
         Returns:
-            The extracted choice (e.g., "A", "B", "C", "D") or an empty string if no clear choice is found.
-        """
-        import re
+            The extracted choice as an uppercase letter (e.g., "A", "B", "C", "D")
+            or an empty string if no clear choice is found.
 
+        Example:
+            >>> adapter._extract_choice_from_generation("The answer is B.")
+            'B'
+        """
         patterns = [
             r"^([A-Da-d])[^A-Za-z0-9]",
             r"^([A-Da-d])$",
@@ -212,70 +571,137 @@ class eSurgeLMEvalAdapter(LM):
 
         return ""
 
-    def generate_until(self, instances):
+    @staticmethod
+    def _parse_instances(instances) -> tuple[list[str], list[list[str]]]:
+        """Extract prompts and stop sequences from lm-eval Instance objects.
+
+        Handles both modern Instance objects (with `.arguments`) and legacy
+        ``(context, until)`` tuples.
+
+        Args:
+            instances: List of Instance objects or tuples.
+
+        Returns:
+            Tuple of (prompts, stop_sequences).
         """
-        Generate text until a specified set of stop sequences is reached for each instance.
+        if instances and not hasattr(instances[0], "arguments") and isinstance(instances[0], tuple):
+            prompts: list[str] = []
+            stop_sequences: list[list[str]] = []
+            for request in instances:
+                prompt = str(request[0]) if request else ""
+                config = request[1] if len(request) > 1 else None
+                if isinstance(config, dict):
+                    until = config.get("until", []) or []
+                elif isinstance(config, (list, tuple)):
+                    until = config
+                else:
+                    until = []
+                prompts.append(prompt)
+                stop_sequences.append([str(s) for s in until])
+            return prompts, stop_sequences
+
+        prompts: list[str] = []
+        stop_sequences: list[list[str]] = []
+        for instance in instances:
+            arguments = instance.arguments if hasattr(instance, "arguments") else instance
+            prompt = str(arguments[0]) if arguments else ""
+            config = arguments[1] if len(arguments) > 1 else None
+            if isinstance(config, dict):
+                until = config.get("until", []) or []
+            elif isinstance(config, (list, tuple)):
+                until = config
+            else:
+                until = []
+            prompts.append(prompt)
+            stop_sequences.append([str(s) for s in until])
+        return prompts, stop_sequences
+
+    def _maybe_normalize_math(self, generations: list[str], instances) -> list[str]:
+        """Apply math answer normalization for GSM-like tasks when enabled."""
+        if not self.normalize_math_answers:
+            return generations
+        normalized: list[str] = []
+        for generation, instance in zip(generations, instances, strict=False):
+            task_name = getattr(instance, "task_name", None)
+            if _is_math_answer_task(task_name, self.math_answer_task_hints):
+                generation = _normalize_math_generation(generation)
+            normalized.append(generation)
+        return normalized
+
+    def generate_until(self, instances):
+        """Generate text until a specified set of stop sequences is reached.
 
         This method is part of the lm-evaluation-harness LM interface.
 
         Args:
             instances: List of Instance objects from lm-evaluation-harness.
-                       Each instance is expected to contain the prompt as the first argument
-                       and an optional dictionary as the second argument with a 'until' key
-                       containing a list of stop sequences.
+                Each instance is expected to contain the prompt as the first
+                argument and an optional dictionary as the second argument
+                with an 'until' key containing a list of stop sequences.
 
         Returns:
             List of generated strings, one for each instance.
         """
-
-        requests = []
-        for instance in instances:
-            prompt = instance.arguments[0]
-
-            if len(instance.arguments) > 1 and isinstance(instance.arguments[1], dict):
-                config = instance.arguments[1]
-                stop_sequences = config.get("until", [])
-            else:
-                stop_sequences = []
-
-            requests.append((prompt, stop_sequences))
-
+        prompts, stop_sequences = self._parse_instances(instances)
         generations = self._generate(
-            [req[0] for req in requests],
+            prompts,
             max_tokens=self.max_gen_toks,
-            stop_sequences=[req[1] for req in requests],
+            stop_sequences=stop_sequences,
         )
-
-        return generations
+        return self._maybe_normalize_math(generations, instances)
 
     @property
     def eot_token_id(self):
-        """Get the end-of-text token ID."""
+        """Get the end-of-text token ID.
+
+        Returns:
+            int: The EOS token ID from the tokenizer.
+        """
         return self.tokenizer.eos_token_id
 
     @property
     def max_length(self):
-        """Get the maximum context length."""
+        """Get the maximum context length.
+
+        Returns:
+            int: The maximum sequence length the model can process.
+        """
         return self._max_length
 
     @max_length.setter
     def max_length(self, value):
-        """Set the maximum context length."""
+        """Set the maximum context length.
+
+        Args:
+            value: The new maximum length value.
+        """
         self._max_length = value
 
     @property
     def max_gen_toks(self):
-        """Get the maximum number of tokens to generate."""
+        """Get the maximum number of tokens to generate.
+
+        Returns:
+            int: Maximum generation length in tokens.
+        """
         return self.max_new_tokens
 
     @property
     def batch_size(self):
-        """Get the batch size."""
+        """Get the batch size.
+
+        Returns:
+            int: Number of requests to process in parallel.
+        """
         return self._batch_size
 
     @property
     def device(self):
-        """Get the device (CPU/GPU)."""
+        """Get the device (CPU/GPU).
+
+        Returns:
+            str: Always returns "cpu" as JAX handles device placement.
+        """
         return "cpu"
 
     @property
@@ -284,17 +710,15 @@ class eSurgeLMEvalAdapter(LM):
 
         Returns the name or path of the tokenizer/model being used.
         This is required by lm_eval for proper chat template handling.
+
+        Returns:
+            str: Tokenizer name, path, or class name as fallback.
         """
-        # Try to get the tokenizer name from various possible attributes
         if hasattr(self.tokenizer, "name_or_path") and self.tokenizer.name_or_path:
             return self.tokenizer.name_or_path
-        elif hasattr(self.tokenizer, "tokenizer_name") and self.tokenizer.tokenizer_name:
+        if hasattr(self.tokenizer, "tokenizer_name") and self.tokenizer.tokenizer_name:
             return self.tokenizer.tokenizer_name
-        elif hasattr(self.tokenizer, "__class__"):
-            # Return the class name as a fallback
-            return self.tokenizer.__class__.__name__
-        else:
-            return ""
+        return self.tokenizer.__class__.__name__
 
     def apply_chat_template(self, messages, add_generation_prompt: bool):
         """Apply chat template to messages.
@@ -302,23 +726,37 @@ class eSurgeLMEvalAdapter(LM):
         This method is required by lm_eval for chat-based evaluations.
 
         Args:
-            messages: List of message dictionaries with 'role' and 'content' keys
+            messages: List of message dictionaries with 'role' and
+                'content' keys.
+            add_generation_prompt: Whether to add a generation prompt
+                at the end for the assistant to continue.
 
         Returns:
-            String with the formatted chat template applied
+            str: Formatted chat string with the template applied.
         """
-        return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_generation_prompt)
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            return self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=add_generation_prompt
+            )
+
+        lines = [f"{m.get('role', 'user')}: {m.get('content', '')}" for m in (messages or [])]
+        if add_generation_prompt:
+            lines.append("assistant:")
+        return "\n".join(lines)
 
     def tok_encode(self, string: str):
         """Encode a string into token IDs.
 
         Args:
-            string: The input string.
+            string: The input string to tokenize.
 
         Returns:
-            A list of token IDs.
+            list[int]: List of token IDs.
         """
-        return self.tokenizer.encode(string)
+        try:
+            return self.tokenizer.encode(string, add_special_tokens=False)
+        except TypeError:
+            return self.tokenizer.encode(string)
 
     def tok_decode(self, tokens):
         """Decode token IDs into a string.
@@ -327,27 +765,216 @@ class eSurgeLMEvalAdapter(LM):
             tokens: A list or tensor of token IDs.
 
         Returns:
-            The decoded string.
+            str: The decoded text string.
         """
         return self.tokenizer.decode(tokens)
 
-    def _model_call(self, inps):
-        """
-        This method is not directly used by eSurgeLMEvalAdapter but is required by the LM interface.
+    def _encode_text(self, text: str) -> list[int]:
+        """Encode text to token IDs using the tokenizer.
 
-        In our case, loglikelihood and greedy_until handle the model calls directly
-        by interacting with the `eSurge` instance.
+        Handles both dict-returning tokenizers and direct encode methods.
+
+        Args:
+            text: Text string to encode.
+
+        Returns:
+            list[int]: Token IDs as a list of integers.
+        """
+        try:
+            encoded = self.tokenizer(
+                text,
+                add_special_tokens=False,
+                return_attention_mask=False,
+            )
+            ids = encoded.get("input_ids", [])
+            if ids and isinstance(ids[0], list):
+                ids = ids[0]
+            return [int(t) for t in ids]
+        except Exception:
+            return [int(t) for t in self.tok_encode(text)]
+
+    def _loglikelihood_token_ids(
+        self,
+        context_token_ids: list[list[int]],
+        continuation_token_ids: list[list[int]],
+    ) -> list[tuple[float, bool]]:
+        """Compute log-likelihood of continuations given contexts.
+
+        Performs exact teacher-forced log-likelihood computation by running
+        the model on the concatenated context and continuation tokens.
+
+        Args:
+            context_token_ids: List of context token ID sequences.
+            continuation_token_ids: List of continuation token ID sequences.
+                Must have the same length as context_token_ids.
+
+        Returns:
+            List of (log_likelihood, is_greedy) tuples where:
+            - log_likelihood: Sum of log probabilities for continuation tokens
+            - is_greedy: True if the greedy prediction matches the continuation
 
         Raises:
-            NotImplementedError: This method is not implemented as it's not used.
+            RuntimeError: If the scoring model is not available.
+            ValueError: If inputs have different lengths or continuations exceed max_length.
+        """
+        if self.model is None:
+            raise RuntimeError("Scoring model is not available on the eSurge engine (missing `surge.runner.model`).")
+
+        if len(context_token_ids) != len(continuation_token_ids):
+            raise ValueError("context_token_ids and continuation_token_ids must have the same length")
+
+        pad_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = getattr(self.tokenizer, "eos_token_id", None)
+        if isinstance(pad_id, list):
+            pad_id = pad_id[0] if pad_id else 0
+        if pad_id is None:
+            pad_id = 0
+        pad_id = int(pad_id)
+
+        bos_id = getattr(self.tokenizer, "bos_token_id", None)
+        if isinstance(bos_id, list):
+            bos_id = bos_id[0] if bos_id else None
+        eos_id = getattr(self.tokenizer, "eos_token_id", None)
+        if isinstance(eos_id, list):
+            eos_id = eos_id[0] if eos_id else None
+
+        # Prepare (possibly truncated) token sequences (mirror lm-eval's causal logic).
+        # For causal scoring, we keep the full continuation (<= max_length) and truncate the context from the left so
+        # that `len(context)+len(continuation) <= max_length+1`. The model is run on `tokens[:-1]` (<= max_length).
+        inputs: list[list[int]] = []
+        targets: list[list[int]] = []
+        context_lens: list[int] = []
+        cont_lens: list[int] = []
+
+        for ctx, cont in zip(context_token_ids, continuation_token_ids, strict=False):
+            ctx_ids = [int(t) for t in (ctx or [])]
+            cont_ids = [int(t) for t in (cont or [])]
+
+            if not ctx_ids:
+                if bos_id is not None:
+                    ctx_ids = [int(bos_id)]
+                elif eos_id is not None:
+                    ctx_ids = [int(eos_id)]
+                else:
+                    ctx_ids = [pad_id]
+
+            if len(cont_ids) > self.max_length:
+                raise ValueError(
+                    f"Continuation is too long for scoring (len={len(cont_ids)}) with max_length={self.max_length}."
+                )
+
+            total_len = len(ctx_ids) + len(cont_ids)
+            if total_len > self.max_length + 1:
+                # Keep the full continuation and truncate context from the left.
+                drop = total_len - (self.max_length + 1)
+                if drop >= len(ctx_ids):
+                    raise ValueError(
+                        "Context truncation would drop the entire context; "
+                        f"got ctx={len(ctx_ids)}, cont={len(cont_ids)}, max_length={self.max_length}."
+                    )
+                ctx_ids = ctx_ids[drop:]
+
+            full = ctx_ids + cont_ids
+            if len(full) < 2:
+                # No next-token targets; score is trivially 0.
+                inputs.append([])
+                targets.append([])
+                context_lens.append(len(ctx_ids))
+                cont_lens.append(len(cont_ids))
+                continue
+
+            context_lens.append(len(ctx_ids))
+            cont_lens.append(len(cont_ids))
+
+            # Shift for next-token prediction.
+            inputs.append(full[:-1])
+            targets.append(full[1:])
+
+        results: list[tuple[float, bool]] = [(0.0, True) for _ in inputs]
+        scored_indices = [i for i, n in enumerate(cont_lens) if n > 0]
+        if not scored_indices:
+            return results
+
+        inputs_scored = [inputs[i] for i in scored_indices]
+        targets_scored = [targets[i] for i in scored_indices]
+        context_lens_scored = [context_lens[i] for i in scored_indices]
+        cont_lens_scored = [cont_lens[i] for i in scored_indices]
+
+        max_len = max((len(x) for x in inputs_scored), default=0)
+        if max_len < 1:
+            return results
+
+        input_rows: list[jax.Array] = []
+        target_rows: list[jax.Array] = []
+        mask_rows: list[jax.Array] = []
+        for ids, t_ids in zip(inputs_scored, targets_scored, strict=False):
+            ids_arr = jnp.asarray(ids, dtype=jnp.int32)
+            targets_arr = jnp.asarray(t_ids, dtype=jnp.int32)
+            valid_len = ids_arr.shape[0]
+            pad_len = max_len - valid_len
+
+            input_rows.append(jnp.pad(ids_arr, (0, pad_len), constant_values=pad_id))
+            target_rows.append(jnp.pad(targets_arr, (0, pad_len), constant_values=pad_id))
+            mask_rows.append(jnp.pad(jnp.ones((valid_len,), dtype=jnp.bool_), (0, pad_len), constant_values=False))
+
+        input_ids_jax = jnp.stack(input_rows, axis=0)
+        target_ids_jax = jnp.stack(target_rows, axis=0)
+        attention_mask_jax = jnp.stack(mask_rows, axis=0)
+
+        scoring_model = self._get_scoring_model()
+        scoring_logits_fn = self._get_scoring_logits_fn()
+        runner = getattr(self.surge, "runner", None)
+        mesh = getattr(runner, "mesh", None)
+        if mesh is None:
+            mesh = getattr(scoring_model, "mesh", None)
+
+        mesh_ctx = mesh if hasattr(mesh, "__enter__") and hasattr(mesh, "__exit__") else nullcontext()
+        with mesh_ctx:
+            logits = scoring_logits_fn(input_ids_jax, attention_mask_jax)
+        if logits is None:
+            raise RuntimeError("Model forward did not return logits; cannot compute loglikelihood.")
+
+        log_denom = logsumexp(logits, axis=-1)
+        selected = jnp.take_along_axis(logits, target_ids_jax[..., None], axis=-1).squeeze(-1)
+        token_logprobs = selected - log_denom
+
+        greedy_ids = jnp.argmax(logits, axis=-1)
+
+        positions = jnp.arange(max_len)[None, :]
+        start = (jnp.asarray(context_lens_scored) - 1)[:, None]
+        end = (jnp.asarray(context_lens_scored) - 1 + jnp.asarray(cont_lens_scored))[:, None]
+        score_mask = (positions >= start) & (positions < end) & attention_mask_jax
+
+        seq_loglikelihood = jnp.sum(jnp.where(score_mask, token_logprobs, 0.0), axis=-1)
+        seq_is_greedy = jnp.all(jnp.where(score_mask, greedy_ids == target_ids_jax, True), axis=-1)
+
+        for out_i, (ll, is_g) in enumerate(zip(seq_loglikelihood, seq_is_greedy, strict=False)):
+            results[scored_indices[out_i]] = (float(ll), bool(is_g))
+        return results
+
+    def _model_call(self, inps):
+        """Raw model call interface (not implemented).
+
+        This method is not directly used by eSurgeLMEvalAdapter but is
+        required by the LM interface. Generation is handled through
+        the eSurge engine instead.
+
+        Args:
+            inps: Input tensor.
+
+        Raises:
+            NotImplementedError: Always, as this adapter doesn't use
+                direct model calls.
         """
         raise NotImplementedError("eSurgeLMEvalAdapter doesn't use _model_call directly")
 
     def _model_generate(self, context, max_length, eos_token_id):
-        """Generate text from context.
+        """Raw model generation interface (not implemented).
 
-        This method is not directly used by eSurgeLMEvalAdapter but is required by the LM interface.
-        Generation is handled by the `_generate` and `generate_until` methods.
+        This method is not directly used by eSurgeLMEvalAdapter but is
+        required by the LM interface. Generation is handled by the
+        `_generate` and `generate_until` methods through eSurge.
 
         Args:
             context: The input context.
@@ -355,124 +982,132 @@ class eSurgeLMEvalAdapter(LM):
             eos_token_id: The end-of-sequence token ID.
 
         Raises:
-            NotImplementedError: This method is not implemented as it's not used.
+            NotImplementedError: Always, as this adapter doesn't use
+                direct model generation.
         """
         raise NotImplementedError("eSurgeLMEvalAdapter doesn't use _model_generate directly")
 
     def loglikelihood(self, instances):
-        """
-        Compute log-likelihood of completions given contexts.
+        """Compute log-likelihood of completions given contexts.
 
         This method is part of the lm-evaluation-harness LM interface.
-        It currently provides a placeholder implementation, especially for non-multiple-choice tasks.
+        It computes the exact teacher-forced log-likelihood of the
+        continuation tokens.
 
         Args:
             instances: List of Instance objects from lm-evaluation-harness.
-                       For multiple-choice tasks, instances are expected to have context and continuation.
+                For multiple-choice tasks, instances are expected to have
+                context and continuation as the first two arguments.
 
         Returns:
             List of (log_likelihood, is_greedy) tuples.
-                For multiple-choice tasks, log-likelihood is high if the extracted choice matches the continuation,
-                low otherwise. For other tasks, a placeholder value is returned.
         """
-        requests = []
+        requests: list[tuple[str, str]] = []
+
         for instance in instances:
-            if len(instance.arguments) >= 2:
-                context = instance.arguments[0]
-                continuation = instance.arguments[1]
-                requests.append((context, continuation))
+            if hasattr(instance, "arguments"):
+                arguments = instance.arguments
             else:
-                print(f"Warning: Invalid instance format: {instance}")
+                arguments = instance
+
+            if len(arguments) >= 2:
+                requests.append((str(arguments[0]), str(arguments[1])))
+            else:
+                logger.warning("Invalid loglikelihood instance format: %s", instance)
                 requests.append(("", ""))
-        contexts = [req[0] for req in requests]
-        continuations = [req[1] for req in requests]
 
-        is_mc_task = False
-        if contexts and len(contexts) > 0:
-            mc_pattern = r"[A-D]\.\s"
-            import re
-
-            if any(re.search(mc_pattern, ctx) for ctx in contexts):
-                is_mc_task = True
-
-        results = []
-
-        if is_mc_task:
-            choices = "ABCD"
-            max_tokens = 5
-            generations = self._generate(contexts, max_tokens=max_tokens)
-
-            for _i, (_, continuation, generation) in enumerate(zip(contexts, continuations, generations, strict=False)):
-                predicted_choice = self._extract_choice_from_generation(generation)
-
-                expected_choice = continuation.strip().upper()
-                if expected_choice and expected_choice[0] in choices:
-                    expected_choice = expected_choice[0]
-
-                log_likelihood = 0.0 if predicted_choice == expected_choice else -100.0
-                is_greedy = predicted_choice == expected_choice
-
-                results.append((log_likelihood, is_greedy))
-        else:
-            for _ in zip(contexts, continuations, strict=False):
-                results.append((-1.0, True))
+        results: list[tuple[float, bool]] = []
+        for chunk in _chunked(requests, self._batch_size):
+            ctx_ids = [self._encode_text(ctx) for ctx, _ in chunk]
+            cont_ids = [self._encode_text(cont) for _, cont in chunk]
+            results.extend(self._loglikelihood_token_ids(ctx_ids, cont_ids))
 
         return results
 
     def loglikelihood_rolling(self, instances):
-        """
-        Calculate log-likelihood of token sequences in a rolling fashion.
+        """Calculate log-likelihood of token sequences in a rolling fashion.
 
         This method is part of the lm-evaluation-harness LM interface.
-        It currently provides a placeholder implementation as actual rolling log-likelihood
-        calculation might not be directly supported by the current `eSurge` setup.
+        Used for computing perplexity on long documents by sliding a
+        window over the text.
 
         Args:
             instances: List of Instance objects from lm-evaluation-harness.
-                       Instances are expected to contain the token sequence as the first argument.
+                Instances contain either the raw string or a pre-tokenized
+                sequence.
 
         Returns:
-            List of lists of (loglikelihood, is_greedy) pairs, one inner list per instance.
-            Each inner list contains pairs for each token in the sequence (except the first).
-            Currently returns placeholder values.
+            List of rolling log-likelihoods (floats), one per instance.
         """
+        per_request_windows: list[tuple[int, list[int], list[int]]] = []
 
-        token_lists = []
-        for instance in instances:
-            if len(instance.arguments) >= 1 and isinstance(instance.arguments[0], list):
-                tokens = instance.arguments[0]
-                token_lists.append(tokens)
+        prefix = self.eot_token_id
+        max_seq_len = int(self.max_length)
+        context_len = 1  # matches lm-eval default for rolling perplexity
+
+        for req_idx, instance in enumerate(instances):
+            if hasattr(instance, "arguments"):
+                arguments = instance.arguments
             else:
-                print(f"Warning: Invalid instance format for rolling loglikelihood: {instance}")
-                token_lists.append([])
+                arguments = instance
 
-        results = []
+            if not arguments:
+                continue
 
-        for tokens in token_lists:
-            token_results = []
-            for _i in range(1, len(tokens)):
-                log_likelihood = -2.0
-                is_greedy = True
-                token_results.append((log_likelihood, is_greedy))
+            seq = arguments[0]
+            token_ids = [int(t) for t in seq] if isinstance(seq, list) else self.tok_encode(str(seq))
+            for ctx, cont in _get_rolling_token_windows(
+                token_ids,
+                prefix_token=int(prefix),
+                max_seq_len=max_seq_len,
+                context_len=context_len,
+            ):
+                ctx_disjoint, cont_disjoint = _make_disjoint_window(ctx, cont)
+                per_request_windows.append((req_idx, ctx_disjoint, cont_disjoint))
 
-            results.append(token_results)
+        if not instances:
+            return []
 
-        return results
+        totals = [0.0 for _ in range(len(instances))]
+        if not per_request_windows:
+            return totals
+
+        window_ctx = [w[1] for w in per_request_windows]
+        window_cont = [w[2] for w in per_request_windows]
+
+        for start in range(0, len(per_request_windows), self._batch_size):
+            batch_ctx = window_ctx[start : start + self._batch_size]
+            batch_cont = window_cont[start : start + self._batch_size]
+            batch_scores = self._loglikelihood_token_ids(batch_ctx, batch_cont)
+
+            for (req_idx, _ctx, _cont), (ll, _is_greedy) in zip(
+                per_request_windows[start : start + self._batch_size],
+                batch_scores,
+                strict=False,
+            ):
+                totals[req_idx] += float(ll)
+
+        return totals
 
     def greedy_until(self, requests):
-        """
-        Generate completions for prompts until a stop sequence is reached using greedy decoding.
+        """Generate completions using greedy decoding until stop sequences.
 
         This method is part of the lm-evaluation-harness LM interface.
-        It currently raises NotImplementedError as its functionality is covered by `generate_until`.
+        Uses temperature=0.0 for deterministic (greedy) generation.
 
         Args:
-            requests: List of (context, stopping_sequences) tuples.
+            requests: List of (context, stopping_sequences) tuples or
+                Instance objects from lm-evaluation-harness.
 
         Returns:
-            List of generated completions.
-
-        Raises:
-            NotImplementedError: This method is not implemented as `generate_until` provides similar functionality.
+            List of generated completion strings.
         """
-        raise NotImplementedError("eSurgeLMEvalAdapter doesn't use greedy_until directly, use generate_until")
+        prompts, stop_sequences = self._parse_instances(requests)
+        generations = self._generate(
+            prompts,
+            max_tokens=self.max_gen_toks,
+            temperature=0.0,
+            top_p=1.0,
+            stop_sequences=stop_sequences,
+        )
+        return self._maybe_normalize_math(generations, requests)
