@@ -155,33 +155,4 @@ class GlmConfig(EasyDeLBaseConfig):
         Returns:
             Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            # Column-wise Sharding (split output dimensions)
-            (r".*attn/.*(q_proj|k_proj|v_proj)/(?:base_module/)?kernel", pmag.resolve(ColumnWise)),
-            (r".*attn/.*(q_proj|k_proj|v_proj)/lora_b", pmag.resolve(ColumnWise)),
-            (r".*attn/.*(q_proj|k_proj|v_proj)/lora_a", pmag.resolve(Replicated)),
-            # MLP Up-Projections (split gate_proj/up_proj)
-            (r".*mlp/(gate_proj|up_proj)/(?:base_module/)?kernel", pmag.resolve(ColumnWise)),
-            (r".*mlp/(gate_proj|up_proj)/lora_b", pmag.resolve(ColumnWise)),
-            (r".*mlp/(gate_proj|up_proj)/lora_a", pmag.resolve(Replicated)),
-            # Embeddings
-            (r".*embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r".*embed_vision/embedding", pmag.resolve(ColumnWise)),
-            (r".*lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r".*vision_head/kernel", pmag.resolve(ColumnWise)),
-            # Row-wise Sharding (split input dimensions)
-            (r".*attn/o_proj/(?:base_module/)?kernel", pmag.resolve(RowWise)),
-            (r".*attn/o_proj/lora_a", pmag.resolve(RowWise)),
-            (r".*attn/o_proj/lora_b", pmag.resolve(Replicated)),
-            (r".*mlp/down_proj/(?:base_module/)?kernel", pmag.resolve(RowWise)),
-            (r".*mlp/down_proj/lora_a", pmag.resolve(RowWise)),
-            (r".*mlp/down_proj/lora_b", pmag.resolve(Replicated)),
-            (r".*score/kernel", pmag.resolve(RowWise)),
-            # Replicated Parameters
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*layernorm/scale", pmag.resolve(Replicated)),
-            (r".*rms_norm/scale", pmag.resolve(Replicated)),
-            (r".*norm/scale", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
