@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial, cached_property
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -398,18 +398,6 @@ class GlmModel(EasyDeLBaseModule):
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
-        )
-
-    @cached_property
-    def frequencies(self):
-        """Override to ensure frequency cache matches partial rotary dim for GLM.
-
-        The partial_rotary_factor is applied automatically by get_basic_frequencies.
-        """
-        head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
-        return self.config.get_basic_frequencies(
-            head_size=head_dim,
-            rotary_dim=head_dim,
         )
 
     def __call__(
