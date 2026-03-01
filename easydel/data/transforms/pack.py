@@ -93,7 +93,7 @@ class GreedyPacker:
         self._current_segment = 0
         self._source_ids: list[str] = []
 
-    def add(self, tokens: list[int], source_id: str | None = None) -> list[PackedSequence]:
+    def add(self, tokens: list[int], source_id: str | None = None) -> PackedSequence | None:
         """Add tokens to the packer.
 
         Args:
@@ -101,9 +101,9 @@ class GreedyPacker:
             source_id: Optional source identifier.
 
         Returns:
-            List of completed PackedSequences (may be empty).
+            PackedSequence if a full sequence is ready, None otherwise.
         """
-        results = []
+        result = None
 
         # Add tokens to buffer
         for tok in tokens:
@@ -113,7 +113,7 @@ class GreedyPacker:
 
             # Check if we have a full sequence
             if len(self._buffer) >= self.seq_length:
-                results.append(self._flush())
+                result = self._flush()
 
         # Add EOS and update segment
         if len(self._buffer) > 0:
@@ -126,9 +126,9 @@ class GreedyPacker:
 
         # Check if we hit the target length
         if len(self._buffer) >= self.seq_length:
-            results.append(self._flush())
+            result = self._flush()
 
-        return results
+        return result
 
     def _flush(self) -> PackedSequence:
         """Create a packed sequence from the current buffer."""
@@ -244,9 +244,9 @@ class PoolPacker:
                 best_idx = i
 
         # Add to best packer
-        packer_results = self._packers[best_idx].add(tokens, source_id)
-        if packer_results:
-            results.extend(packer_results)
+        result = self._packers[best_idx].add(tokens, source_id)
+        if result is not None:
+            results.append(result)
 
         return results
 
@@ -349,12 +349,6 @@ class FirstFitPacker:
         for bin_tokens, bin_segments, bin_sources in bins:
             # Pad if needed
             pad_len = self.seq_length - len(bin_tokens)
-            if pad_len < 0:
-                bin_tokens = bin_tokens[:self.seq_length]
-                if self.include_segment_ids and bin_segments is not None:
-                    bin_segments = bin_segments[:self.seq_length]
-                pad_len = 0
-            
             input_ids = np.array(bin_tokens + [self.pad_token_id] * pad_len, dtype=np.int32)
 
             attention_mask = np.ones(self.seq_length, dtype=np.int32)
