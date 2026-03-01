@@ -113,7 +113,7 @@ class GlmMLP(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
-        """Apply gated feedforward transformation.
+        """Apply SwiGLU feedforward transformation.
 
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden_dim]
