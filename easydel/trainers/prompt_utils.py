@@ -645,6 +645,7 @@ def keep_array_and_primitives(example: TListOrMapping) -> TListOrMapping:
     else:
         raise TypeError("Input must be a list or a dictionary.")
 
+
 def keep_arrays_map(
     example: dict[str, tp.Any],
     array_fields: list[str] | None = None,

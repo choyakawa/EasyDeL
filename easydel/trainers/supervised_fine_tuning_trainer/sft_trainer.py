@@ -150,7 +150,7 @@ class SFTTrainer(Trainer):
             tokenizer=self.processing_class,
             max_length=self.arguments.max_length,
             text_field=self._dataset_text_field or "text",
-            mask_prompt=getattr(self.arguments, "assistant_only_loss", False),
+            mask_prompt=getattr(self.arguments, "completion_only_loss", False),
             formatting_func=self._formatting_func,
         )
 
