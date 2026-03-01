@@ -170,6 +170,58 @@ class GlmAttention(UnifiedAttention):
             layer_idx=layer_idx,
         )
 
+    def _create_q_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Override to use bias=True for query projection."""
+        return ColumnParallelLinear(
+            config.hidden_size,
+            config.num_attention_heads * self.head_dim,
+            rngs=rngs,
+            use_bias=True,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+        )
+
+    def _create_k_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Override to use bias=True for key projection."""
+        return ColumnParallelLinear(
+            config.hidden_size,
+            config.num_key_value_heads * self.head_dim,
+            rngs=rngs,
+            use_bias=True,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+        )
+
+    def _create_v_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Override to use bias=True for value projection."""
+        return ColumnParallelLinear(
+            config.hidden_size,
+            config.num_key_value_heads * self.head_dim,
+            rngs=rngs,
+            use_bias=True,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+        )
+
+    def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Override to use bias=False for output projection."""
+        return RowParallelLinear(
+            config.num_attention_heads * self.head_dim,
+            config.hidden_size,
+            rngs=rngs,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+        )
+
     def _create_rotary(self, config, dtype):
         return config.get_basic_rope(
             dtype=dtype,
