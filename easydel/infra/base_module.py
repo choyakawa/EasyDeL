@@ -80,7 +80,6 @@ import flax.nnx
 import flax.struct
 import jax
 import jax.tree_util
-from eformer.common_types import Replicated
 from eformer.escale import make_shard_and_gather_fns, match_partition_rules
 from eformer.loggings import get_logger
 from flax import nnx as nn
@@ -1128,8 +1127,33 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             >>> custom_rules = [(".*kernel", ("fsdp", "tp"))]
             >>> rules = model._get_partition_rules(custom_rules)  # Uses provided
         """
+
+        def _normalize_rules_for_variable_leaves(rules: PartitionLike) -> PartitionLike:
+            normalized: list[tuple[str, tp.Any]] = []
+            for pattern, spec in rules:
+                if isinstance(pattern, str):
+                    # VariableState leaves in state/optimizer trees add a trailing
+                    # "/.../..." suffix after parameter names. Keep anchored
+                    # parameter regexes compatible with both raw parameter paths and
+                    # deeper state/optimizer value paths.
+                    if (
+                        pattern.endswith("(?:/.*)?$")
+                        or pattern.endswith("/.*$")
+                        or pattern.endswith("(?:/value)?$")
+                        or pattern.endswith("/value$")
+                    ):
+                        normalized_pattern = pattern
+                    elif pattern.endswith("$"):
+                        normalized_pattern = pattern[:-1] + r"(?:/.*)?$"
+                    else:
+                        normalized_pattern = pattern
+                else:
+                    normalized_pattern = pattern
+                normalized.append((normalized_pattern, spec))
+            return tuple(normalized)
+
         if partition_rules is not None:
-            return partition_rules
+            return _normalize_rules_for_variable_leaves(partition_rules)
 
         if not hasattr(self, "config"):
             raise ValueError("Partition rules must be provided either as an argument or through the model config.")
@@ -1142,9 +1166,9 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             rules = None
 
         if rules is None:
-            return self.resolve_shardings_automatically()
+            rules = self.resolve_shardings_automatically()
 
-        return rules
+        return _normalize_rules_for_variable_leaves(rules)
 
     def resolve_shardings_automatically(
         self,
@@ -1224,6 +1248,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                 _add_rule("", spec, prefix)
 
         def _generalize_numeric_path(pattern: str) -> str:
+            """Build a regex that matches both direct and optimizer-prefixed paths."""
             parts = pattern.split("/")
             regex_parts: list[str] = []
             for part in parts:
@@ -1231,7 +1256,10 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                     regex_parts.append(r"\d+")
                 else:
                     regex_parts.append(re.escape(part))
-            return "^" + "/".join(regex_parts) + "$"
+            # Optax state trees often prepend segments like "mu/", "nu/" or tuple-index
+            # wrappers before the original parameter path. Allow optional prefixes so
+            # auto-generated rules keep working for optimizer-state sharding.
+            return r"^(?:.*/)?" + "/".join(regex_parts) + r"$"
 
         seen: set[tuple[str, tp.Any]] = set()
         rules: list[tuple[str, tp.Any]] = []
@@ -1243,7 +1271,9 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             seen.add(key)
             rules.append((generalized, spec))
 
-        rules.append((".*", _resolve_spec(Replicated)))
+        # Explicit catch-all replication for any unmatched leaf path.
+        # Use empty PartitionSpec() to avoid rank-dependent ambiguity.
+        rules.append((".*", PartitionSpec()))
 
         return tuple(rules)
 
@@ -1509,13 +1539,15 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         shape_tree = nn.eval_shape(lambda: mock)
         partition_specs = match_partition_rules(self._get_partition_rules(partition_rules), shape_tree)
         partition_specs = jax.tree_util.tree_map(
-            lambda spec, shape: sanitize_partition_spec_for_shape(
-                spec=spec,
-                shape=tuple(shape.shape),
-                mesh=self.mesh,
-            )
-            if isinstance(spec, PartitionSpec) and hasattr(shape, "shape")
-            else spec,
+            lambda spec, shape: (
+                sanitize_partition_spec_for_shape(
+                    spec=spec,
+                    shape=tuple(shape.shape),
+                    mesh=self.mesh,
+                )
+                if isinstance(spec, PartitionSpec) and hasattr(shape, "shape")
+                else spec
+            ),
             partition_specs,
             shape_tree,
         )
@@ -1924,9 +1956,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
 
         rng = kwargs.get("rngs", flax.nnx.Rngs(44))
         lazy_model = cls.lazy_init(**kwargs)
-        partition_rules = lazy_model.config.get_partition_rules()
-        if partition_rules is None:
-            partition_rules = lazy_model.resolve_shardings_automatically()
+        partition_rules = lazy_model._get_partition_rules(None)
         for path, module in iter_module_search(lazy_model, (flax.nnx.Module, ArrayParam)):
             if not path:
                 continue
@@ -2858,10 +2888,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         for sub_cfg in EasyDeLBaseModule._recursive_config_children(config):
             sub_cfg_dict = getattr(sub_cfg, "__dict__", None)
             for key, value in updates.items():
-                if (
-                    (isinstance(sub_cfg_dict, dict) and key in sub_cfg_dict)
-                    or hasattr(type(sub_cfg), key)
-                ):
+                if (isinstance(sub_cfg_dict, dict) and key in sub_cfg_dict) or hasattr(type(sub_cfg), key):
                     try:
                         setattr(sub_cfg, key, value)
                     except AttributeError:
