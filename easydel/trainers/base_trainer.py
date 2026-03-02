@@ -587,69 +587,6 @@ class BaseTrainer(BaseTrainerProtocol):
         }
         path.write_text(json.dumps(payload, indent=2))
 
-    def _count_batches_from_source(
-        self,
-        source: "ShardedDataSource",
-        batch_size: int,
-        num_epochs: int = 1,
-        drop_remainder: bool = True,
-    ) -> int:
-        """Count the exact number of batches yielded by a source-backed loader."""
-        if batch_size <= 0:
-            raise ValueError("batch_size must be positive")
-
-        total_batches = 0
-        for _ in range(num_epochs):
-            batch_len = 0
-            for shard_name in source.shard_names:
-                for _example in source.open_shard(shard_name):
-                    batch_len += 1
-                    if batch_len >= batch_size:
-                        total_batches += 1
-                        batch_len = 0
-            if batch_len and not drop_remainder:
-                total_batches += 1
-        return total_batches
-
-    def _count_steps_until_raw_item_limit(
-        self,
-        source: "ShardedDataSource",
-        batch_size: int,
-        raw_item_limit: int,
-        num_epochs: int | None = None,
-        drop_remainder: bool = True,
-    ) -> int:
-        """Count exact optimizer steps until a raw-item budget is exhausted."""
-        if batch_size <= 0:
-            raise ValueError("batch_size must be positive")
-        if raw_item_limit <= 0:
-            return 0
-
-        total_batches = 0
-        consumed_items = 0
-        epoch = 0
-        while consumed_items < raw_item_limit:
-            if num_epochs is not None and epoch >= num_epochs:
-                break
-            epoch += 1
-
-            batch: list[dict[str, tp.Any]] = []
-            for shard_name in source.shard_names:
-                for example in source.open_shard(shard_name):
-                    batch.append(example)
-                    if len(batch) >= batch_size:
-                        total_batches += 1
-                        consumed_items += self._count_raw_progress_items_in_batch(batch) or len(batch)
-                        batch = []
-                        if consumed_items >= raw_item_limit:
-                            return total_batches
-            if batch and not drop_remainder:
-                total_batches += 1
-                consumed_items += self._count_raw_progress_items_in_batch(batch) or len(batch)
-                if consumed_items >= raw_item_limit:
-                    return total_batches
-        return total_batches
-
     def _is_default_num_train_epochs(self) -> bool:
         """Whether num_train_epochs still has its dataclass default value."""
         field_info = type(self.arguments).__dataclass_fields__["num_train_epochs"]
@@ -665,6 +602,64 @@ class BaseTrainer(BaseTrainerProtocol):
     def _raw_item_limit_active(self) -> bool:
         raw_limit = getattr(self.arguments, "max_training_raw_items", None)
         return raw_limit is not None and raw_limit > 0
+
+    def _resolve_configured_step_fallback(self, is_train: bool) -> int | None:
+        """Return configured step fallback when dataset length is unavailable."""
+        per_epoch_steps = (
+            self.arguments.per_epoch_training_steps if is_train else self.arguments.per_epoch_evaluation_steps
+        )
+        if per_epoch_steps is None:
+            return None
+        if not is_train:
+            return int(per_epoch_steps)
+        num_epochs = self._effective_train_epoch_limit()
+        if num_epochs is None:
+            return int(per_epoch_steps)
+        return int(per_epoch_steps) * int(num_epochs)
+
+    def _calculate_steps_without_scanning(self, dataset, *, is_train: bool) -> int:
+        """Resolve step counts without pre-iterating source-backed datasets."""
+        forced_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
+        if forced_steps is not None:
+            return int(forced_steps)
+
+        total_data_len = self._safe_len(dataset)
+        if total_data_len is not None:
+            batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
+            num_epochs = self.arguments.num_train_epochs if is_train else 1
+            return resolve_total_steps(
+                forced_steps=None,
+                total_data_len=total_data_len,
+                batch_size=batch_size,
+                num_epochs=num_epochs,
+                gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
+                is_train=is_train,
+            )
+
+        configured_steps = self._resolve_configured_step_fallback(is_train)
+        if configured_steps is not None:
+            return configured_steps
+
+        raise ValueError(
+            f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
+            "steps for a generator/streaming dataset."
+        )
+
+    def _estimate_training_steps_from_raw_item_limit(self, raw_item_limit: int, effective_train_epochs: int | None) -> int:
+        """Estimate training steps from a raw-item budget without scanning the dataset."""
+        if raw_item_limit <= 0:
+            return 0
+        capped_raw_items = int(raw_item_limit)
+        if self._raw_train_item_count is not None and effective_train_epochs is not None:
+            capped_raw_items = min(capped_raw_items, int(self._raw_train_item_count) * int(effective_train_epochs))
+        return resolve_total_steps(
+            forced_steps=None,
+            total_data_len=capped_raw_items,
+            batch_size=self.arguments.total_batch_size,
+            num_epochs=1,
+            gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
+            is_train=True,
+        )
 
     def _should_stop_training(self, current_step: int) -> bool:
         """Check whether any active training stop condition has been reached."""
@@ -2483,57 +2478,18 @@ class BaseTrainer(BaseTrainerProtocol):
                 read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=128),
             )
 
-        def calculate_steps(dataset, is_train: bool) -> int:
-            forced_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
-            total_data_len: int | None = None
-            if forced_steps is None:
-                try:
-                    total_data_len = len(dataset)
-                except TypeError as e:
-                    total_data_len = (
-                        self.arguments.per_epoch_training_steps
-                        if is_train
-                        else self.arguments.per_epoch_evaluation_steps
-                    )
-                    if total_data_len is None:
-                        raise ValueError(
-                            f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
-                            "steps for a generator/streaming dataset."
-                        ) from e
-
-            batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
-            num_epochs = self.arguments.num_train_epochs if is_train else 1
-            return resolve_total_steps(
-                forced_steps=forced_steps,
-                total_data_len=total_data_len,
-                batch_size=batch_size,
-                num_epochs=num_epochs,
-                gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
-                is_train=is_train,
-            )
-
         train_steps_source = self._train_source if self._train_source is not None else self.dataset_train
         effective_train_epochs = self._effective_train_epoch_limit()
         raw_item_limit = getattr(self.arguments, "max_training_raw_items", None)
         if self.arguments.max_training_steps is not None:
             max_training_steps = int(self.arguments.max_training_steps)
-        elif raw_item_limit is not None and self._train_source is not None:
-            max_training_steps = self._count_steps_until_raw_item_limit(
-                source=self._train_source,
-                batch_size=self.training_batch_size,
+        elif raw_item_limit is not None:
+            max_training_steps = self._estimate_training_steps_from_raw_item_limit(
                 raw_item_limit=int(raw_item_limit),
-                num_epochs=effective_train_epochs,
-                drop_remainder=True,
-            )
-        elif self._train_source is not None:
-            max_training_steps = self._count_batches_from_source(
-                source=self._train_source,
-                batch_size=self.training_batch_size,
-                num_epochs=effective_train_epochs or 1,
-                drop_remainder=True,
+                effective_train_epochs=effective_train_epochs,
             )
         else:
-            max_training_steps = calculate_steps(train_steps_source, is_train=True)
+            max_training_steps = self._calculate_steps_without_scanning(train_steps_source, is_train=True)
 
         # Use _train_source if available (has transforms applied)
         if self._train_source is not None:
@@ -2553,15 +2509,8 @@ class BaseTrainer(BaseTrainerProtocol):
             eval_steps_source = self._eval_source if self._eval_source is not None else self.dataset_eval
             if self.arguments.max_evaluation_steps is not None:
                 max_evaluation_steps = int(self.arguments.max_evaluation_steps)
-            elif self._eval_source is not None:
-                max_evaluation_steps = self._count_batches_from_source(
-                    source=self._eval_source,
-                    batch_size=self.evaluation_batch_size,
-                    num_epochs=1,
-                    drop_remainder=True,
-                )
             else:
-                max_evaluation_steps = calculate_steps(eval_steps_source, is_train=False)
+                max_evaluation_steps = self._calculate_steps_without_scanning(eval_steps_source, is_train=False)
             # Use _eval_source if available (has transforms applied)
             if self._eval_source is not None:
                 dataloader_eval = self._create_dataloader_from_source(
@@ -2691,48 +2640,6 @@ class BaseTrainer(BaseTrainerProtocol):
                 .as_numpy_iterator()
             )
 
-        def calculate_steps(dataset: Dataset | IterableDataset, is_train: bool) -> int:
-            """
-            Calculates the number of training or evaluation steps based on dataset length and arguments.
-
-            Args:
-              dataset (tp.Union[Dataset, IterableDataset]): The dataset to calculate steps for.
-              is_train (bool): Whether the dataset is for training.
-
-            Returns:
-              int: The number of steps.
-
-            Raises:
-              ValueError: If the dataset is a generator/streaming dataset and the number of steps is not specified.
-            """
-            forced_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
-            total_data_len: int | None = None
-            if forced_steps is None:
-                try:
-                    total_data_len = len(dataset)
-                except TypeError as e:
-                    total_data_len = (
-                        self.arguments.per_epoch_training_steps
-                        if is_train
-                        else self.arguments.per_epoch_evaluation_steps
-                    )
-                    if total_data_len is None:
-                        raise ValueError(
-                            f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
-                            "steps for a generator/streaming dataset."
-                        ) from e
-
-            batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
-            num_epochs = self.arguments.num_train_epochs if is_train else 1
-            return resolve_total_steps(
-                forced_steps=forced_steps,
-                total_data_len=total_data_len,
-                batch_size=batch_size,
-                num_epochs=num_epochs,
-                gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
-                is_train=is_train,
-            )
-
         def to_tf_dataloader(dataset: Dataset | IterableDataset, is_train: bool) -> collections.abc.Iterator[np.ndarray]:
             """
             Converts a Hugging Face Dataset to a TensorFlow dataloader.
@@ -2754,23 +2661,13 @@ class BaseTrainer(BaseTrainerProtocol):
         raw_item_limit = getattr(self.arguments, "max_training_raw_items", None)
         if self.arguments.max_training_steps is not None:
             max_training_steps = int(self.arguments.max_training_steps)
-        elif raw_item_limit is not None and self._train_source is not None:
-            max_training_steps = self._count_steps_until_raw_item_limit(
-                source=self._train_source,
-                batch_size=self.training_batch_size,
+        elif raw_item_limit is not None:
+            max_training_steps = self._estimate_training_steps_from_raw_item_limit(
                 raw_item_limit=int(raw_item_limit),
-                num_epochs=effective_train_epochs,
-                drop_remainder=True,
-            )
-        elif self._train_source is not None:
-            max_training_steps = self._count_batches_from_source(
-                source=self._train_source,
-                batch_size=self.training_batch_size,
-                num_epochs=effective_train_epochs or 1,
-                drop_remainder=True,
+                effective_train_epochs=effective_train_epochs,
             )
         else:
-            max_training_steps = calculate_steps(train_steps_source, is_train=True)
+            max_training_steps = self._calculate_steps_without_scanning(train_steps_source, is_train=True)
 
         # Use _train_source if available (has transforms applied)
         if self._train_source is not None:
@@ -2789,15 +2686,8 @@ class BaseTrainer(BaseTrainerProtocol):
             eval_steps_source = self._eval_source if self._eval_source is not None else self.dataset_eval
             if self.arguments.max_evaluation_steps is not None:
                 max_evaluation_steps = int(self.arguments.max_evaluation_steps)
-            elif self._eval_source is not None:
-                max_evaluation_steps = self._count_batches_from_source(
-                    source=self._eval_source,
-                    batch_size=self.evaluation_batch_size,
-                    num_epochs=1,
-                    drop_remainder=True,
-                )
             else:
-                max_evaluation_steps = calculate_steps(eval_steps_source, is_train=False)
+                max_evaluation_steps = self._calculate_steps_without_scanning(eval_steps_source, is_train=False)
             # Use _eval_source if available (has transforms applied)
             if self._eval_source is not None:
                 dataloader_eval = self._create_dataloader_from_source(
