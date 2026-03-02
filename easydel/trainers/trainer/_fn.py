@@ -110,7 +110,6 @@ def training_step(
         """
         if straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
-        import jax
         tree_other = jax.tree_util.tree_map(
             lambda x: jax.lax.stop_gradient(jax.numpy.asarray(x)) if hasattr(x, "shape") else x, 
             state.graphother
@@ -199,7 +198,6 @@ def evaluation_step(
         Returns:
             LossMetrics: The computed metrics from the loss function.
         """
-        import jax
         tree_other = jax.tree_util.tree_map(
             lambda x: jax.lax.stop_gradient(jax.numpy.asarray(x)) if hasattr(x, "shape") else x, 
             state.graphother
