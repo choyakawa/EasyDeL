@@ -20,7 +20,6 @@ from eformer.loggings import get_logger
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
-
 from easydel.utils import Registry
 
 from ..prompt_transforms import SFTPreprocessTransform
