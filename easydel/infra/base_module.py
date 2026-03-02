@@ -1235,25 +1235,17 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                 if pattern:
                     raw_rules.append((pattern, _resolve_spec(spec_value)))
 
-            def _process_spec_item(suffix: tp.Any, spec_value: tp.Any, prefix: str) -> None:
-                if isinstance(spec_value, dict):
-                    new_prefix = f"{prefix}/{suffix}" if prefix and suffix else str(suffix or prefix)
-                    for sub_suffix, sub_spec in spec_value.items():
-                        _process_spec_item(sub_suffix, sub_spec, new_prefix)
-                else:
-                    _add_rule(suffix, spec_value, prefix)
-
             if isinstance(spec, dict):
                 for suffix, spec_value in spec.items():
-                    _process_spec_item(suffix, spec_value, prefix)
+                    _add_rule(suffix, spec_value, prefix)
             elif isinstance(spec, (list, tuple)):
                 for item in spec:
                     if isinstance(item, tuple) and len(item) == 2:
-                        _process_spec_item(item[0], item[1], prefix)
+                        _add_rule(item[0], item[1], prefix)
                     else:
-                        _process_spec_item("", item, prefix)
+                        _add_rule("", item, prefix)
             else:
-                _process_spec_item("", spec, prefix)
+                _add_rule("", spec, prefix)
 
         def _generalize_numeric_path(pattern: str) -> str:
             """Build a regex that matches both direct and optimizer-prefixed paths."""

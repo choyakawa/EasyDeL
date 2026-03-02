@@ -488,10 +488,13 @@ def apply_lora_to_layers(
                         mesh=mesh,
                     )
                     
-                    # Also include base module's shardings as nested dict
+                    # Also include base module's shardings as flattened dict
                     if hasattr(bm, "craft_sharding"):
                         bm_specs = bm.craft_sharding(partition_manager=partition_manager, **_kwargs)
-                        if bm_specs:
+                        if isinstance(bm_specs, dict):
+                            for k, v in bm_specs.items():
+                                specs[f"base_module/{k}"] = v
+                        elif bm_specs:
                             specs["base_module"] = bm_specs
                             
                     return specs
