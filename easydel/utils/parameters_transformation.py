@@ -30,6 +30,7 @@ import numpy as np
 from eformer.loggings import get_logger
 from jax import dlpack
 from jax import numpy as jnp
+from jax.experimental import multihost_utils as mhutils
 from tqdm.autonotebook import tqdm
 
 from easydel.utils.helpers import check_bool_flag
@@ -131,35 +132,205 @@ class TensorConverter:
     @staticmethod
     def jax_to_pytorch(x: jax.Array) -> tp.Any:
         """Convert JAX array to PyTorch tensor."""
+        def _get_local_array(arr):
+            """Return an addressable local device array for multi-host safe transfer."""
+            try:
+                if getattr(arr, "is_fully_addressable", False):
+                    return arr
+            except Exception:
+                ...
+            try:
+                shards = getattr(arr, "addressable_shards", None)
+                if shards and len(shards) > 0:
+                    return shards[0].data
+            except Exception:
+                ...
+            return arr
+
+        # 更稳健的平台检测：优先使用已存在设备的平台集合
+        try:
+            device_platforms = {d.platform for d in jax.devices()}
+        except Exception:
+            device_platforms = set()
+        try:
+            default_backend = jax.default_backend()
+        except Exception:
+            default_backend = None
+
+        def _cpu_chunked_transfer(arr: jax.Array):
+            """Safely transfer possibly-large JAX array to torch via CPU in chunks to avoid HBM spikes.
+
+            Strategy:
+            - Always flatten to 1D on-device (reshape is cheap/view) to enable uniform chunking.
+            - Copy chunks of size <= EASYDEL_CHUNK_BYTES from device to host and stitch on CPU.
+            - Finally, reshape back to original shape on CPU and convert to torch.
+            """
+            import math
+            torch = TensorConverter.get_torch()
+            local = _get_local_array(arr)
+            shape = tuple(local.shape)
+            # Fast path for scalars/small tensors
+            total_elems = int(np.prod(shape)) if len(shape) > 0 else 1
+            dtype_np = np.dtype(str(local.dtype)) if isinstance(local.dtype, jnp.dtype) else local.dtype
+            if total_elems == 0:
+                return torch.from_numpy(np.array(jax.device_get(local)))
+
+            # Flatten to 1D for consistent chunking
+            local_1d = jnp.reshape(local, (total_elems,))
+            # Default 128MB per chunk on TPU unless overridden
+            chunk_bytes = int(os.getenv("EASYDEL_CHUNK_BYTES", str(128 * 1024 * 1024)))
+            bytes_per_elem = np.dtype(dtype_np).itemsize
+            elems_per_chunk = max(1, chunk_bytes // max(1, bytes_per_elem))
+
+            host_np_flat = np.empty((total_elems,), dtype=dtype_np)
+            for start in range(0, total_elems, elems_per_chunk):
+                end = min(total_elems, start + elems_per_chunk)
+                # Device to host for a flat slice to minimize transient allocations
+                chunk = jax.device_get(local_1d[start:end])
+                host_np_flat[start:end] = np.asarray(chunk, dtype=dtype_np)
+            host_np = host_np_flat.reshape(shape)
+            # torch.from_numpy 不支持 ml_dtypes.bfloat16，需转换
+            if str(dtype_np) in ("bfloat16", "bf16"):
+                return torch.from_numpy(host_np.astype(np.float32)).to(torch.bfloat16)
+            return torch.from_numpy(host_np)
+
+        # TPU 专用路径：使用多主机安全的全局收集，避免一次性在某个 TPU 上分配大缓冲
+        if ("tpu" in device_platforms) or (isinstance(default_backend, str) and default_backend.lower() == "tpu"):
+            host_np = TensorConverter.global_array_to_host_numpy(x, x.dtype)
+            torch = TensorConverter.get_torch()
+            if host_np is None:
+                # 非主进程不返回内容；这里返回一个占位 0 张量，调用方在主进程执行
+                return torch.zeros((), dtype=torch.float32)
+            if str(host_np.dtype) in ("bfloat16", "bf16"):
+                return torch.from_numpy(host_np.astype(np.float32)).to(torch.bfloat16)
+            return torch.from_numpy(host_np)
+
+        # CPU/GPU 平台或强制安全转移：走分块 CPU 转移，避免单次大拷贝
         if check_bool_flag("EASY_SAFE_TRANSFER", True):
-            x = jax.device_get(x)
-            return TensorConverter.get_torch().from_numpy(np.array(x.tolist(), dtype=x.dtype))
+            try:
+                return _cpu_chunked_transfer(x)
+            except Exception:
+                return _cpu_chunked_transfer(_get_local_array(x))
         else:
             from torch import cuda
             from torch.utils import dlpack as dlpack_pt
 
-            platform = jax.extend.backend.get_backend()
             cpu_force = not cuda.is_available()
 
+            def _to_dlpack_capsule(arr):
+                """Create a DLPack capsule from a JAX array, compatible with JAX >= 0.7."""
+                try:
+                    # Preferred path on modern JAX: use __dlpack__ on a local-addressable view
+                    _arr = _get_local_array(arr)
+                    return _arr.__dlpack__()
+                except Exception:
+                    # Fallback for older JAX versions
+                    if hasattr(dlpack, "to_dlpack"):
+                        try:
+                            return dlpack.to_dlpack(_get_local_array(arr))
+                        except Exception:
+                            ...
+                    # Last resort: host copy then try again
+                    host_arr = jax.device_get(_get_local_array(arr))
+                    return host_arr.__dlpack__() if hasattr(host_arr, "__dlpack__") else dlpack.to_dlpack(host_arr)
+
             if (
-                platform in ["cpu", "gpu"]
+                str(platform).lower() in ["cpu", "gpu"]
                 and not cpu_force
                 and not check_bool_flag("EASYDEL_FORCE_TORCH_USE_CPU", False)
             ):
-                dl_pack_jax = dlpack.to_dlpack(
-                    x,
-                    stream=True if (platform == "gpu" and not cpu_force) else None,
-                    src_device=next(iter(x.devices())),
-                )
+                capsule = _to_dlpack_capsule(x)
             else:
-                dl_pack_jax = dlpack.to_dlpack(
-                    jax.device_put(
-                        jax.device_get(x),
-                        jax.devices(EASYDEL_PERFRED_HOST_COPY)[EASYDEL_PERFRED_HOST_COPY_INDEX],
-                    ),
-                    stream=None,
+                y = jax.device_put(
+                    jax.device_get(_get_local_array(x)),
+                    jax.devices(EASYDEL_PERFRED_HOST_COPY)[EASYDEL_PERFRED_HOST_COPY_INDEX],
                 )
-            return dlpack_pt.from_dlpack(dl_pack_jax)
+                capsule = _to_dlpack_capsule(y)
+            return dlpack_pt.from_dlpack(capsule)
+
+    @staticmethod
+    def global_array_to_host_numpy(x: jax.Array, target_dtype: jnp.dtype) -> np.ndarray | None:
+        """Gather a potentially multi-host sharded JAX array into host numpy on process 0.
+
+        - On fully addressable arrays: simple device_get.
+        - On sharded arrays: gather addressable shards per process, all-gather across processes,
+          and assemble the full array on process 0 CPU. Other processes return None.
+        """
+        is_main = jax.process_index() == 0
+
+        # Fast path: already fully addressable
+        try:
+            if getattr(x, "is_fully_addressable", False):
+                host_arr = jax.device_get(x)
+                return np.asarray(host_arr, dtype=np.dtype(DtypeHandler.get_dtype(target_dtype)))
+        except Exception:
+            ...
+
+        # Sharded path: collect local shards
+        local_chunks: list[tuple[list[tuple[int, int]], np.ndarray]] = []
+        try:
+            shards = getattr(x, "addressable_shards", None)
+        except Exception:
+            shards = None
+
+        if shards is None or len(shards) == 0:
+            # Fallback: try to get a local view; may still fail if non-addressable
+            try:
+                host_arr = jax.device_get(x)
+                return np.asarray(host_arr, dtype=np.dtype(DtypeHandler.get_dtype(target_dtype)))
+            except Exception:
+                # As a last resort, return None on non-main to avoid crashes
+                return None if not is_main else np.asarray(
+                    jax.device_get(x.addressable_shards[0].data),
+                    dtype=np.dtype(DtypeHandler.get_dtype(target_dtype)),
+                )
+
+        for shard in shards:
+            idx_pairs: list[tuple[int, int]] = []
+            for dim, sl in enumerate(shard.index):
+                start = 0 if sl.start is None else int(sl.start)
+                stop = x.shape[dim] if sl.stop is None else int(sl.stop)
+                idx_pairs.append((start, stop))
+            chunk_np = np.asarray(
+                jax.device_get(shard.data),
+                dtype=np.dtype(DtypeHandler.get_dtype(target_dtype)),
+            )
+            local_chunks.append((idx_pairs, chunk_np))
+
+        # Cross-host gather (host-only). All processes must participate.
+        gathered: list[list[tuple[list[tuple[int, int]], np.ndarray]]] = mhutils.process_allgather(local_chunks)
+
+        if not is_main:
+            # Other processes do not assemble to save memory
+            return None
+
+        # Assemble on process 0
+        full_np = np.empty(x.shape, dtype=np.dtype(DtypeHandler.get_dtype(target_dtype)))
+        for proc_chunks in gathered:
+            for idx_pairs, chunk in proc_chunks:
+                # 兼容 (start, stop) 或 (start, stop, step) 或直接 slice 对象
+                slices_list = []
+                for item in idx_pairs:
+                    if isinstance(item, slice):
+                        s = item
+                    elif isinstance(item, (list, tuple)):
+                        if len(item) == 2:
+                            s = slice(item[0], item[1])
+                        elif len(item) >= 3:
+                            s = slice(item[0], item[1], item[2])
+                        else:
+                            s = slice(0, None)
+                    else:
+                        # 单值索引不预期，这里退化为范围 1 的切片
+                        try:
+                            idx_int = int(item)
+                            s = slice(idx_int, idx_int + 1)
+                        except Exception:
+                            s = slice(0, None)
+                    slices_list.append(s)
+                slices = tuple(slices_list)
+                full_np[slices] = chunk
+        return full_np
 
     @staticmethod
     def pytorch_to_jax(x: tp.Any) -> jnp.ndarray:
@@ -592,6 +763,13 @@ class StateDictConverter:
                     potential_key = f"{block_path}.experts.{moe_name}.kernel"
                     if potential_key in model_parameters:
                         stacked_moe_keys.add(potential_key)
+        # 准备逐参数 gather 函数（如果可用，用于确保张量是全局形状而非本地分片形状）
+        try:
+            gather_fns_tree = module._gather_fns  # type: ignore[attr-defined]
+            gather_fns = flatten_dict(gather_fns_tree, sep=".") if gather_fns_tree is not None else {}
+        except Exception:
+            gather_fns = {}
+
         torch_state_dict = {}
         with tqdm(model_parameters.items(), desc=f"Converting {module.__class__.__name__} to torch") as pbar:
             for key, tensor in pbar:
@@ -601,8 +779,12 @@ class StateDictConverter:
                     tensor = tensor.materialize()
                 if hasattr(tensor, "value") and hasattr(tensor.value, "materialize"):
                     tensor = tensor.value.materialize()
-                if tensor.dtype != DtypeHandler.get_dtype(dtype):
-                    tensor = tensor.astype(DtypeHandler.get_dtype(dtype))
+                # 尝试对单参数进行 gather，避免仅拿到本地分片（导致形状变成 1/N）
+                try:
+                    if key in gather_fns:
+                        tensor = gather_fns[key](tensor)
+                except Exception:
+                    ...
                 tensor = TensorConverter.jax_to_pytorch(jax.block_until_ready(tensor))
                 is_stacked_moe = key in stacked_moe_keys
 
@@ -730,8 +912,13 @@ class ModelConverter:
             if len(list(key_shape_checks.keys())) != len(list(state_dict.keys())):
                 warnings.warn("There might be an issue with converted `state_dict`.", stacklevel=1)
             for key, shape in key_shape_checks.items():
-                if state_dict[key].shape != shape:
+                if key not in state_dict:
+                    warnings.warn(f"Missing {key}.", stacklevel=1)
+                elif state_dict[key].shape != shape:
                     warnings.warn(f"Shape conflict at {key}.", stacklevel=1)
+            print("state_dict:")
+            for key in state_dict:
+                print(key)
             model.load_state_dict(state_dict, assign=True, strict=True)
 
         return model

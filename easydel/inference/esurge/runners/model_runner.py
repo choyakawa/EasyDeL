@@ -71,6 +71,7 @@ from jax import numpy as jnp
 
 from easydel.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
 
+from ..core.dp_sharding import dp_shard_for_page_id, dp_shard_page_bounds, pages_per_dp_shard
 from ..metrics import get_metrics_collector
 from ..outputs import ModelRunnerOutput
 from ..scheduler import SchedulerOutput
@@ -94,7 +95,9 @@ if typing.TYPE_CHECKING:
 logger = get_logger("eSurge")
 
 
-def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int, min_input_pad: int) -> int:  # pyright: ignore[reportUnusedFunction]
+def _get_padded_num_reqs_with_upper_limit(
+    x: int, upper_limit: int, min_input_pad: int
+) -> int:  # pyright: ignore[reportUnusedFunction]
     """Calculate padded request count for compilation efficiency.
 
     Pads the number of requests to powers of 2 (up to 8) or the nearest
@@ -295,6 +298,88 @@ class eSurgeRunner:
         self._pre_async_results: AsyncPreResults | None = None
         self._executor: typing.Any = None  # ThreadPoolExecutor, typed as Any to avoid circular import
         logger.debug("eSurgeRunner initialization complete")
+        self._log_startup_summary()
+
+    def _log_startup_summary(self) -> None:
+        """Log a consolidated startup summary showing model architecture, algorithms, cache config, and runtime info."""
+        try:
+            text_config = self.model.config.get_text_config()
+            model_type = getattr(text_config, "model_type", "unknown")
+            attn_mechanism = getattr(text_config, "attn_mechanism", "unknown")
+            num_layers = getattr(text_config, "num_hidden_layers", 0)
+            layer_types = getattr(text_config, "layer_types", None)
+            cache_info = None
+            try:
+                cache_info = self.model.get_operations_cache_info()
+            except Exception:
+                pass
+
+            rec_ops: set[str] = set()
+            if cache_info is not None and len(cache_info.layers) > 0:
+                for layer in cache_info.layers:
+                    if layer.is_recurrent_layer:
+                        rec_ops.add(layer.operation_name)
+                cache_type = cache_info.get_recommended_cache_type()
+            else:
+                cache_type = "paged"
+
+            if layer_types is not None:
+                from collections import Counter
+
+                type_counts = Counter(layer_types)
+                n_attn = sum(v for k, v in type_counts.items() if "full" in k or "sliding" in k)
+                n_linear = sum(v for k, v in type_counts.items() if "linear" in k)
+                n_parallel = type_counts.get("parallel_hybrid", 0)
+                n_other = num_layers - n_attn - n_linear - n_parallel
+
+                parts = []
+                if n_parallel:
+                    parts.append(f"{n_parallel} parallel attn+ssm")
+                if n_linear:
+                    parts.append(f"{n_linear} linear")
+                if n_attn:
+                    parts.append(f"{n_attn} full-attention")
+                if n_other:
+                    parts.append(f"{n_other} other")
+
+                has_recurrent = n_linear > 0 or n_parallel > 0
+                has_attention = n_attn > 0 or n_parallel > 0
+
+                if n_parallel and not n_attn and not n_linear:
+                    arch_desc = f"parallel_hybrid ({' + '.join(parts)} / {num_layers} layers)"
+                elif has_recurrent and has_attention:
+                    arch_desc = f"hybrid ({' + '.join(parts)} / {num_layers} layers)"
+                elif has_recurrent and not has_attention:
+                    arch_desc = f"recurrent ({' + '.join(parts)} / {num_layers} layers)"
+                else:
+                    arch_desc = f"attention ({num_layers} layers)"
+            elif num_layers > 0:
+                arch_desc = f"attention ({num_layers} layers)"
+            else:
+                arch_desc = "unknown"
+
+            algos = [f"attention={attn_mechanism}"]
+            if rec_ops:
+                algos.append(f"linear={', '.join(sorted(rec_ops))}")
+            algo_str = " | ".join(algos)
+
+            cache_parts = [f"type={cache_type}"]
+            if hasattr(self.metadata, "num_pages") and hasattr(self.metadata, "page_size"):
+                n_pages = int(self.metadata.num_pages)
+                p_size = int(self.metadata.page_size)
+                seq_cap = int((n_pages * p_size) / 1000)
+                cache_parts.append(f"pages={n_pages:,} ({p_size} tok/page)")
+                cache_parts.append(f"sequence_capacity={seq_cap:,}K")
+
+            lines = [
+                f"Model : {model_type}",
+                f"Architecture : {arch_desc}",
+                f"Algorithms : {algo_str}",
+                f"Cache : {' | '.join(cache_parts)}",
+            ]
+            logger.info("\n".join(lines))
+        except Exception as e:
+            logger.debug(f"Could not generate startup summary: {e}")
 
     @property
     def mesh(self):
@@ -618,8 +703,12 @@ class eSurgeRunner:
                 logger.debug(f"fill_slice skip ({pr_reqs}): {e}")
 
         try:
-            _ = swap_rows.lower(token_ids, jnp.int32(0), jnp.int32(1)).compile()  # pyright: ignore[reportFunctionMemberAccess]
-            _ = move_row.lower(token_ids, jnp.int32(0), jnp.int32(1)).compile()  # pyright: ignore[reportFunctionMemberAccess]
+            _ = swap_rows.lower(
+                token_ids, jnp.int32(0), jnp.int32(1)
+            ).compile()  # pyright: ignore[reportFunctionMemberAccess]
+            _ = move_row.lower(
+                token_ids, jnp.int32(0), jnp.int32(1)
+            ).compile()  # pyright: ignore[reportFunctionMemberAccess]
             logger.debug("swap_rows and move_row compiled")
         except Exception as e:
             logger.debug(f"swap_rows/move_row skip: {e}")
@@ -898,13 +987,15 @@ class eSurgeRunner:
             to ensure the runner's state matches the scheduler's decisions.
         """
         dp_size = int(getattr(self.metadata, "data_parallel_size", 1) or 1)
+        pages_per_shard_opt = pages_per_dp_shard(int(getattr(self.metadata, "num_pages", 0) or 0), dp_size)
         use_dp_local_rows = (
             dp_size > 1
             and int(self.sequence_buffer.max_num_reqs) > 0
             and int(self.sequence_buffer.max_num_reqs) % dp_size == 0
+            and pages_per_shard_opt is not None
         )
         rows_per_shard = int(self.sequence_buffer.max_num_reqs) // dp_size if use_dp_local_rows else 0
-        pages_per_shard = int(getattr(self.metadata, "num_pages", 0) or 0) // dp_size if use_dp_local_rows else 0
+        pages_per_shard = int(pages_per_shard_opt or 0) if use_dp_local_rows else 0
 
         def infer_req_shard(page_ids: tuple[list[int], ...]) -> int | None:
             if not use_dp_local_rows or pages_per_shard <= 0:
@@ -915,7 +1006,9 @@ class eSurgeRunner:
                     # 0 is reserved for null/padding page in page pool.
                     if int(pid) <= 0:
                         continue
-                    shard = min(int(pid) // pages_per_shard, dp_size - 1)
+                    shard = dp_shard_for_page_id(int(pid), pages_per_shard, dp_size)
+                    if shard is None:
+                        continue
                     if inferred is None:
                         inferred = shard
                     elif inferred != shard:
@@ -933,15 +1026,22 @@ class eSurgeRunner:
             if req_index is not None:
                 removed_req_indices.append(req_index)
 
-        # 3) Remove unscheduled requests from buffer
-        scheduled_req_ids = set(scheduler_output.num_scheduled_tokens.keys())
-        cached_req_ids = set(self.sequence_buffer.req_id_to_index.keys())
-        unscheduled_req_ids = cached_req_ids - scheduled_req_ids
-        for req_id in unscheduled_req_ids:
+        # 3) Remove preempted requests from buffer.
+        # Only remove requests the scheduler explicitly preempted (evicted from
+        # running to waiting). Running requests that were merely skipped due to
+        # token budget exhaustion still hold valid rows and pages — removing them
+        # would force re-insertion next cycle and trigger "No free sequence row
+        # in target DP shard" errors when shard rows are full.
+        for req_id in scheduler_output.preempted_req_ids:
             req_index = self.sequence_buffer.remove_request(req_id)
             if req_index is not None:
                 removed_req_indices.append(req_index)
                 removed_req_index_by_id[req_id] = req_index
+
+        # 3b) Clear recurrent/SSM state for freed slots so the next request
+        # assigned to the same slot starts from a clean state.
+        if removed_req_indices:
+            self.executor_manager.clear_recurrent_slots(removed_req_indices)
 
         # 4) Add new requests to tracking
         req_ids_to_add: list[str] = []
@@ -1093,7 +1193,7 @@ class eSurgeRunner:
                 req_state.prefill_visual_pos_masks = None
                 req_state.prefill_deepstack_visual_embeds = None
 
-        has_changes = len(unscheduled_req_ids) > 0 or len(req_ids_to_add) > 0
+        has_changes = len(scheduler_output.preempted_req_ids) > 0 or len(req_ids_to_add) > 0
         return has_changes
 
     def _modify_prev_results(self) -> None:
@@ -1240,6 +1340,76 @@ class eSurgeRunner:
                 i += 1
                 j -= 1
 
+    def _reorder_decode_first_per_shard(
+        self,
+        scheduler_output: SchedulerOutput,
+        dp_size: int,
+    ) -> None:
+        """Reorder decode requests first within each DP shard's row range.
+
+        Unlike _reorder_decode_first which reorders across the entire buffer
+        (and would move requests across shard boundaries), this method
+        reorders decode-first independently within each shard's contiguous
+        row range: [shard * rows_per_shard, (shard+1) * rows_per_shard).
+
+        This preserves DP-local row placement while giving each shard's
+        rows the decode-first ordering that the v3 attention kernel expects.
+
+        Args:
+            scheduler_output: Used to determine scheduled tokens per request.
+            dp_size: Number of data-parallel shards.
+        """
+        # Use max_num_reqs (not num_slots) for shard boundaries to match
+        # _update_states and the validation in batch_preparer, which both
+        # partition rows based on the fixed max_num_reqs capacity.
+        max_reqs = self.sequence_buffer.max_num_reqs
+        if max_reqs <= 1 or dp_size <= 1:
+            return
+        rows_per_shard = max_reqs // dp_size
+        if rows_per_shard <= 1 or max_reqs % dp_size != 0:
+            return
+
+        num_slots = self.sequence_buffer.num_slots
+        for shard in range(dp_size):
+            lo = shard * rows_per_shard
+            hi = min(lo + rows_per_shard, num_slots)
+
+            # 1) Compact holes (None slots) to the end of the shard range.
+            #    This ensures the attention kernel never encounters a 0-token
+            #    row in the middle of its processing range.
+            self.sequence_buffer.compact_holes_in_range(lo, hi)
+
+            # 2) Decode-first partitioning on the compacted (hole-free) prefix.
+            #    Find the boundary between non-None rows and holes.
+            shard_end = hi
+            while shard_end > lo and (
+                shard_end - 1 >= len(self.sequence_buffer.req_ids) or self.sequence_buffer.req_ids[shard_end - 1] is None
+            ):
+                shard_end -= 1
+
+            i, j = lo, shard_end - 1
+            while i < j:
+                i_req_id = self.sequence_buffer.req_ids[i]
+                j_req_id = self.sequence_buffer.req_ids[j]
+
+                i_is_decode = (
+                    scheduler_output.num_scheduled_tokens.get(i_req_id, 0) == 1
+                    and self.sequence_buffer.num_computed_tokens[i] > 0
+                )
+                j_is_decode = (
+                    scheduler_output.num_scheduled_tokens.get(j_req_id, 0) == 1
+                    and self.sequence_buffer.num_computed_tokens[j] > 0
+                )
+
+                if i_is_decode:
+                    i += 1
+                elif not j_is_decode:
+                    j -= 1
+                else:
+                    self.sequence_buffer.swap_states(i, j)
+                    i += 1
+                    j -= 1
+
     def _execute_model_impl(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         """Execute the model on scheduled requests.
 
@@ -1286,8 +1456,11 @@ class eSurgeRunner:
 
         # Align ordering with TPU runner: decode requests first.
         dp_size = int(getattr(self.metadata, "data_parallel_size", 1) or 1)
-        if self.sequence_buffer.num_reqs > 1 and dp_size <= 1:
-            self._reorder_decode_first(scheduler_output)
+        if self.sequence_buffer.num_reqs > 1:
+            if dp_size <= 1:
+                self._reorder_decode_first(scheduler_output)
+            else:
+                self._reorder_decode_first_per_shard(scheduler_output, dp_size)
 
         if not scheduler_output.total_num_scheduled_tokens:
             return ModelRunnerOutput(
@@ -1508,9 +1681,10 @@ class eSurgeRunner:
             if dp_size > 1:
                 total_pages = int(getattr(self.metadata, "num_pages", 0) or 0)
                 page_size = max(1, int(getattr(self.metadata, "page_size", 1)))
-                if total_pages > 0 and total_pages % dp_size == 0 and self.num_reqs_max_model_len % dp_size == 0:
+                pages_per_shard_opt = pages_per_dp_shard(total_pages, dp_size)
+                if pages_per_shard_opt is not None and self.num_reqs_max_model_len % dp_size == 0:
                     rows_per_shard = self.num_reqs_max_model_len // dp_size
-                    pages_per_shard = total_pages // dp_size
+                    pages_per_shard = int(pages_per_shard_opt)
                     for local_req_idx in range(num_reqs):
                         seq_len = int(self.sequence_buffer.num_computed_tokens[start_index + local_req_idx]) + int(
                             scheduled_list[local_req_idx]
@@ -1524,8 +1698,7 @@ class eSurgeRunner:
                             continue
                         global_req_idx = start_index + local_req_idx
                         req_shard = min(global_req_idx // rows_per_shard, dp_size - 1)
-                        page_lo = req_shard * pages_per_shard
-                        page_hi = page_lo + pages_per_shard
+                        page_lo, page_hi = dp_shard_page_bounds(req_shard, pages_per_shard)
                         invalid = row[(row < page_lo) | (row >= page_hi)]
                         if invalid.size:
                             req_id_dbg = req_ids_window[local_req_idx]

@@ -440,7 +440,7 @@ class BaseTrainerCfg(TypedDict, total=False):
     backend: NotRequired[str | None]
     auto_shard_states: NotRequired[bool]
     performance_mode: NotRequired[bool]
-    track_memory: NotRequired[bool | float]
+    track_memory: NotRequired[bool]
     low_mem_usage: NotRequired[bool]
     quantization_mode: NotRequired[Literal["nf4", "affine", "mxfp8", "nvfp8", "mxfp4", "nvfp4"] | None]
     quantization_group_size: NotRequired[int | None]

@@ -87,8 +87,10 @@ from jax import numpy as jnp
 
 from easydel.caching import (
     HybridCache,
+    ParallelHybridCacheView,
     RaggedPagesCache,
     RaggedPagesCacheConfig,
+    RecurrentCacheView,
     UnifiedAttentionCache,
     UnifiedAttentionCacheConfig,
 )
@@ -394,7 +396,10 @@ class ExecutionManager:
         if metadata is None:
             raise ValueError("ExecutionManager requires a paged cache config `metadata`.")
 
-        logger.info(f"initializing eSurge-ExecutionManager {model.config.get_text_config().attn_mechanism}")
+        _attn_mech = model.config.get_text_config().attn_mechanism
+        _cache_ver = metadata.version
+        _max_tok = max_num_tokens if max_num_tokens is not None else max_model_len
+        logger.info(f"initializing eSurge-ExecutionManager {_attn_mech} (cache={_cache_ver}, max_tokens={_max_tok})")
         self.model = model
         self.mesh = model.mesh
 
@@ -790,6 +795,58 @@ class ExecutionManager:
         self.kv_pages = outputs.kv_pages
         return outputs
 
+    def clear_recurrent_slots(self, slot_indices: list[int]) -> None:
+        """Zero out recurrent/SSM state for freed request slots.
+
+        When a request finishes, its conv_state and recurrent_state must be
+        cleared so the next request assigned to the same slot starts from a
+        clean state.  Only layers with RecurrentCacheView (or
+        ParallelHybridCacheView wrapping one) are affected.
+        """
+        if not slot_indices:
+            return
+        cache = self.kv_pages
+        if not isinstance(cache, HybridCache):
+            return
+
+        changed = False
+        new_views = list(cache.views)
+        for idx, view in enumerate(new_views):
+            rec = None
+            if isinstance(view, RecurrentCacheView):
+                rec = view
+            elif isinstance(view, ParallelHybridCacheView) and view.recurrent is not None:
+                rec = view.recurrent
+            else:
+                continue
+
+            new_conv = rec.conv_state
+            new_rec = rec.recurrent_state
+            slot_arr = jnp.array(slot_indices, dtype=jnp.int32)
+            # Build mask once — conv_state and recurrent_state share the batch dim.
+            n_slots = new_conv.shape[0] if new_conv is not None else (new_rec.shape[0] if new_rec is not None else 0)
+            if n_slots == 0:
+                continue
+            keep_mask = jnp.ones(n_slots, dtype=jnp.bool_).at[slot_arr].set(False)
+            if new_conv is not None:
+                new_conv = jnp.where(keep_mask.reshape(-1, *([1] * (new_conv.ndim - 1))), new_conv, 0)
+            if new_rec is not None:
+                new_rec = jnp.where(keep_mask.reshape(-1, *([1] * (new_rec.ndim - 1))), new_rec, 0)
+
+            new_recurrent = rec.replace(conv_state=new_conv, recurrent_state=new_rec)
+            if isinstance(view, ParallelHybridCacheView):
+                new_views[idx] = view.replace(
+                    recurrent=new_recurrent,
+                    conv_state=new_conv,
+                    recurrent_state=new_rec,
+                )
+            else:
+                new_views[idx] = new_recurrent
+            changed = True
+
+        if changed:
+            self.kv_pages = HybridCache(views=new_views)
+
     def sample_tokens(
         self,
         num_tokens: int,
@@ -889,15 +946,14 @@ class ExecutionManager:
                     f"Compiling [{compilation_count + 1}/{total_compilations}]: {num_tokens:5d} tokens, "
                     f"{reqs_padd:2d} padded requests",
                 )
-                if not reqs_padd > num_tokens:
-                    self._step_compile(
-                        num_tokens=num_tokens,
-                        num_reqs_max_model_len=num_reqs_max_model_len,
-                        max_pages_per_req=max_pages_per_req,
-                        max_num_reqs=max_num_reqs,
-                        padded_num_reqs=reqs_padd,
-                        metadata=metadata,
-                    )
+                self._step_compile(
+                    num_tokens=num_tokens,
+                    num_reqs_max_model_len=num_reqs_max_model_len,
+                    max_pages_per_req=max_pages_per_req,
+                    max_num_reqs=max_num_reqs,
+                    padded_num_reqs=reqs_padd,
+                    metadata=metadata,
+                )
                 compilation_count += 1
         progress.complete(f"All {total_compilations} compilations completed")
 

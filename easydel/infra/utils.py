@@ -445,18 +445,67 @@ def apply_lora_to_layers(
         for path, _ in iter_module_search(model, ParallelLinear):
             if pattern.search(".".join([str(p) for p in path])):
                 base_module: ParallelLinear = get_module_from_path(model=model, path=path)
+                lora_module = nn.LoRA(
+                    base_module=base_module,
+                    rngs=rngs,
+                    dtype=base_module.dtype,
+                    param_dtype=base_module.param_dtype,
+                    in_features=base_module.in_features,
+                    lora_rank=lora_rank,
+                    out_features=base_module.out_features,
+                )
+                
+                # Dynamically attach a craft_sharding hook based on the parent's direction
+                def _lora_craft_sharding(self, *, partition_manager=None, **_kwargs):
+                    from eformer.common_types import ColumnWise, RowWise, Replicated
+                    from easydel.layers._sharding import resolve_safe_sharding
+                    
+                    specs = {}
+                    bm = getattr(self, "base_module", None)
+                    if bm is None:
+                        return specs
+                        
+                    direction = getattr(bm, "_direction", None)
+                    mesh = _kwargs.get("mesh")
+                    
+                    if direction == "row":
+                        lora_a_spec, lora_b_spec = RowWise, Replicated
+                    elif direction == "column":
+                        lora_a_spec, lora_b_spec = Replicated, ColumnWise
+                    else:
+                        lora_a_spec, lora_b_spec = Replicated, Replicated
+                        
+                    specs["lora_a"] = resolve_safe_sharding(
+                        axes=lora_a_spec,
+                        shape=tuple(self.lora_a.value.shape),
+                        partition_manager=partition_manager,
+                        mesh=mesh,
+                    )
+                    specs["lora_b"] = resolve_safe_sharding(
+                        axes=lora_b_spec,
+                        shape=tuple(self.lora_b.value.shape),
+                        partition_manager=partition_manager,
+                        mesh=mesh,
+                    )
+                    
+                    # Also include base module's shardings as flattened dict
+                    if hasattr(bm, "craft_sharding"):
+                        bm_specs = bm.craft_sharding(partition_manager=partition_manager, **_kwargs)
+                        if isinstance(bm_specs, dict):
+                            for k, v in bm_specs.items():
+                                specs[f"base_module/{k}"] = v
+                        elif bm_specs:
+                            specs["base_module"] = bm_specs
+                            
+                    return specs
+
+                import types
+                lora_module.craft_sharding = types.MethodType(_lora_craft_sharding, lora_module)
+
                 set_module_from_path(
                     model=model,
                     path=path,
-                    new_value=nn.LoRA(
-                        base_module=base_module,
-                        rngs=rngs,
-                        dtype=base_module.dtype,
-                        param_dtype=base_module.param_dtype,
-                        in_features=base_module.in_features,
-                        lora_rank=lora_rank,
-                        out_features=base_module.out_features,
-                    ),
+                    new_value=lora_module,
                 )
             pbar.update(1)
 
@@ -1243,12 +1292,26 @@ class AttnMaskType(StrEnum):
     FULL = "ATTN_MASK_FULL"
     SLIDING = "ATTN_MASK_SLIDING"
     CHUNK = "ATTN_MASK_CHUNK"
+    LINEAR = "ATTN_MASK_LINEAR"
 
     @classmethod
-    def from_hf(cls, hf_type: tp.Literal["sliding_attention", "full_attention", "chunk_attention", "chunked_attention"]):
+    def from_hf(
+        cls,
+        hf_type: tp.Literal[
+            "sliding_attention",
+            "full_attention",
+            "chunk_attention",
+            "chunked_attention",
+            "linear_attention",
+            "parallel_hybrid",
+        ],
+    ):
         if hf_type == "sliding_attention":
             return AttnMaskType.SLIDING
-        elif hf_type == "full_attention":
+        elif hf_type in ("full_attention", "linear_attention", "parallel_hybrid"):
+            # eSurge cache grouping is page-table based; linear attention layers
+            # and parallel hybrid layers (attention+SSM) are treated as
+            # full-attention groups for scheduler compatibility.
             return AttnMaskType.FULL
         elif hf_type in ["chunk_attention", "chunked_attention"]:
             return AttnMaskType.CHUNK

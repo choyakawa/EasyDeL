@@ -93,14 +93,27 @@ class GlmMLP(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.gate_up_proj = column_parallel_linear(config.hidden_size, 2 * config.intermediate_size)
-        self.down_proj = row_parallel_linear(config.intermediate_size, config.hidden_size)
+        self.gate_proj = column_parallel_linear(
+            config.hidden_size,
+            config.intermediate_size,
+            rngs=rngs,
+        )
+        self.down_proj = row_parallel_linear(
+            config.intermediate_size,
+            config.hidden_size,
+            rngs=rngs,
+        )
+        self.up_proj = column_parallel_linear(
+            config.hidden_size,
+            config.intermediate_size,
+            rngs=rngs,
+        )
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
-        """Apply gated feedforward transformation.
+        """Apply SwiGLU feedforward transformation.
 
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden_dim]
@@ -113,15 +126,15 @@ class GlmMLP(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        gate_up_states = checkpoint_name(self.gate_up_proj(hidden_states), name="mlp_gate_up")
-        gate, up_states = jnp.split(gate_up_states, 2, axis=-1)
-        hidden_states = checkpoint_name(self.down_proj(up_states * self.act_fn(gate)), name="mlp_down")
+        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
+        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        return hidden_states
+        return checkpoint_name(hidden_states, "mlp_output")
 
 
 class GlmAttention(UnifiedAttention):
@@ -155,6 +168,67 @@ class GlmAttention(UnifiedAttention):
             precision=precision,
             rngs=rngs,
             layer_idx=layer_idx,
+        )
+
+    def _create_q_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Override to use bias=True for query projection."""
+        return ColumnParallelLinear(
+            config.hidden_size,
+            config.num_attention_heads * self.head_dim,
+            rngs=rngs,
+            use_bias=True,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+        )
+
+    def _create_k_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Override to use bias=True for key projection."""
+        return ColumnParallelLinear(
+            config.hidden_size,
+            config.num_key_value_heads * self.head_dim,
+            rngs=rngs,
+            use_bias=True,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+        )
+
+    def _create_v_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Override to use bias=True for value projection."""
+        return ColumnParallelLinear(
+            config.hidden_size,
+            config.num_key_value_heads * self.head_dim,
+            rngs=rngs,
+            use_bias=True,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+        )
+
+    def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Override to use bias=False for output projection."""
+        return RowParallelLinear(
+            config.num_attention_heads * self.head_dim,
+            config.hidden_size,
+            rngs=rngs,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+        )
+
+    def _create_rotary(self, config, dtype):
+        return config.get_basic_rope(
+            dtype=dtype,
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,
+            base=getattr(config, "rope_theta", 100000000.0),
+            is_neox_style=False,
         )
 
 

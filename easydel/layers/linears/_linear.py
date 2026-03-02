@@ -367,7 +367,7 @@ class ParallelLinear(nn.Module):
                 mesh=mesh,
             )
         }
-        if self.use_bias:
+        if self.use_bias and self.bias is not None and self.bias.value is not None:
             specs["bias"] = resolve_safe_sharding(
                 axes=Replicated,
                 shape=tuple(self.bias.value.shape),

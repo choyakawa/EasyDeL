@@ -218,7 +218,7 @@ class PagedFlashAttn(OperationImpl):
             logits_soft_cap=logits_soft_cap,
             normalize_output=normalize_output,
             precision=precision,
-            logits_dtype=jnp.bfloat16,
+            # logits_dtype=jnp.bfloat16,
             cfg=self.metadata.get_operation_config("paged_flash_attention"),
             mesh=self.metadata.mesh,
             in_specs=(
