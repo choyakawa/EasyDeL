@@ -141,22 +141,22 @@ class RunTimeConfig:
             )
 
 
-    # Pre-parse track_memory to bypass DataClassArgumentParser Union constraint
-    track_memory_val = False
-    if "--track_memory" in sys.argv:
-        idx = sys.argv.index("--track_memory")
-        if idx + 1 < len(sys.argv):
-            val = sys.argv.pop(idx + 1)
-            sys.argv.pop(idx)
-            try:
-                track_memory_val = float(val) if not val.lower() in ("true", "false", "1", "0") else val.lower() in ("true", "1")
-            except ValueError:
-                pass
+# Pre-parse track_memory to bypass DataClassArgumentParser Union constraint
+track_memory_val = False
+if "--track_memory" in sys.argv:
+    idx = sys.argv.index("--track_memory")
+    if idx + 1 < len(sys.argv):
+        val = sys.argv.pop(idx + 1)
+        sys.argv.pop(idx)
+        try:
+            track_memory_val = float(val) if not val.lower() in ("true", "false", "1", "0") else val.lower() in ("true", "1")
+        except ValueError:
+            pass
 
-    parser = DataClassArgumentParser((ed.SFTConfig, RunTimeConfig))
-    sft_config, runtime_config = parser.parse_args_into_dataclasses()
+parser = DataClassArgumentParser((ed.SFTConfig, RunTimeConfig))
+sft_config, runtime_config = parser.parse_args_into_dataclasses()
 
-    sft_config.track_memory = track_memory_val
+sft_config.track_memory = track_memory_val
 
 
 runtime_config: RunTimeConfig
