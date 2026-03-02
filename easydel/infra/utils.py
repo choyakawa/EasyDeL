@@ -445,18 +445,64 @@ def apply_lora_to_layers(
         for path, _ in iter_module_search(model, ParallelLinear):
             if pattern.search(".".join([str(p) for p in path])):
                 base_module: ParallelLinear = get_module_from_path(model=model, path=path)
+                lora_module = nn.LoRA(
+                    base_module=base_module,
+                    rngs=rngs,
+                    dtype=base_module.dtype,
+                    param_dtype=base_module.param_dtype,
+                    in_features=base_module.in_features,
+                    lora_rank=lora_rank,
+                    out_features=base_module.out_features,
+                )
+                
+                # Dynamically attach a craft_sharding hook based on the parent's direction
+                def _lora_craft_sharding(self, *, partition_manager=None, **_kwargs):
+                    from eformer.escale import ColumnWise, RowWise
+                    from easydel.layers._sharding import resolve_safe_sharding
+                    
+                    specs = {}
+                    bm = getattr(self, "base_module", None)
+                    if bm is None:
+                        return specs
+                        
+                    direction = getattr(bm, "_direction", None)
+                    mesh = _kwargs.get("mesh")
+                    
+                    if direction == "row":
+                        lora_a_spec, lora_b_spec = RowWise, Replicated
+                    elif direction == "column":
+                        lora_a_spec, lora_b_spec = Replicated, ColumnWise
+                    else:
+                        lora_a_spec, lora_b_spec = Replicated, Replicated
+                        
+                    specs["lora_a"] = resolve_safe_sharding(
+                        axes=lora_a_spec,
+                        shape=tuple(self.lora_a.value.shape),
+                        partition_manager=partition_manager,
+                        mesh=mesh,
+                    )
+                    specs["lora_b"] = resolve_safe_sharding(
+                        axes=lora_b_spec,
+                        shape=tuple(self.lora_b.value.shape),
+                        partition_manager=partition_manager,
+                        mesh=mesh,
+                    )
+                    
+                    # Also include base module's shardings as nested dict
+                    if hasattr(bm, "craft_sharding"):
+                        bm_specs = bm.craft_sharding(partition_manager=partition_manager, **_kwargs)
+                        if bm_specs:
+                            specs["base_module"] = bm_specs
+                            
+                    return specs
+
+                import types
+                lora_module.craft_sharding = types.MethodType(_lora_craft_sharding, lora_module)
+
                 set_module_from_path(
                     model=model,
                     path=path,
-                    new_value=nn.LoRA(
-                        base_module=base_module,
-                        rngs=rngs,
-                        dtype=base_module.dtype,
-                        param_dtype=base_module.param_dtype,
-                        in_features=base_module.in_features,
-                        lora_rank=lora_rank,
-                        out_features=base_module.out_features,
-                    ),
+                    new_value=lora_module,
                 )
             pbar.update(1)
 
