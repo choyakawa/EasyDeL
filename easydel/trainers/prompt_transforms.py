@@ -1206,6 +1206,8 @@ class SFTPreprocessTransform(Transform):
             result["input_ids"] = tokens["input_ids"]
             result["attention_mask"] = tokens["attention_mask"]
 
+        self._apply_completion_labels(result)
+
         # Remove non-tokenized fields
         return purify_example(result)
 
@@ -1287,6 +1289,7 @@ class SFTPreprocessTransform(Transform):
             # Apply attention mask to zero out padding positions
             completion_mask = [m * a for m, a in zip(completion_mask, tokens["attention_mask"], strict=True)]
             result["completion_mask"] = completion_mask
+            self._apply_completion_labels(result)
 
         # Remove non-tokenized fields
         return purify_example(result)
@@ -1314,6 +1317,33 @@ class SFTPreprocessTransform(Transform):
 
         # Remove non-tokenized fields
         return purify_example(result)
+
+    def _apply_completion_labels(self, result: dict) -> None:
+        """Convert assistant/completion masks into ignore-indexed labels."""
+        if not self._mask_prompt:
+            return
+
+        input_ids = result.get("input_ids")
+        if input_ids is None:
+            return
+
+        completion_mask = result.get("completion_mask")
+        if completion_mask is None:
+            completion_mask = result.get("assistant_masks")
+            if completion_mask is not None:
+                result["completion_mask"] = completion_mask
+
+        if completion_mask is None:
+            return
+
+        attention_mask = result.get("attention_mask")
+        labels = []
+        for idx, token_id in enumerate(input_ids):
+            keep = bool(completion_mask[idx])
+            if attention_mask is not None:
+                keep = keep and bool(attention_mask[idx])
+            labels.append(token_id if keep else -100)
+        result["labels"] = labels
 
     def __repr__(self) -> str:
         return f"SFTPreprocessTransform(max_length={self._max_length}, mask_prompt={self._mask_prompt})"
