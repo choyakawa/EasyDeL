@@ -457,7 +457,7 @@ def apply_lora_to_layers(
                 
                 # Dynamically attach a craft_sharding hook based on the parent's direction
                 def _lora_craft_sharding(self, *, partition_manager=None, **_kwargs):
-                    from eformer.escale import ColumnWise, RowWise
+                    from eformer.common_types import ColumnWise, RowWise, Replicated
                     from easydel.layers._sharding import resolve_safe_sharding
                     
                     specs = {}
