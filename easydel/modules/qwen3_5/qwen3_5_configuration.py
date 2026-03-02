@@ -14,6 +14,7 @@
 
 """Configuration for Qwen3.5 text and multimodal models."""
 
+import importlib.util
 import typing
 from collections.abc import Mapping
 
@@ -25,19 +26,35 @@ from easydel.modules.qwen3_next.qwen3_next_configuration import Qwen3NextConfig
 from easydel.modules.qwen3_vl.qwen3_vl_configuration import Qwen3VLVisionConfig
 
 
+def _hf_supports_mrope_rope_type() -> bool:
+    """Check whether the installed HF rope validator supports ``rope_type='mrope'``."""
+    try:
+        from transformers import modeling_rope_utils
+    except Exception:
+        return False
+
+    validators = getattr(modeling_rope_utils, "ROPE_VALIDATION_FUNCTIONS", None)
+    return isinstance(validators, Mapping) and "mrope" in validators
+
+
 def _normalize_rope_scaling_for_mrope(rope_scaling: dict | None) -> dict | None:
-    """Normalize RoPE config so mRoPE keys imply ``rope_type='mrope'``."""
+    """Normalize mRoPE config while remaining compatible with older HF validators."""
     if not isinstance(rope_scaling, dict):
         return rope_scaling
     normalized = dict(rope_scaling)
     has_mrope_keys = "mrope_section" in normalized or "mrope_interleaved" in normalized
     if has_mrope_keys:
         rope_type = normalized.get("rope_type", normalized.get("type"))
-        if rope_type in (None, "default"):
-            normalized["rope_type"] = "mrope"
-            if "type" in normalized:
-                normalized["type"] = "mrope"
+        if rope_type in (None, "default", "mrope"):
+            target_rope_type = "mrope" if _hf_supports_mrope_rope_type() else "default"
+            normalized["rope_type"] = target_rope_type
+            normalized["type"] = target_rope_type
     return normalized
+
+
+def _has_hf_qwen3_5_text_impl() -> bool:
+    """Whether the installed transformers version exposes Qwen3.5 text classes."""
+    return importlib.util.find_spec("transformers.models.qwen3_5.modeling_qwen3_5") is not None
 
 
 @register_config("qwen3_5_text")
@@ -146,6 +163,7 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
         output_router_logits: bool = False,
         router_aux_loss_coef: float = 0.001,
         mlp_only_layers: list[int] | None = None,
+        linear_attention_separate_proj: bool | None = None,
         **kwargs,
     ):
         rope_scaling = _normalize_rope_scaling_for_mrope(rope_scaling or rope_parameters)
@@ -195,9 +213,13 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
             mlp_only_layers=mlp_only_layers,
             **kwargs,
         )
-        # Qwen3.5 linear attention uses split projections in HF:
-        # in_proj_qkv, in_proj_z, in_proj_b, in_proj_a.
-        self.linear_attention_separate_proj = True
+        # Prefer split projections when native HF Qwen3.5 exists. In older HF
+        # installs that only expose Qwen3Next fallback classes, keep packed
+        # projections to match checkpoint parameter names.
+        if linear_attention_separate_proj is None:
+            self.linear_attention_separate_proj = _has_hf_qwen3_5_text_impl()
+        else:
+            self.linear_attention_separate_proj = bool(linear_attention_separate_proj)
         # Mirror HF naming for rope config interop.
         self.rope_parameters = rope_scaling
 

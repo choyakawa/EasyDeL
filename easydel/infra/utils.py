@@ -673,7 +673,12 @@ def extract_static_parameters(module):
     obj = getattr(module, "__call__", None)  # noqa
     if isinstance(obj, (types.FunctionType, types.MethodType)):
         static_args = ()
-        signature = inspect.signature(obj)
+        try:
+            # Avoid inspect.unwrap() here; decorated callables can have cyclic
+            # __wrapped__ chains in some runtimes (seen with remat wrappers).
+            signature = inspect.signature(obj, follow_wrapped=False)
+        except (TypeError, ValueError):
+            return static_args
         for idx, (param_name, _param) in enumerate(signature.parameters.items()):
             if param_name in target_params:
                 static_args += (idx,)
@@ -784,16 +789,22 @@ def auto_remat(
     outs = ()
     for module in modules:
         assert issubclass(module, nn.Module)
+        if getattr(module.__call__, "_easydel_auto_remat_wrapped", False):
+            outs += (module,)
+            continue
+
         static_argnums = extract_static_parameters(module=module)
         if static_argnums is None:
             static_argnums = ()
 
-        module.__call__ = nn.remat(
+        rematted_call = nn.remat(
             f=module.__call__,
             prevent_cse=prevent_cse,
             static_argnums=static_argnums,
             policy=policy,
         )
+        setattr(rematted_call, "_easydel_auto_remat_wrapped", True)  # noqa
+        module.__call__ = rematted_call
 
         outs += (module,)
 
