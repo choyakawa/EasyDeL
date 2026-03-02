@@ -160,16 +160,19 @@ class GreedyPacker:
         if not self._buffer:
             return None
 
-        # Pad to seq_length
-        pad_len = self.seq_length - len(self._buffer)
-        input_ids = np.array(self._buffer + [self.pad_token_id] * pad_len, dtype=np.int32)
+        # Never exceed seq_length, even if buffer is longer
+        buf = self._buffer[: self.seq_length]
+        pad_len = self.seq_length - len(buf)
 
-        attention_mask = np.ones(self.seq_length, dtype=np.int32)
-        attention_mask[len(self._buffer) :] = 0
+        input_ids = np.array(buf + [self.pad_token_id] * pad_len, dtype=np.int32)
+
+        attention_mask = np.zeros(self.seq_length, dtype=np.int32)
+        attention_mask[: len(buf)] = 1
 
         segment_ids = None
         if self.include_segment_ids:
-            padded_segments = self._segment_ids + [self._current_segment] * pad_len
+            seg = self._segment_ids[: self.seq_length]
+            padded_segments = seg + [self._current_segment] * pad_len
             segment_ids = np.array(padded_segments, dtype=np.int32)
 
         result = PackedSequence(
