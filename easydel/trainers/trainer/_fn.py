@@ -110,7 +110,13 @@ def training_step(
         """
         if straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
-        module = state.merge(tree)
+        import jax
+        tree_other = jax.tree_util.tree_map(
+            lambda x: jax.lax.stop_gradient(jax.numpy.asarray(x)) if hasattr(x, "shape") else x, 
+            state.graphother
+        )
+        from flax import nnx as nn
+        module = nn.merge(state.graphdef, tree, tree_other)
         # Prepare inputs for the model call.
         call_batch = module.prepare_inputs_for_call(**minibatch)
         labels = call_batch.pop("labels", None)
@@ -193,7 +199,13 @@ def evaluation_step(
         Returns:
             LossMetrics: The computed metrics from the loss function.
         """
-        module = state.merge(tree)
+        import jax
+        tree_other = jax.tree_util.tree_map(
+            lambda x: jax.lax.stop_gradient(jax.numpy.asarray(x)) if hasattr(x, "shape") else x, 
+            state.graphother
+        )
+        from flax import nnx as nn
+        module = nn.merge(state.graphdef, tree, tree_other)
         module.eval()
         labels = batch.pop("labels", None)
         _outputs, metrics = module.compute_loss(
