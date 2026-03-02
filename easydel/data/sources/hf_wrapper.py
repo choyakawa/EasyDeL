@@ -73,6 +73,25 @@ class HFDatasetShardedSource(ShardedDataSource[dict]):
                 self._length = len(dataset)
             except (TypeError, AttributeError):
                 pass
+        else:
+            self._length = self._resolve_estimated_length(dataset)
+
+    @staticmethod
+    def _resolve_estimated_length(dataset) -> int | None:
+        """Best-effort lookup for IterableDataset cardinality from attached metadata."""
+        try:
+            info = getattr(dataset, "info", None)
+            splits = getattr(info, "splits", None)
+            split_name = getattr(dataset, "split", None) or getattr(dataset, "_split", None)
+            if splits is not None and split_name is not None:
+                split_info = splits.get(str(split_name))
+                if split_info is not None:
+                    num_examples = getattr(split_info, "num_examples", None)
+                    if num_examples is not None:
+                        return int(num_examples)
+        except Exception:
+            return None
+        return None
 
     @staticmethod
     def _check_is_iterable(dataset) -> bool:

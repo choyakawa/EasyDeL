@@ -560,6 +560,29 @@ class HuggingFaceShardedSource(ShardedDataSource[dict]):
         self._streaming = streaming
         self._cache_dir = cache_dir
         self._dataset = None
+        self._estimated_length: int | None = None
+        self._estimated_length = self._resolve_estimated_length()
+
+    def _resolve_estimated_length(self) -> int | None:
+        """Best-effort metadata lookup for split size without materializing the dataset."""
+        try:
+            from datasets import load_dataset_builder  # pyright: ignore[reportMissingTypeStubs]
+
+            builder = load_dataset_builder(
+                path=self._dataset_name,
+                name=self._subset,
+                cache_dir=self._cache_dir,
+            )
+            splits = getattr(getattr(builder, "info", None), "splits", None)
+            if splits is None:
+                return None
+            split_info = splits.get(self._split)
+            if split_info is None:
+                return None
+            num_examples = getattr(split_info, "num_examples", None)
+            return int(num_examples) if num_examples is not None else None
+        except Exception:
+            return None
 
     @property
     def shard_names(self) -> "Sequence[str]":
@@ -613,6 +636,11 @@ class HuggingFaceShardedSource(ShardedDataSource[dict]):
             raise TypeError("Streaming HuggingFace datasets don't support len()")
         ds = self._load_dataset()
         return len(ds)
+
+    @property
+    def estimated_length(self) -> int | None:
+        """Return metadata-derived example count when available."""
+        return self._estimated_length
 
     def __repr__(self) -> str:
         subset_str = f", subset={self._subset!r}" if self._subset else ""
