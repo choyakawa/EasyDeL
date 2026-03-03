@@ -2786,6 +2786,37 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
 
         assert labels is not None, "`labels` can not be `None` for computing loss."
         loss_kwargs = loss_kwargs or {}
+        loss_batch = dict(batch)
+        segment_ids = loss_batch.get("segment_ids", None)
+        if segment_ids is not None and "decoder_segment_ids" not in loss_batch:
+            loss_batch["decoder_segment_ids"] = segment_ids
+
+        if "decoder_positions" not in loss_batch and segment_ids is not None:
+            seg_array = jnp.asarray(segment_ids, dtype=jnp.int32)
+            if seg_array.ndim == 1:
+                seg_array = seg_array[None, :]
+                squeeze_positions = True
+            else:
+                squeeze_positions = False
+
+            def _positions_for_row(row: Array) -> Array:
+                def _scan_fn(carry, seg_id):
+                    prev_seg, prev_pos = carry
+                    is_padding = seg_id < 0
+                    same_segment = jnp.logical_and(seg_id == prev_seg, jnp.logical_not(is_padding))
+                    pos = jnp.where(is_padding, 0, jnp.where(same_segment, prev_pos + 1, 0))
+                    next_prev_seg = jnp.where(is_padding, -1, seg_id)
+                    next_prev_pos = jnp.where(is_padding, 0, pos)
+                    return (next_prev_seg, next_prev_pos), pos
+
+                (_, _), positions = jax.lax.scan(_scan_fn, (-1, 0), row)
+                return positions.astype(jnp.int32)
+
+            positions = jax.vmap(_positions_for_row)(seg_array)
+            if squeeze_positions:
+                positions = positions[0]
+            loss_batch["decoder_positions"] = positions.astype(jnp.int32)
+
         forward_batch = batch
         try:
             call_signature = inspect.signature(self.__call__)
@@ -2809,6 +2840,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             labels=labels,
             config=loss_config,
             paxis=self.config.partition_axis,
+            batch=loss_batch,
             **loss_kwargs,
             **outputs,
             **batch,

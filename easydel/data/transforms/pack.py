@@ -43,6 +43,32 @@ logger = logging.getLogger(__name__)
 _PADDING_SEGMENT_ID = -1
 
 
+def _build_decoder_positions(segment_ids: np.ndarray | None) -> np.ndarray | None:
+    """Build per-segment reset positions for packed loss normalization."""
+    if segment_ids is None:
+        return None
+
+    positions = np.zeros_like(segment_ids, dtype=np.int32)
+    current_segment: int | None = None
+    current_position = 0
+
+    for idx, segment_id in enumerate(segment_ids.tolist()):
+        if segment_id == _PADDING_SEGMENT_ID:
+            positions[idx] = 0
+            current_segment = None
+            current_position = 0
+            continue
+
+        if segment_id != current_segment:
+            current_segment = segment_id
+            current_position = 0
+
+        positions[idx] = current_position
+        current_position += 1
+
+    return positions
+
+
 def _normalize_sample(
     tokens: list[int],
     labels: list[int] | None,
@@ -81,6 +107,7 @@ class PackedSequence:
     labels: np.ndarray | None = None
     attention_mask: np.ndarray | None = None
     segment_ids: np.ndarray | None = None
+    decoder_positions: np.ndarray | None = None
     source_ids: list[str] | None = None
     num_segments: int = 0
 
@@ -93,6 +120,9 @@ class PackedSequence:
             result["attention_mask"] = self.attention_mask
         if self.segment_ids is not None:
             result["segment_ids"] = self.segment_ids
+            result["decoder_segment_ids"] = self.segment_ids
+        if self.decoder_positions is not None:
+            result["decoder_positions"] = self.decoder_positions
         return result
 
 
@@ -162,9 +192,8 @@ class GreedyPacker:
             if len(self._buffer) >= self.seq_length:
                 result = self._flush()
 
-        if tokens:
-            if source_id:
-                self._source_ids.append(source_id)
+        if tokens and source_id:
+            self._source_ids.append(source_id)
         self._current_segment = max(self._segment_ids, default=0) + 1
 
         return result
@@ -183,6 +212,7 @@ class GreedyPacker:
             input_ids=input_ids,
             labels=labels,
             segment_ids=segment_ids,
+            decoder_positions=_build_decoder_positions(segment_ids),
             source_ids=self._source_ids.copy() if self._source_ids else None,
             num_segments=max(self._segment_ids[: self.seq_length], default=0),
         )
@@ -226,6 +256,7 @@ class GreedyPacker:
             labels=labels,
             attention_mask=attention_mask,
             segment_ids=segment_ids,
+            decoder_positions=_build_decoder_positions(segment_ids),
             source_ids=self._source_ids.copy() if self._source_ids else None,
             num_segments=max(seg, default=0),
         )
@@ -280,23 +311,23 @@ class PoolPacker:
             List of completed PackedSequences (may be empty).
         """
         results = []
-        best_idx = 0
-        tokens, normalized_labels = _normalize_sample(tokens, labels, self._packers[best_idx].eos_token_id, self.seq_length)
         token_len = len(tokens)
 
         # Find the packer with the best fit (least remaining space after adding)
+        best_idx = 0
         best_fit = float("inf")
 
         for i, packer in enumerate(self._packers):
             current_len = len(packer._buffer)
-            remaining_after = self.seq_length - (current_len + token_len)
+            estimated_tokens, _ = _normalize_sample(tokens, labels, packer.eos_token_id, self.seq_length)
+            remaining_after = self.seq_length - (current_len + len(estimated_tokens))
 
             if 0 <= remaining_after < best_fit:
                 best_fit = remaining_after
                 best_idx = i
 
         # Add to best packer
-        result = self._packers[best_idx].add(tokens, normalized_labels, source_id)
+        result = self._packers[best_idx].add(tokens, labels, source_id)
         if result is not None:
             results.append(result)
 
@@ -366,14 +397,16 @@ class FirstFitPacker:
         if not self._pending:
             return []
 
-        # Sort by length (decreasing)
-        sorted_pending = sorted(self._pending, key=lambda x: len(x[0]), reverse=True)
+        normalized_pending = [
+            (*_normalize_sample(raw_tokens, raw_labels, self.eos_token_id, self.seq_length), source_id)
+            for raw_tokens, raw_labels, source_id in self._pending
+        ]
+        sorted_pending = sorted(normalized_pending, key=lambda x: len(x[0]), reverse=True)
 
-        # Bins: list of [tokens, labels, segment_ids, source_ids]
+        # Bins: list of [tokens, labels, segment_ids]
         bins: list[list[tp.Any]] = []
 
-        for raw_tokens, raw_labels, source_id in sorted_pending:
-            tokens, labels = _normalize_sample(raw_tokens, raw_labels, self.eos_token_id, self.seq_length)
+        for tokens, labels, source_id in sorted_pending:
             token_len = len(tokens)
             placed = False
 
@@ -435,6 +468,7 @@ class FirstFitPacker:
                     labels=labels_arr,
                     attention_mask=attention_mask,
                     segment_ids=segment_ids,
+                    decoder_positions=_build_decoder_positions(segment_ids),
                     source_ids=bin_sources if bin_sources else None,
                     num_segments=max(bin_segments, default=0),
                 )
@@ -526,6 +560,8 @@ class PackedShardedSource(ShardedDataSource[dict]):
 
     def open_shard(self, shard_name: str) -> "Iterator[dict]":
         """Open the packed shard."""
+        if shard_name not in self.shard_names:
+            raise KeyError(f"Unknown packed shard: {shard_name}")
         if self._seed is not None:
             random.seed(self._seed)
 
@@ -548,7 +584,6 @@ class PackedShardedSource(ShardedDataSource[dict]):
             return result
 
         # Iterate through source
-        del shard_name
         for source_shard in self._source.shard_names:
             for example in self._source.open_shard(source_shard):
                 tokens = example.get(self._input_field, [])

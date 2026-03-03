@@ -1294,8 +1294,8 @@ def _sum_weights_per_segment(
     Args:
         positions: Position indices within each segment with shape (seq_len,).
             A value of 0 indicates the start of a new segment.
-        segment_ids: Segment identifiers with shape (seq_len,). Non-zero values
-            indicate valid positions; zero indicates padding.
+        segment_ids: Segment identifiers with shape (seq_len,). Non-negative values
+            indicate valid positions; negative values indicate padding.
         weights: Weights to sum per segment with shape (seq_len,).
 
     Returns:
@@ -1330,7 +1330,7 @@ def _sum_weights_per_segment(
 
     start_positions = positions == 0
     final_positions = jnp.concatenate([start_positions[1:], jnp.ones(1)])
-    final_positions *= segment_ids != 0
+    final_positions *= segment_ids >= 0
     final_cumulative_weights = final_positions * jnp.cumsum(weights)
     final_total_weights = jnp.concatenate(
         [
