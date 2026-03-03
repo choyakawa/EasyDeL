@@ -344,22 +344,31 @@ class FirstFitPacker:
         # Sort by length (decreasing)
         sorted_pending = sorted(self._pending, key=lambda x: len(x[0]), reverse=True)
 
-        # Bins: list of (tokens, labels, segment_ids, source_ids)
-        bins: list[tuple[list[int], list[int], list[int], list[str]]] = []
+        # Bins: list of [tokens, labels, segment_ids, source_ids]
+        bins: list[list[tp.Any]] = []
 
         for tokens, labels, source_id in sorted_pending:
             token_len = len(tokens) + 1  # +1 for EOS
             placed = False
 
             # Find first bin that fits
-            for _i, (bin_tokens, bin_labels, bin_segments, bin_sources) in enumerate(bins):
+            for _i, bin_data in enumerate(bins):
+                bin_tokens, bin_labels, bin_segments, bin_sources = bin_data
                 if len(bin_tokens) + token_len <= self.seq_length:
                     # Add to this bin
                     segment_id = max(bin_segments) + 1 if bin_segments else 0
+                    
+                    if labels is not None and bin_labels is None:
+                        bin_labels = [-100] * len(bin_tokens)
+                        bin_data[1] = bin_labels
+                        
                     bin_tokens.extend(tokens)
-                    bin_labels.extend(labels if labels is not None else [-100] * len(tokens))
+                    
+                    if bin_labels is not None:
+                        bin_labels.extend(labels if labels is not None else [-100] * len(tokens))
+                        bin_labels.append(-100)
+                        
                     bin_tokens.append(self.eos_token_id)
-                    bin_labels.append(-100)
                     bin_segments.extend([segment_id] * (len(tokens) + 1))
                     if source_id:
                         bin_sources.append(source_id)
@@ -369,24 +378,29 @@ class FirstFitPacker:
             if not placed:
                 # Create new bin
                 new_tokens = [*tokens, self.eos_token_id]
-                new_labels = [*(labels if labels is not None else ([-100] * len(tokens))), -100]
+                new_labels = [*labels, -100] if labels is not None else None
                 new_segments = [0] * len(new_tokens)
                 new_sources = [source_id] if source_id else []
-                bins.append((new_tokens, new_labels, new_segments, new_sources))
+                bins.append([new_tokens, new_labels, new_segments, new_sources])
 
         # Convert bins to PackedSequences
         results = []
         for bin_tokens, bin_labels, bin_segments, bin_sources in bins:
             # Ensure we don't exceed seq_length
             bin_tokens = bin_tokens[: self.seq_length]
-            bin_labels = bin_labels[: self.seq_length]
+            if bin_labels is not None:
+                bin_labels = bin_labels[: self.seq_length]
             if self.include_segment_ids and bin_segments:
                 bin_segments = bin_segments[: self.seq_length]
 
             # Pad if needed
             pad_len = self.seq_length - len(bin_tokens)
             input_ids = np.array(bin_tokens + [self.pad_token_id] * pad_len, dtype=np.int32)
-            labels = np.array(bin_labels + ([-100] * pad_len), dtype=np.int32)
+            
+            if bin_labels is not None:
+                labels_arr = np.array(bin_labels + ([-100] * pad_len), dtype=np.int32)
+            else:
+                labels_arr = None
 
             attention_mask = np.ones(self.seq_length, dtype=np.int32)
             attention_mask[len(bin_tokens) :] = 0
@@ -400,7 +414,7 @@ class FirstFitPacker:
             results.append(
                 PackedSequence(
                     input_ids=input_ids,
-                    labels=labels,
+                    labels=labels_arr,
                     attention_mask=attention_mask,
                     segment_ids=segment_ids,
                     source_ids=bin_sources if bin_sources else None,
