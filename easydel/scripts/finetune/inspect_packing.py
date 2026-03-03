@@ -92,6 +92,10 @@ class InspectPackingConfig:
         default=True,
         metadata={"help": "Prefer examples with more than one segment when selecting packed examples to print."},
     )
+    only_multi_segment: bool = field(
+        default=False,
+        metadata={"help": "Only print packed examples with more than one segment."},
+    )
     boundary_window: int = field(
         default=8,
         metadata={"help": "How many tokens to show around each packed boundary."},
@@ -286,6 +290,7 @@ def _scan_packed_examples(
     max_boundaries_per_example: int,
     decode_tokens: bool,
     prefer_multi_segment: bool,
+    only_multi_segment: bool,
 ) -> tuple[list[dict[str, object]], dict[str, int]]:
     inspected: list[dict[str, object]] = []
     total_scanned = 0
@@ -324,7 +329,9 @@ def _scan_packed_examples(
         if total_scanned >= packed_scan_limit:
             break
 
-    if prefer_multi_segment and selected_multi:
+    if only_multi_segment:
+        inspected.extend(selected_multi[:packed_examples])
+    elif prefer_multi_segment and selected_multi:
         inspected.extend(selected_multi[:packed_examples])
         if len(inspected) < packed_examples:
             inspected.extend(selected_fallback[: packed_examples - len(inspected)])
@@ -397,6 +404,9 @@ def main():
             "packing_strategy": args.packing_strategy,
             "assistant_only_loss": args.assistant_only_loss,
             "completion_only_loss": args.completion_only_loss,
+            "packed_scan_limit": args.packed_scan_limit,
+            "prefer_multi_segment": args.prefer_multi_segment,
+            "only_multi_segment": args.only_multi_segment,
         },
         "source_sample_keys": sorted(sample.keys()),
         "pretokenized": pretokenized,
@@ -423,6 +433,7 @@ def main():
             max_boundaries_per_example=args.max_boundaries_per_example,
             decode_tokens=args.decode_tokens,
             prefer_multi_segment=args.prefer_multi_segment,
+            only_multi_segment=args.only_multi_segment,
         )
         summary["packed_examples"] = packed_inspection
         summary["packed_rollup"] = {
@@ -442,6 +453,14 @@ def main():
                 sum(len(item["position_reset_failure_positions"]) for item in packed_inspection)
             ),
         }
+        if (
+            args.only_multi_segment
+            and packed_scan_stats["multi_segment_examples"] == 0
+        ):
+            summary["packed_warning"] = (
+                "No multi-segment packed examples were found in the scanned window. "
+                "Increase --packed_scan_limit and rerun."
+            )
 
     if args.dump_json_path is not None:
         with open(args.dump_json_path, "w", encoding="utf-8") as file:
