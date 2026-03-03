@@ -377,6 +377,12 @@ class FirstFitPacker:
         # Convert bins to PackedSequences
         results = []
         for bin_tokens, bin_labels, bin_segments, bin_sources in bins:
+            # Ensure we don't exceed seq_length
+            bin_tokens = bin_tokens[: self.seq_length]
+            bin_labels = bin_labels[: self.seq_length]
+            if self.include_segment_ids and bin_segments:
+                bin_segments = bin_segments[: self.seq_length]
+
             # Pad if needed
             pad_len = self.seq_length - len(bin_tokens)
             input_ids = np.array(bin_tokens + [self.pad_token_id] * pad_len, dtype=np.int32)
