@@ -226,8 +226,8 @@ def main():
             ...
 
     # --- Build formatting function ---
-    # When dataset_text_field points to a messages column, apply chat template;
-    # when it points to a plain text column the trainer handles it directly (formatting_func=None).
+    # Keep message-style data unformatted here so SFT preprocessing can apply the
+    # tokenizer chat template itself and request assistant masks when needed.
     sample_iter = dataset.open_shard(dataset.shard_names[0])
     dataset_sample = next(sample_iter)
     text_field = sft_config.dataset_text_field
@@ -235,7 +235,7 @@ def main():
 
     if sample_value is not None and isinstance(sample_value, list):
         # Message-style data → apply chat template
-        formatting_func = lambda x: processor.apply_chat_template(x[text_field], tokenize=False)
+        formatting_func = None
     else:
         # Plain text / pretrain data → no formatting needed
         formatting_func = None
