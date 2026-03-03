@@ -1050,6 +1050,8 @@ class SFTPreprocessTransform(Transform):
         mask_prompt: Whether to create completion mask for completion-only loss.
         add_eos: Whether to add EOS token to text.
         truncation: Whether to truncate to max_length.
+        pad_to_max_length: Whether to pad tokenized samples to max_length during
+            preprocessing. Disable this when sequence packing will run afterward.
         formatting_func: Optional function to format examples before tokenization.
             Should take an example dict and return a string or dict with "text" field.
 
@@ -1072,6 +1074,7 @@ class SFTPreprocessTransform(Transform):
         mask_prompt: bool = False,
         add_eos: bool = True,
         truncation: bool = True,
+        pad_to_max_length: bool = True,
         formatting_func: tp.Callable | None = None,
     ):
         self._tokenizer = tokenizer
@@ -1081,11 +1084,15 @@ class SFTPreprocessTransform(Transform):
         self._mask_prompt = mask_prompt
         self._add_eos = add_eos
         self._truncation = truncation
+        self._pad_to_max_length = pad_to_max_length
         self._formatting_func = formatting_func
         chat_template = getattr(tokenizer, "chat_template", None)
         self._return_assistant_tokens_mask = bool(
             mask_prompt and isinstance(chat_template, str) and "{% generation %}" in chat_template
         )
+
+    def _padding_mode(self) -> bool | str:
+        return "max_length" if self._pad_to_max_length and self._max_length else False
 
     def __call__(self, example: Example) -> Example:
         """Apply SFT preprocessing to example.
@@ -1181,7 +1188,7 @@ class SFTPreprocessTransform(Transform):
                 return_assistant_tokens_mask=self._return_assistant_tokens_mask,
                 truncation=self._truncation,
                 max_length=self._max_length,
-                padding="max_length" if self._max_length else False,
+                padding=self._padding_mode(),
                 tools=tools,
             )
             result.update(processed)
@@ -1200,7 +1207,7 @@ class SFTPreprocessTransform(Transform):
                 text,
                 truncation=self._truncation,
                 max_length=self._max_length,
-                padding="max_length" if self._max_length else False,
+                padding=self._padding_mode(),
                 return_attention_mask=True,
             )
             result["input_ids"] = tokens["input_ids"]
@@ -1272,7 +1279,7 @@ class SFTPreprocessTransform(Transform):
             full_text,
             truncation=self._truncation,
             max_length=self._max_length,
-            padding="max_length" if self._max_length else False,
+            padding=self._padding_mode(),
             return_attention_mask=True,
             add_special_tokens=False,
         )
@@ -1308,7 +1315,7 @@ class SFTPreprocessTransform(Transform):
             text,
             truncation=self._truncation,
             max_length=self._max_length,
-            padding="max_length" if self._max_length else False,
+            padding=self._padding_mode(),
             return_attention_mask=True,
         )
 
@@ -1334,7 +1341,11 @@ class SFTPreprocessTransform(Transform):
                 result["completion_mask"] = completion_mask
 
         if completion_mask is None:
-            return
+            raise ValueError(
+                "assistant_only_loss=True requires an assistant/completion mask, but none was produced. "
+                "For conversational data, use a tokenizer chat template that supports `{% generation %}`. "
+                "For prompt/completion data, provide explicit prompt and completion fields."
+            )
 
         attention_mask = result.get("attention_mask")
         labels = []

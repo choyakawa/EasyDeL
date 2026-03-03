@@ -80,6 +80,7 @@ import flax.nnx
 import flax.struct
 import jax
 import jax.tree_util
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from eformer.escale import make_shard_and_gather_fns, match_partition_rules
 from eformer.loggings import get_logger
 from flax import nnx as nn
@@ -1750,6 +1751,9 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             ...     kwargs.setdefault('use_cache', True)
             ...     return kwargs
         """
+        segment_ids = kwargs.get("segment_ids")
+        if segment_ids is not None and kwargs.get("mask_info") is None:
+            kwargs["mask_info"] = MaskInfo.from_segments(jnp.asarray(segment_ids, dtype=jnp.int32))
         return kwargs
 
     def get_static_arguments(self: Self) -> tuple:

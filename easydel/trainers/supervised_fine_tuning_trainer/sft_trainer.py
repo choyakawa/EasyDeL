@@ -155,6 +155,7 @@ class SFTTrainer(Trainer):
             max_length=self.arguments.max_length,
             text_field=self._dataset_text_field or "text",
             mask_prompt=mask_prompt,
+            pad_to_max_length=not bool(getattr(self.arguments, "packing", False)),
             formatting_func=self._formatting_func,
         )
 
