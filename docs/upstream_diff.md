@@ -236,42 +236,55 @@ This is part of the local divergence because the branch expects masked-label pre
 
 #### File: `easydel/data/transforms/pack.py`
 
-Teach all packers to preserve `labels`.
+Teach all packers to preserve `labels` and emit packed-loss metadata.
 
 Required behavior:
 
 - `PackedSequence` must gain:
   - `labels: np.ndarray | None = None`
+- `PackedSequence` must also gain:
+  - `decoder_positions: np.ndarray | None = None`
 - `PackedSequence.to_dict()` must include `labels` when present
+- `PackedSequence.to_dict()` must also expose:
+  - `decoder_segment_ids`
+  - `decoder_positions`
 
 Update `GreedyPacker`:
 
 - maintain an internal `_labels` buffer alongside `_buffer`
 - change `add(...)` signature to accept `labels: list[int] | None`
 - require labels to match token length when provided
-- if labels exist for the packer state, append `-100` for EOS
+- normalize each sample before packing:
+  - clip to `seq_length`
+  - append EOS only if the sample is non-empty, does not already end with EOS, and still has room
+- if labels exist for the packer state, append `-100` for any EOS inserted during normalization
 - `_flush()` must return aligned `labels`
 - `flush_final()` must:
   - truncate to `seq_length`
   - pad labels with `-100`
-  - pad `segment_ids` with `0` so padding remains distinguishable from real packed segments
+  - pad `segment_ids` with `-1`
+  - generate per-segment-reset `decoder_positions`
 
 Update `PoolPacker`:
 
 - forward optional labels into the chosen inner packer
+- estimate fit using normalized sample length rather than assuming a fresh EOS is always appended
 
 Update `FirstFitPacker`:
 
 - store pending items as `(tokens, labels, source_id)`
+- normalize pending samples before sorting and bin-packing
 - when building bins, merge labels alongside tokens
-- append `-100` at EOS boundaries
+- preserve labels exactly as produced by normalization
 - pad labels with `-100`
-- pad `segment_ids` with `0` instead of inventing a new segment id for padding positions
+- pad `segment_ids` with `-1`
+- generate `decoder_positions`
 
 Update `PackedShardedSource`:
 
 - read `labels = example.get("labels")`
 - pass labels into whichever packer is active
+- keep iterating the underlying source's real shard names; do not forward the synthetic `"packed_shard_0"` name into the wrapped source
 
 The local branch depends on this exact propagation path: preprocess produces labels, pack preserves labels, trainer consumes labels.
 
@@ -683,7 +696,8 @@ A correct reconstruction of the current local branch should produce all of the f
 - iterable Hugging Face datasets can contribute metadata-derived length information
 - preprocessing emits explicit `labels` for masked SFT loss
 - packing preserves those labels and keeps them aligned
-- packed padding keeps `segment_ids=0` so model-side mask derivation can distinguish padding from real segments
+- packed padding uses `segment_ids=-1`
+- packed sequences also expose `decoder_segment_ids` and `decoder_positions` for packed-aware loss handling
 - packed `segment_ids` can automatically become model-side `mask_info`
 - a local end-to-end finetune script exists and supports LoRA-oriented workflows
 - JAX-to-PyTorch export is adapted for multi-host TPU usage
