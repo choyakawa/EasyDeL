@@ -226,6 +226,14 @@ Required behavior:
 
 This differs from upstream because the local branch treats assistant-only loss as another path to the same masking semantics.
 
+There is also a packing-related preprocessing difference:
+
+- `SFTPreprocessTransform` should accept `pad_to_max_length: bool = True`
+- when packing is enabled, the SFT trainer should pass `pad_to_max_length=False`
+- tokenization should then use a helper like `_padding_mode()` so examples are not pre-padded before packing
+
+This is part of the local divergence because the branch expects masked-label preprocessing and packing to work together on unpadded token sequences.
+
 #### File: `easydel/data/transforms/pack.py`
 
 Teach all packers to preserve `labels`.
@@ -629,7 +637,39 @@ Reproduce the mode change:
 
 No content change is required for this file.
 
-## 11. Summary of what must be true if the divergence is reproduced correctly
+## 11. Packed segment metadata must also drive model-side mask preparation
+
+### Motivation
+
+The local branch expects packed examples to remain usable after they leave the data pipeline. Carrying `segment_ids` alone is not sufficient if model input preparation does not convert them into the attention-mask metadata expected by downstream kernels.
+
+This divergence is therefore not just about data packing. It also ensures packed segment boundaries are converted into model-consumable mask structure automatically.
+
+### Behavioral target
+
+After reproducing this divergence:
+
+- model input preparation should notice `segment_ids`
+- if `mask_info` is missing, it should be derived from `segment_ids`
+- callers that pass packed samples with segment ids should not need to build `mask_info` manually
+
+### Reconstruction steps
+
+#### File: `easydel/infra/base_module.py`
+
+Update `EasyDeLBaseModule.prepare_inputs_for_call(...)`.
+
+Required behavior:
+
+- import `MaskInfo` from `ejkernel.types`
+- read `segment_ids` from `kwargs`
+- if `segment_ids` is present and `mask_info` is not already provided:
+  - build `MaskInfo.from_segments(jnp.asarray(segment_ids, dtype=jnp.int32))`
+  - assign it to `kwargs["mask_info"]`
+
+This is a small patch, but it is part of the actual upstream divergence because it connects packed sample metadata to the model-side attention path.
+
+## 12. Summary of what must be true if the divergence is reproduced correctly
 
 A correct reconstruction of the current local branch should produce all of the following outcomes:
 
@@ -639,6 +679,7 @@ A correct reconstruction of the current local branch should produce all of the f
 - iterable Hugging Face datasets can contribute metadata-derived length information
 - preprocessing emits explicit `labels` for masked SFT loss
 - packing preserves those labels and keeps them aligned
+- packed `segment_ids` can automatically become model-side `mask_info`
 - a local end-to-end finetune script exists and supports LoRA-oriented workflows
 - JAX-to-PyTorch export is adapted for multi-host TPU usage
 - LoRA insertion preserves usable sharding semantics
