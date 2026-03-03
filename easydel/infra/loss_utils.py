@@ -1342,6 +1342,19 @@ def _sum_weights_per_segment(
     return normalizer
 
 
+def _shifted_segment_continuation_mask(segment_ids: Array) -> Array:
+    """Mask valid next-token targets that stay within the same packed segment."""
+    segment_ids = jnp.asarray(segment_ids, dtype=jnp.int32)
+    if segment_ids.ndim == 1:
+        segment_ids = segment_ids[None, :]
+
+    current_segment_ids = segment_ids[:, :-1]
+    next_segment_ids = segment_ids[:, 1:]
+    same_segment = current_segment_ids == next_segment_ids
+    valid_segment = (current_segment_ids >= 0) & (next_segment_ids >= 0)
+    return same_segment & valid_segment
+
+
 def get_factor_and_weight(
     loss_normalizing_factor: FACTOR_TYPE,
     batch: collections.abc.Mapping[str, Array],
@@ -1799,6 +1812,13 @@ def ForCausalLMLoss(
         shift_labels = labels[:, 1:]
         if attention_mask is not None:
             shift_attn_m = attention_mask[:, 1:]
+
+        packed_segment_ids = None
+        if batch is not None:
+            packed_segment_ids = batch.get("decoder_segment_ids", batch.get("segment_ids"))
+        if packed_segment_ids is not None:
+            continuation_mask = _shifted_segment_continuation_mask(packed_segment_ids)
+            shift_attn_m = continuation_mask if shift_attn_m is None else jnp.logical_and(shift_attn_m, continuation_mask)
     else:
         shift_logits = logits
         shift_labels = labels

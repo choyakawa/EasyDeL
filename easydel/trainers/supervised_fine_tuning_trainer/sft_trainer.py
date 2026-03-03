@@ -148,7 +148,7 @@ class SFTTrainer(Trainer):
         mask_prompt = bool(getattr(self.arguments, "assistant_only_loss", False))
         completion_only_loss = getattr(self.arguments, "completion_only_loss", None)
         if completion_only_loss is not None:
-            mask_prompt = bool(completion_only_loss)
+            mask_prompt = mask_prompt or bool(completion_only_loss)
 
         return SFTPreprocessTransform(
             tokenizer=self.processing_class,
