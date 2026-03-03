@@ -84,6 +84,14 @@ class InspectPackingConfig:
         default=3,
         metadata={"help": "How many packed examples to print."},
     )
+    packed_scan_limit: int = field(
+        default=256,
+        metadata={"help": "How many packed examples to scan before selecting examples to print."},
+    )
+    prefer_multi_segment: bool = field(
+        default=True,
+        metadata={"help": "Prefer examples with more than one segment when selecting packed examples to print."},
+    )
     boundary_window: int = field(
         default=8,
         metadata={"help": "How many tokens to show around each packed boundary."},
@@ -269,6 +277,71 @@ def _inspect_packed_example(
     }
 
 
+def _scan_packed_examples(
+    tokenizer,
+    source,
+    packed_examples: int,
+    packed_scan_limit: int,
+    boundary_window: int,
+    max_boundaries_per_example: int,
+    decode_tokens: bool,
+    prefer_multi_segment: bool,
+) -> tuple[list[dict[str, object]], dict[str, int]]:
+    inspected: list[dict[str, object]] = []
+    total_scanned = 0
+    multi_segment_total = 0
+    single_segment_total = 0
+    max_segment_count = 0
+
+    selected_multi: list[dict[str, object]] = []
+    selected_fallback: list[dict[str, object]] = []
+
+    for shard_name in source.shard_names:
+        for example in source.open_shard(shard_name):
+            packed_item = _inspect_packed_example(
+                tokenizer=tokenizer,
+                example=example,
+                example_index=total_scanned,
+                boundary_window=boundary_window,
+                max_boundaries_per_example=max_boundaries_per_example,
+                decode_tokens=decode_tokens,
+            )
+            total_scanned += 1
+
+            segment_count = int(packed_item["segment_count"])
+            max_segment_count = max(max_segment_count, segment_count)
+            if segment_count > 1:
+                multi_segment_total += 1
+                if len(selected_multi) < packed_examples:
+                    selected_multi.append(packed_item)
+            else:
+                single_segment_total += 1
+                if len(selected_fallback) < packed_examples:
+                    selected_fallback.append(packed_item)
+
+            if total_scanned >= packed_scan_limit:
+                break
+        if total_scanned >= packed_scan_limit:
+            break
+
+    if prefer_multi_segment and selected_multi:
+        inspected.extend(selected_multi[:packed_examples])
+        if len(inspected) < packed_examples:
+            inspected.extend(selected_fallback[: packed_examples - len(inspected)])
+    else:
+        inspected.extend(selected_fallback[:packed_examples])
+        if len(inspected) < packed_examples:
+            inspected.extend(selected_multi[: packed_examples - len(inspected)])
+
+    stats = {
+        "scanned_examples": total_scanned,
+        "single_segment_examples": single_segment_total,
+        "multi_segment_examples": multi_segment_total,
+        "max_segment_count": max_segment_count,
+    }
+    return inspected, stats
+
+
 def main():
     parser = DataClassArgumentParser((InspectPackingConfig,))
     (args,) = parser.parse_args_into_dataclasses()
@@ -341,21 +414,23 @@ def main():
             include_segment_ids=True,
             shuffle=False,
         )
-        packed_examples = _take_examples(packed_source, args.packed_examples)
-        packed_inspection = [
-            _inspect_packed_example(
-                tokenizer=tokenizer,
-                example=example,
-                example_index=idx,
-                boundary_window=args.boundary_window,
-                max_boundaries_per_example=args.max_boundaries_per_example,
-                decode_tokens=args.decode_tokens,
-            )
-            for idx, example in enumerate(packed_examples)
-        ]
+        packed_inspection, packed_scan_stats = _scan_packed_examples(
+            tokenizer=tokenizer,
+            source=packed_source,
+            packed_examples=args.packed_examples,
+            packed_scan_limit=args.packed_scan_limit,
+            boundary_window=args.boundary_window,
+            max_boundaries_per_example=args.max_boundaries_per_example,
+            decode_tokens=args.decode_tokens,
+            prefer_multi_segment=args.prefer_multi_segment,
+        )
         summary["packed_examples"] = packed_inspection
         summary["packed_rollup"] = {
             "packed_examples_inspected": len(packed_inspection),
+            "packed_examples_scanned": packed_scan_stats["scanned_examples"],
+            "single_segment_examples_scanned": packed_scan_stats["single_segment_examples"],
+            "multi_segment_examples_scanned": packed_scan_stats["multi_segment_examples"],
+            "max_segment_count_scanned": packed_scan_stats["max_segment_count"],
             "total_boundaries": int(sum(item["boundary_count"] for item in packed_inspection)),
             "total_boundary_target_unmasked": int(
                 sum(item["boundary_target_unmasked_count"] for item in packed_inspection)
