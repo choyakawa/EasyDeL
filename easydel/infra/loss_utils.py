@@ -1389,7 +1389,7 @@ def get_factor_and_weight(
         loss_normalizing_factor = convert_special_loss_normalizing_factor_to_enum(loss_normalizing_factor)
 
     if loss_weights is None:
-        loss_weights = jnp.asarray(batch["decoder_target_tokens"] > 0, compute_dtype)
+        loss_weights = jnp.asarray(batch["decoder_target_tokens"] != -100, compute_dtype)
 
     output_normalizing_factor = None
     if loss_normalizing_factor == SLNF.NUM_REAL_TARGET_TOKENS:
@@ -1810,8 +1810,11 @@ def ForCausalLMLoss(
     if batch is not None:
         loss_batch = dict(batch)
         loss_batch["decoder_target_tokens"] = shift_labels
+        label_weights = (shift_labels != config.ignore_index).astype(shift_logits.dtype)
         if shift_attn_m is not None:
-            loss_batch["decoder_loss_weights"] = shift_attn_m
+            loss_batch["decoder_loss_weights"] = shift_attn_m.astype(shift_logits.dtype) * label_weights
+        else:
+            loss_batch["decoder_loss_weights"] = label_weights
         for key in ("decoder_positions", "decoder_segment_ids"):
             value = loss_batch.get(key)
             if value is not None and config.shift_tokens:
