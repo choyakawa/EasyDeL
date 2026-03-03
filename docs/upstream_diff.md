@@ -254,6 +254,7 @@ Update `GreedyPacker`:
 - `flush_final()` must:
   - truncate to `seq_length`
   - pad labels with `-100`
+  - pad `segment_ids` with `0` so padding remains distinguishable from real packed segments
 
 Update `PoolPacker`:
 
@@ -265,6 +266,7 @@ Update `FirstFitPacker`:
 - when building bins, merge labels alongside tokens
 - append `-100` at EOS boundaries
 - pad labels with `-100`
+- pad `segment_ids` with `0` instead of inventing a new segment id for padding positions
 
 Update `PackedShardedSource`:
 
@@ -331,8 +333,10 @@ Training mode behavior:
 Formatting behavior:
 
 - inspect a dataset sample
-- if the target text field contains message-style data, apply tokenizer chat template
-- otherwise leave formatting function as `None`
+- if the target text field contains message-style data, leave formatting as `None`
+- let `SFTPreprocessTransform` apply the tokenizer chat template directly
+- this preserves conversational structure so `assistant_only_loss` can request assistant masks from the tokenizer
+- if the target field is plain text, leave formatting function as `None`
 
 Training behavior:
 
@@ -679,6 +683,7 @@ A correct reconstruction of the current local branch should produce all of the f
 - iterable Hugging Face datasets can contribute metadata-derived length information
 - preprocessing emits explicit `labels` for masked SFT loss
 - packing preserves those labels and keeps them aligned
+- packed padding keeps `segment_ids=0` so model-side mask derivation can distinguish padding from real segments
 - packed `segment_ids` can automatically become model-side `mask_info`
 - a local end-to-end finetune script exists and supports LoRA-oriented workflows
 - JAX-to-PyTorch export is adapted for multi-host TPU usage
