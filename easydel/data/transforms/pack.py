@@ -194,7 +194,7 @@ class GreedyPacker:
         segment_ids = None
         if self.include_segment_ids:
             seg = self._segment_ids[: self.seq_length]
-            padded_segments = seg + [self._current_segment] * pad_len
+            padded_segments = seg + [0] * pad_len
             segment_ids = np.array(padded_segments, dtype=np.int32)
 
         result = PackedSequence(
@@ -407,8 +407,7 @@ class FirstFitPacker:
 
             segment_ids = None
             if self.include_segment_ids:
-                max_seg = max(bin_segments) if bin_segments else 0
-                padded_segments = bin_segments + [max_seg + 1] * pad_len
+                padded_segments = bin_segments + [0] * pad_len
                 segment_ids = np.array(padded_segments, dtype=np.int32)
 
             results.append(
