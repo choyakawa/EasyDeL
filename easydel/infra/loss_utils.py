@@ -1799,24 +1799,6 @@ def ForCausalLMLoss(
         shift_labels = labels[:, 1:]
         if attention_mask is not None:
             shift_attn_m = attention_mask[:, 1:]
-
-        # Packed sequences need boundary-aware supervision: the token at the end
-        # of one segment must not be trained to predict the first token of the
-        # next packed segment.
-        packed_segment_ids = None if batch is None else batch.get("decoder_segment_ids")
-        if packed_segment_ids is not None:
-            packed_segment_ids = jnp.asarray(packed_segment_ids, dtype=jnp.int32)
-            if packed_segment_ids.ndim == 1:
-                packed_segment_ids = packed_segment_ids[None, :]
-
-            same_segment = packed_segment_ids[:, :-1] == packed_segment_ids[:, 1:]
-            valid_segment = (packed_segment_ids[:, :-1] >= 0) & (packed_segment_ids[:, 1:] >= 0)
-            packed_shift_mask = same_segment & valid_segment
-
-            if shift_attn_m is None:
-                shift_attn_m = packed_shift_mask
-            else:
-                shift_attn_m = jnp.asarray(shift_attn_m).astype(jnp.bool_) & packed_shift_mask
     else:
         shift_logits = logits
         shift_labels = labels
