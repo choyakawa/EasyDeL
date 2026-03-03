@@ -1806,13 +1806,24 @@ def ForCausalLMLoss(
         if attention_mask is not None:
             shift_attn_m = attention_mask
 
+    loss_batch = None
+    if batch is not None:
+        loss_batch = dict(batch)
+        loss_batch["decoder_target_tokens"] = shift_labels
+        if shift_attn_m is not None:
+            loss_batch["decoder_loss_weights"] = shift_attn_m
+        for key in ("decoder_positions", "decoder_segment_ids"):
+            value = loss_batch.get(key)
+            if value is not None and config.shift_tokens:
+                loss_batch[key] = value[:, 1:] if value.ndim > 1 else value[1:]
+
     loss = fixed_cross_entropy(
         source=shift_logits,
         target=shift_labels,
         attention_mask=shift_attn_m,
         config=config,
         num_items_in_batch=num_items_in_batch,
-        batch=batch,
+        batch=loss_batch,
         **kwargs,
     )
     return loss
