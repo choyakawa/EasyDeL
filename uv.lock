@@ -739,9 +739,9 @@ requires-dist = [
     { name = "datasets", specifier = ">=3.6.0" },
     { name = "eformer", specifier = "==0.0.98" },
     { name = "einops", specifier = "~=0.8.0" },
-    { name = "ejkernel", specifier = "==0.0.66" },
-    { name = "ejkernel", extras = ["cuda", "triton"], marker = "extra == 'cuda'", specifier = "==0.0.66" },
-    { name = "ejkernel", extras = ["tpu"], marker = "extra == 'tpu'", specifier = "==0.0.66" },
+    { name = "ejkernel", specifier = "==0.0.67" },
+    { name = "ejkernel", extras = ["cuda", "triton"], marker = "extra == 'cuda'", specifier = "==0.0.67" },
+    { name = "ejkernel", extras = ["tpu"], marker = "extra == 'tpu'", specifier = "==0.0.67" },
     { name = "eopod", marker = "extra == 'podutils'", specifier = "==0.0.35" },
     { name = "fastapi", specifier = ">=0.115.2" },
     { name = "flax", specifier = "==0.12.3" },
@@ -770,7 +770,7 @@ requires-dist = [
     { name = "torch", marker = "extra == 'cuda' and extra == 'torch'", specifier = "==2.8.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "extra == 'cuda' and extra != 'torch'", specifier = "==2.8.0" },
     { name = "torch", marker = "extra == 'torch'", specifier = "==2.8.0", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "transformers", specifier = "~=5.0.0" },
+    { name = "transformers", specifier = "~=5.2.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32.0" },
     { name = "uvloop", specifier = "==0.21.0" },
     { name = "wandb", specifier = ">=0.22.2" },
@@ -820,7 +820,7 @@ wheels = [
 
 [[package]]
 name = "ejkernel"
-version = "0.0.66"
+version = "0.0.67"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beartype" },
@@ -832,9 +832,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3f/1e/60e24c0087ffeea93008a306dfd5a4ca2d05b9d150f2fd70500c0caf8394/ejkernel-0.0.66.tar.gz", hash = "sha256:fadaf2b621b526f692c286ff141a93eaa4364dd71383d82e5a226bf59dfade9c", size = 1475695, upload-time = "2026-02-21T12:00:16.653Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c2/fc/e44dbb76b074abc619d70ad8b19307cba4269c19e8615c2e81e2ca5f096e/ejkernel-0.0.67.tar.gz", hash = "sha256:d1529686b8534c57808840c55ea9e437dea0ecb759333a6047cc3dadd8f61c52", size = 1488729, upload-time = "2026-03-02T10:57:21.567Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/bb/c9/f410130c464f1f42e22fc56b313dc42eba94c7926feddab3bab0fabea4a6/ejkernel-0.0.66-py3-none-any.whl", hash = "sha256:9fe451577d0dfc33d660e69d334ee7330e0aea79089fb97fe42b2aa3a8fa0b83", size = 3203301, upload-time = "2026-02-21T12:00:18.149Z" },
+    { url = "https://files.pythonhosted.org/packages/66/6c/62bf167db3e1925b27d166e8ed6ca39680d039cea8b130b04941628f12b8/ejkernel-0.0.67-py3-none-any.whl", hash = "sha256:efff4a2d88050801dffb7d80b25b388e04a9cd13aa25de310d8e6055211e2aef", size = 3222822, upload-time = "2026-03-02T10:57:23.127Z" },
 ]
 
 [package.optional-dependencies]
@@ -4391,10 +4391,9 @@ wheels = [
 
 [[package]]
 name = "transformers"
-version = "5.0.0"
+version = "5.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "filelock" },
     { name = "huggingface-hub" },
     { name = "numpy" },
     { name = "packaging" },
@@ -4405,9 +4404,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "typer-slim" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/bc/79/845941711811789c85fb7e2599cea425a14a07eda40f50896b9d3fda7492/transformers-5.0.0.tar.gz", hash = "sha256:5f5634efed6cf76ad068cc5834c7adbc32db78bbd6211fb70df2325a9c37dec8", size = 8424830, upload-time = "2026-01-26T10:46:46.813Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/bd/7e/8a0c57d562015e5b16c97c1f0b8e0e92ead2c7c20513225dc12c2043ba9f/transformers-5.2.0.tar.gz", hash = "sha256:0088b8b46ccc9eff1a1dca72b5d618a5ee3b1befc3e418c9512b35dea9f9a650", size = 8618176, upload-time = "2026-02-16T18:54:02.867Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/52/f3/ac976fa8e305c9e49772527e09fbdc27cc6831b8a2f6b6063406626be5dd/transformers-5.0.0-py3-none-any.whl", hash = "sha256:587086f249ce64c817213cf36afdb318d087f790723e9b3d4500b97832afd52d", size = 10142091, upload-time = "2026-01-26T10:46:43.88Z" },
+    { url = "https://files.pythonhosted.org/packages/4e/93/79754b0ca486e556c2b95d4f5afc66aaf4b260694f3d6e1b51da2d036691/transformers-5.2.0-py3-none-any.whl", hash = "sha256:9ecaf243dc45bee11a7d93f8caf03746accc0cb069181bbf4ad8566c53e854b4", size = 10403304, upload-time = "2026-02-16T18:53:59.699Z" },
 ]
 
 [[package]]

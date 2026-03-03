@@ -1050,6 +1050,8 @@ class SFTPreprocessTransform(Transform):
         mask_prompt: Whether to create completion mask for completion-only loss.
         add_eos: Whether to add EOS token to text.
         truncation: Whether to truncate to max_length.
+        pad_to_max_length: Whether to pad tokenized samples to max_length during
+            preprocessing. Disable this when sequence packing will run afterward.
         formatting_func: Optional function to format examples before tokenization.
             Should take an example dict and return a string or dict with "text" field.
 
@@ -1072,6 +1074,7 @@ class SFTPreprocessTransform(Transform):
         mask_prompt: bool = False,
         add_eos: bool = True,
         truncation: bool = True,
+        pad_to_max_length: bool = True,
         formatting_func: tp.Callable | None = None,
     ):
         self._tokenizer = tokenizer
@@ -1081,7 +1084,15 @@ class SFTPreprocessTransform(Transform):
         self._mask_prompt = mask_prompt
         self._add_eos = add_eos
         self._truncation = truncation
+        self._pad_to_max_length = pad_to_max_length
         self._formatting_func = formatting_func
+        chat_template = getattr(tokenizer, "chat_template", None)
+        self._return_assistant_tokens_mask = bool(
+            mask_prompt and isinstance(chat_template, str) and "{% generation %}" in chat_template
+        )
+
+    def _padding_mode(self) -> bool | str:
+        return "max_length" if self._pad_to_max_length and self._max_length else False
 
     def __call__(self, example: Example) -> Example:
         """Apply SFT preprocessing to example.
@@ -1174,10 +1185,10 @@ class SFTPreprocessTransform(Transform):
                 messages,
                 return_dict=True,
                 return_attention_mask=True,
-                return_assistant_tokens_mask=self._mask_prompt,
+                return_assistant_tokens_mask=self._return_assistant_tokens_mask,
                 truncation=self._truncation,
                 max_length=self._max_length,
-                padding="max_length" if self._max_length else False,
+                padding=self._padding_mode(),
                 tools=tools,
             )
             result.update(processed)
@@ -1196,11 +1207,13 @@ class SFTPreprocessTransform(Transform):
                 text,
                 truncation=self._truncation,
                 max_length=self._max_length,
-                padding="max_length" if self._max_length else False,
+                padding=self._padding_mode(),
                 return_attention_mask=True,
             )
             result["input_ids"] = tokens["input_ids"]
             result["attention_mask"] = tokens["attention_mask"]
+
+        self._apply_completion_labels(result)
 
         # Remove non-tokenized fields
         return purify_example(result)
@@ -1266,7 +1279,7 @@ class SFTPreprocessTransform(Transform):
             full_text,
             truncation=self._truncation,
             max_length=self._max_length,
-            padding="max_length" if self._max_length else False,
+            padding=self._padding_mode(),
             return_attention_mask=True,
             add_special_tokens=False,
         )
@@ -1283,6 +1296,7 @@ class SFTPreprocessTransform(Transform):
             # Apply attention mask to zero out padding positions
             completion_mask = [m * a for m, a in zip(completion_mask, tokens["attention_mask"], strict=True)]
             result["completion_mask"] = completion_mask
+            self._apply_completion_labels(result)
 
         # Remove non-tokenized fields
         return purify_example(result)
@@ -1301,7 +1315,7 @@ class SFTPreprocessTransform(Transform):
             text,
             truncation=self._truncation,
             max_length=self._max_length,
-            padding="max_length" if self._max_length else False,
+            padding=self._padding_mode(),
             return_attention_mask=True,
         )
 
@@ -1310,6 +1324,37 @@ class SFTPreprocessTransform(Transform):
 
         # Remove non-tokenized fields
         return purify_example(result)
+
+    def _apply_completion_labels(self, result: dict) -> None:
+        """Convert assistant/completion masks into ignore-indexed labels."""
+        if not self._mask_prompt:
+            return
+
+        input_ids = result.get("input_ids")
+        if input_ids is None:
+            return
+
+        completion_mask = result.get("completion_mask")
+        if completion_mask is None:
+            completion_mask = result.get("assistant_masks")
+            if completion_mask is not None:
+                result["completion_mask"] = completion_mask
+
+        if completion_mask is None:
+            raise ValueError(
+                "assistant_only_loss=True requires an assistant/completion mask, but none was produced. "
+                "For conversational data, use a tokenizer chat template that supports `{% generation %}`. "
+                "For prompt/completion data, provide explicit prompt and completion fields."
+            )
+
+        attention_mask = result.get("attention_mask")
+        labels = []
+        for idx, token_id in enumerate(input_ids):
+            keep = bool(completion_mask[idx])
+            if attention_mask is not None:
+                keep = keep and bool(attention_mask[idx])
+            labels.append(token_id if keep else -100)
+        result["labels"] = labels
 
     def __repr__(self) -> str:
         return f"SFTPreprocessTransform(max_length={self._max_length}, mask_prompt={self._mask_prompt})"

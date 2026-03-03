@@ -1294,8 +1294,8 @@ def _sum_weights_per_segment(
     Args:
         positions: Position indices within each segment with shape (seq_len,).
             A value of 0 indicates the start of a new segment.
-        segment_ids: Segment identifiers with shape (seq_len,). Non-zero values
-            indicate valid positions; zero indicates padding.
+        segment_ids: Segment identifiers with shape (seq_len,). Non-negative values
+            indicate valid positions; negative values indicate padding.
         weights: Weights to sum per segment with shape (seq_len,).
 
     Returns:
@@ -1330,7 +1330,7 @@ def _sum_weights_per_segment(
 
     start_positions = positions == 0
     final_positions = jnp.concatenate([start_positions[1:], jnp.ones(1)])
-    final_positions *= segment_ids != 0
+    final_positions *= segment_ids >= 0
     final_cumulative_weights = final_positions * jnp.cumsum(weights)
     final_total_weights = jnp.concatenate(
         [
@@ -1340,6 +1340,19 @@ def _sum_weights_per_segment(
     )
     normalizer = _repeat_last_nonnegative(final_total_weights, reverse=True)
     return normalizer
+
+
+def _shifted_segment_continuation_mask(segment_ids: Array) -> Array:
+    """Mask valid next-token targets that stay within the same packed segment."""
+    segment_ids = jnp.asarray(segment_ids, dtype=jnp.int32)
+    if segment_ids.ndim == 1:
+        segment_ids = segment_ids[None, :]
+
+    current_segment_ids = segment_ids[:, :-1]
+    next_segment_ids = segment_ids[:, 1:]
+    same_segment = current_segment_ids == next_segment_ids
+    valid_segment = (current_segment_ids >= 0) & (next_segment_ids >= 0)
+    return same_segment & valid_segment
 
 
 def get_factor_and_weight(
@@ -1389,7 +1402,7 @@ def get_factor_and_weight(
         loss_normalizing_factor = convert_special_loss_normalizing_factor_to_enum(loss_normalizing_factor)
 
     if loss_weights is None:
-        loss_weights = jnp.asarray(batch["decoder_target_tokens"] > 0, compute_dtype)
+        loss_weights = jnp.asarray(batch["decoder_target_tokens"] != -100, compute_dtype)
 
     output_normalizing_factor = None
     if loss_normalizing_factor == SLNF.NUM_REAL_TARGET_TOKENS:
@@ -1799,6 +1812,13 @@ def ForCausalLMLoss(
         shift_labels = labels[:, 1:]
         if attention_mask is not None:
             shift_attn_m = attention_mask[:, 1:]
+
+        packed_segment_ids = None
+        if batch is not None:
+            packed_segment_ids = batch.get("decoder_segment_ids", batch.get("segment_ids"))
+        if packed_segment_ids is not None:
+            continuation_mask = _shifted_segment_continuation_mask(packed_segment_ids)
+            shift_attn_m = continuation_mask if shift_attn_m is None else jnp.logical_and(shift_attn_m, continuation_mask)
     else:
         shift_logits = logits
         shift_labels = labels
@@ -1806,13 +1826,27 @@ def ForCausalLMLoss(
         if attention_mask is not None:
             shift_attn_m = attention_mask
 
+    loss_batch = None
+    if batch is not None:
+        loss_batch = dict(batch)
+        loss_batch["decoder_target_tokens"] = shift_labels
+        label_weights = (shift_labels != config.ignore_index).astype(shift_logits.dtype)
+        if shift_attn_m is not None:
+            loss_batch["decoder_loss_weights"] = shift_attn_m.astype(shift_logits.dtype) * label_weights
+        else:
+            loss_batch["decoder_loss_weights"] = label_weights
+        for key in ("decoder_positions", "decoder_segment_ids"):
+            value = loss_batch.get(key)
+            if value is not None and config.shift_tokens:
+                loss_batch[key] = value[:, 1:] if value.ndim > 1 else value[1:]
+
     loss = fixed_cross_entropy(
         source=shift_logits,
         target=shift_labels,
         attention_mask=shift_attn_m,
         config=config,
         num_items_in_batch=num_items_in_batch,
-        batch=batch,
+        batch=loss_batch,
         **kwargs,
     )
     return loss

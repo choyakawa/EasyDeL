@@ -309,6 +309,17 @@ class TrainingArguments:
         default=None,
         metadata={"help": "The maximum number of training steps."},
     )
+    max_training_raw_items: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Maximum number of real, un-packed training items to consume before stopping. "
+                "This limit is independent from packing and can be used without setting "
+                "`max_training_steps`. When used alone, training may span multiple epochs "
+                "until the raw-item budget is reached."
+            )
+        },
+    )
     per_epoch_training_steps: int | None = field(
         default=None,
         metadata={"help": "The maximum number of training step per each epoch."},
@@ -582,7 +593,7 @@ class TrainingArguments:
         default=None,
         metadata={"help": "The dtype to use for the `tx.mu` variable."},
     )
-    track_memory: bool | float = field(
+    track_memory: bool = field(
         default=False,
         metadata={"help": "Whether to track memory usage. If a float, it sets the memory tracking interval in seconds."},
     )

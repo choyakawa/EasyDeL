@@ -29,7 +29,9 @@ import functools
 
 import jax
 import jax.numpy as jnp
+from eformer import common_types
 from eformer.common_types import Replicated
+from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
 from einops import repeat
 from flax import nnx as nn
@@ -37,7 +39,7 @@ from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array
 
-from easydel.caching import RecurrentCache, RecurrentCacheConfig, RecurrentCacheView
+from easydel.caching import OperationsMetadata, RecurrentCache, RecurrentCacheConfig, RecurrentCacheView
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput
@@ -84,6 +86,7 @@ class FalconMambaOutput(BaseModelOutput):
         last_hidden_state: The final hidden state tensor of shape
             (batch_size, sequence_length, hidden_size) after the last layer
             and final normalization.
+        past_key_values: Alias for cache_params, for eSurge compatibility.
         cache_params: Recurrent cache containing the SSM states and convolution
             states for each layer, used during autoregressive generation.
         hidden_states: Optional tuple of hidden states at each layer when
@@ -91,6 +94,7 @@ class FalconMambaOutput(BaseModelOutput):
     """
 
     last_hidden_state: Array = None
+    past_key_values: RecurrentCache | None = None
     cache_params: RecurrentCache | None = None
     hidden_states: tuple[Array] | None = None
 
@@ -103,6 +107,8 @@ class FalconMambaCausalLMOutput(BaseModelOutput):
     including vocabulary logits for next token prediction.
 
     Attributes:
+        last_hidden_state: The final hidden state from the backbone before the LM
+            head, shape (batch_size, sequence_length, hidden_size).
         logits: The language model logits of shape (batch_size, sequence_length,
             vocab_size) for next token prediction. None if apply_lm_head=False.
         cache_params: Recurrent cache containing the SSM states and convolution
@@ -111,6 +117,8 @@ class FalconMambaCausalLMOutput(BaseModelOutput):
             output_hidden_states=True, including the final normalized output.
     """
 
+    last_hidden_state: Array = None
+    past_key_values: RecurrentCache | None = None
     logits: Array = None
     cache_params: RecurrentCache | None = None
     hidden_states: tuple[Array] | None = None
@@ -441,30 +449,25 @@ class FalconMambaMixer(nn.Module):
         cache_params: RecurrentCacheView | None = None,
         cache_position: Array | None = None,
         attention_mask: Array | None = None,
+        cache_metadata: OperationsMetadata | None = None,
     ) -> tuple[Array, RecurrentCacheView | None]:
         """Apply selective SSM transformation to input hidden states.
 
-        This method performs the complete Mamba SSM forward pass:
-        1. Project input to expanded dimension and split into hidden/gate streams.
-        2. Apply causal convolution to the hidden stream.
-        3. Compute input-dependent SSM parameters (dt, B, C) with RMS normalization.
-        4. Run the selective scan SSM operation.
-        5. Apply gating and project back to original hidden dimension.
+        Supports three modes:
+        - Prefill: Full sequence convolution + SSM.
+        - Decode (standard): Single-token convolution + SSM step.
+        - Decode (packed / eSurge): ``batch=1`` with multiple tokens packed
+          into seq_len.  Uses ``fori_loop`` to update each token's slot state.
 
         Args:
-            input_states: Input hidden states of shape
-                (batch_size, sequence_length, hidden_size).
-            cache_params: Optional cache view containing SSM state and convolution
-                state from previous steps for autoregressive generation.
-            cache_position: Optional position indices for cache update (unused).
-            attention_mask: Optional attention mask of shape (batch_size, sequence_length)
-                to mask padded positions.
+            input_states: Input hidden states ``(batch, seq_len, hidden_size)``.
+            cache_params: Optional cache view with SSM + conv state per slot.
+            cache_position: Optional position indices (unused).
+            attention_mask: Optional mask ``(batch, seq_len)``.
+            cache_metadata: eSurge packed metadata (query_start_loc, num_seqs).
 
         Returns:
-            A tuple containing:
-                - contextualized_states: Output hidden states of shape
-                    (batch_size, sequence_length, hidden_size).
-                - cache_params: Updated cache view with new SSM and convolution states.
+            ``(output, updated_cache_view)``
         """
         batch_size, seq_len, _ = input_states.shape
         dtype = input_states.dtype
@@ -472,9 +475,111 @@ class FalconMambaMixer(nn.Module):
         projected_states = checkpoint_name(self.in_proj(input_states), name="ssm_input_proj")
         projected_states = jnp.swapaxes(projected_states, 2, 1)
         hidden_states, gate = jnp.split(projected_states, 2, axis=1)
+        # hidden_states: [B, I, L], gate: [B, I, L]
 
         if attention_mask is not None:
             hidden_states = hidden_states * jnp.expand_dims(attention_mask, 1)
+
+        packed_query_start_loc = getattr(cache_metadata, "query_start_loc", None) if cache_metadata is not None else None
+        packed_num_seqs = getattr(cache_metadata, "num_seqs", None) if cache_metadata is not None else None
+        use_packed_state_updates = (
+            cache_params is not None
+            and cache_params.conv_state is not None
+            and cache_params.recurrent_state is not None
+            and batch_size == 1
+            and packed_query_start_loc is not None
+            and packed_num_seqs is not None
+        )
+
+        if use_packed_state_updates:
+            from easydel.operations.kernels.ssm1 import _single_step_ssm1_fwd
+
+            conv_states = cache_params.conv_state  # [max_seqs, I, d_conv]
+            ssm_states = cache_params.recurrent_state.astype(jnp.float32)  # [max_seqs, I, N]
+            token_slots = jnp.clip(
+                jnp.searchsorted(packed_query_start_loc, jnp.arange(seq_len), side="right") - 1,
+                0,
+                packed_num_seqs - 1,
+            )
+
+            A_real = -jnp.exp(self.A_log.value.astype(jnp.float32))
+            D_val = self.D.value.astype(jnp.float32)
+            conv_kernel = self.conv1d.kernel.value  # [kernel_size, 1, I]
+            conv_bias = (
+                self.conv1d.bias.value
+                if self.config.use_conv_bias
+                else jnp.zeros(self.intermediate_size, dtype=conv_kernel.dtype)
+            )
+
+            token_outputs = jnp.zeros((seq_len, self.intermediate_size), dtype=jnp.float32)
+
+            def _body(idx, carry):
+                conv_states_c, ssm_states_c, token_outputs_c = carry
+                slot = token_slots[idx]
+
+                # 1) Conv update for this token
+                conv_state_i = jax.lax.dynamic_slice_in_dim(conv_states_c, slot, 1, axis=0)  # [1, I, d_conv]
+                new_token = hidden_states[0, :, idx]  # [I]
+                conv_state_i = jnp.roll(conv_state_i, shift=-1, axis=-1)
+                conv_state_i = conv_state_i.at[:, :, -1].set(new_token.astype(conv_state_i.dtype))
+
+                # Manual depthwise conv + bias + activation
+                conv_out = jnp.sum(conv_state_i[0] * conv_kernel[:, 0, :].T, axis=-1) + conv_bias  # [I]
+                conv_out = self.act(conv_out).astype(jnp.float32)
+
+                # 2) x_proj: extract time_step, B, C
+                x_proj_out = self.x_proj(conv_out[None, None, :])  # [1, 1, tr+2N]
+                x_proj_out = x_proj_out[0, 0]  # [tr+2N]
+                time_step_i = x_proj_out[: self.time_step_rank]
+                ssm_b_i = x_proj_out[self.time_step_rank : self.time_step_rank + self.ssm_state_size]
+                ssm_c_i = x_proj_out[self.time_step_rank + self.ssm_state_size :]
+
+                # 3) RMS normalize
+                ssm_b_i = rms_forward(ssm_b_i[None], variance_epsilon=self.rms_eps)[0]  # [N]
+                ssm_c_i = rms_forward(ssm_c_i[None], variance_epsilon=self.rms_eps)[0]  # [N]
+                time_step_i = rms_forward(time_step_i[None], variance_epsilon=self.rms_eps)[0]  # [tr]
+
+                # 4) dt_proj + softplus
+                dt_i = self.dt_proj(time_step_i[None, None, :])[0, 0]  # [I]
+                dt_i = jax.nn.softplus(dt_i)
+
+                # 5) SSM single step
+                ssm_state_i = jax.lax.dynamic_slice_in_dim(ssm_states_c, slot, 1, axis=0)  # [1, I, N]
+                y_i, new_ssm_state_i = _single_step_ssm1_fwd(
+                    hidden_states=conv_out[None, :],
+                    A=A_real,
+                    B=ssm_b_i[None, :],
+                    C=ssm_c_i[None, :],
+                    D=D_val,
+                    dt=dt_i[None, :],
+                    ssm_state=ssm_state_i,
+                )
+
+                # 6) Apply gate: y * silu(gate)
+                gate_i = gate[0, :, idx]  # [I]
+                y_gated = y_i[0] * jax.nn.silu(gate_i.astype(jnp.float32))
+
+                # Write back
+                conv_states_c = jax.lax.dynamic_update_slice_in_dim(conv_states_c, conv_state_i, slot, axis=0)
+                ssm_states_c = jax.lax.dynamic_update_slice_in_dim(ssm_states_c, new_ssm_state_i.astype(ssm_states_c.dtype), slot, axis=0)
+                token_outputs_c = token_outputs_c.at[idx].set(y_gated)
+                return conv_states_c, ssm_states_c, token_outputs_c
+
+            conv_states, ssm_states, token_outputs = jax.lax.fori_loop(
+                0,
+                seq_len,
+                _body,
+                (conv_states, ssm_states, token_outputs),
+            )
+
+            y = token_outputs.reshape(1, seq_len, self.intermediate_size)
+            cache_view = cache_params.replace(
+                conv_state=conv_states,
+                recurrent_state=ssm_states.astype(dtype),
+            )
+
+            contextualized_states = checkpoint_name(self.out_proj(y.astype(dtype)), name="ssm_output_proj")
+            return contextualized_states, cache_view
 
         cache_view = cache_params
         if cache_params is not None and cache_params.recurrent_state is not None:
@@ -524,6 +629,12 @@ class FalconMambaMixer(nn.Module):
         hidden_states_t = jnp.swapaxes(hidden_states, 1, 2)
         gate_t = jnp.swapaxes(gate, 1, 2)
 
+        hidden_states_t = apply_logical_sharding(
+            hidden_states_t,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
+
         ssm_output = self.ssm_op(
             hidden_states=hidden_states_t,
             A=self.A_log.value,
@@ -541,7 +652,13 @@ class FalconMambaMixer(nn.Module):
         if cache_view is not None:
             cache_view = cache_view.replace(recurrent_state=ssm_output.ssm_state.astype(dtype))
 
-        contextualized_states = checkpoint_name(self.out_proj(jnp.swapaxes(y, 2, 1)), name="ssm_output_proj")
+        y_t = jnp.swapaxes(y, 2, 1)
+        y_t = apply_logical_sharding(
+            y_t,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
+        contextualized_states = checkpoint_name(self.out_proj(y_t), name="ssm_output_proj")
         return contextualized_states, cache_view
 
 
@@ -617,6 +734,7 @@ class FalconMambaBlock(nn.Module):
         cache_params: RecurrentCacheView | None = None,
         cache_position: Array | None = None,
         attention_mask: Array | None = None,
+        cache_metadata: "OperationsMetadata | None" = None,
     ) -> tuple[Array, RecurrentCacheView | None]:
         """Process hidden states through the FalconMamba block.
 
@@ -630,6 +748,7 @@ class FalconMambaBlock(nn.Module):
             cache_position: Optional position indices for cache update.
             attention_mask: Optional attention mask of shape (batch_size, sequence_length)
                 to mask padded positions.
+            cache_metadata: eSurge packed metadata (query_start_loc, num_seqs).
 
         Returns:
             A tuple containing:
@@ -646,8 +765,14 @@ class FalconMambaBlock(nn.Module):
             cache_params,
             cache_position,
             attention_mask,
+            cache_metadata=cache_metadata,
         )
         hidden_states = residual + hidden_states
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
         return hidden_states, cache_params
 
 
@@ -741,9 +866,11 @@ class FalconMambaModel(EasyDeLBaseModule):
         input_ids: Array | None = None,
         inputs_embeds: Array | None = None,
         cache_params: RecurrentCache | None = None,
+        past_key_values=None,
         output_hidden_states: bool | None = None,
         cache_position: Array | None = None,
         attention_mask: Array | None = None,
+        cache_metadata: "OperationsMetadata | None" = None,
         **kwargs,
     ) -> tuple | FalconMambaOutput:
         """Process input through the FalconMamba backbone.
@@ -756,11 +883,14 @@ class FalconMambaModel(EasyDeLBaseModule):
                 with input_ids.
             cache_params: Optional recurrent cache containing SSM and convolution
                 states from previous generation steps.
+            past_key_values: Alternative cache input (e.g. HybridCache from eSurge).
+                Used when cache_params is None.
             output_hidden_states: Whether to return hidden states from all layers.
                 Defaults to config.output_hidden_states.
             cache_position: Optional position indices for cache update (unused).
             attention_mask: Optional attention mask of shape (batch_size, sequence_length).
                 If not provided, will be inferred from pad_token_id in input_ids.
+            cache_metadata: eSurge packed metadata (query_start_loc, num_seqs).
             **kwargs: Additional keyword arguments (unused).
 
         Returns:
@@ -782,6 +912,8 @@ class FalconMambaModel(EasyDeLBaseModule):
 
         if inputs_embeds is None:
             inputs_embeds = self.embeddings(input_ids)
+        if cache_params is None and past_key_values is not None:
+            cache_params = past_key_values
         if cache_params is None:
             cache_params = RecurrentCache.init_empty(len(self.layers))
         if attention_mask is None:
@@ -811,6 +943,7 @@ class FalconMambaModel(EasyDeLBaseModule):
                 cache_params=cache_params.views[idx],
                 cache_position=cache_position,
                 attention_mask=attention_mask,
+                cache_metadata=cache_metadata,
             )
             cache_params[idx] = cache_view
             if output_hidden_states:
@@ -824,6 +957,7 @@ class FalconMambaModel(EasyDeLBaseModule):
 
         return FalconMambaOutput(
             last_hidden_state=hidden_states,
+            past_key_values=cache_params,
             cache_params=cache_params,
             hidden_states=all_hidden_states,
         )
@@ -932,10 +1066,12 @@ class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaCon
         input_ids: Array | None = None,
         inputs_embeds: Array | None = None,
         cache_params: RecurrentCache | None = None,
+        past_key_values=None,
         output_hidden_states: bool | None = None,
         apply_lm_head: bool = True,
         cache_position: Array | None = None,
         attention_mask: Array | None = None,
+        cache_metadata: "OperationsMetadata | None" = None,
         **kwargs,
     ) -> tuple | FalconMambaCausalLMOutput:
         """Process input and compute language modeling logits.
@@ -948,6 +1084,8 @@ class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaCon
                 with input_ids.
             cache_params: Optional recurrent cache containing SSM and convolution
                 states from previous generation steps.
+            past_key_values: Alternative cache input (e.g. HybridCache from eSurge).
+                Used when cache_params is None.
             output_hidden_states: Whether to return hidden states from all layers.
                 Defaults to config.output_hidden_states.
             apply_lm_head: Whether to apply the language model head to compute
@@ -955,7 +1093,7 @@ class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaCon
                 Defaults to True.
             cache_position: Optional position indices for cache update (unused).
             attention_mask: Optional attention mask of shape (batch_size, sequence_length).
-            **kwargs: Additional keyword arguments (unused).
+            cache_metadata: eSurge packed metadata (query_start_loc, num_seqs).
 
         Returns:
             FalconMambaCausalLMOutput containing:
@@ -968,9 +1106,11 @@ class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaCon
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             cache_params=cache_params,
+            past_key_values=past_key_values,
             output_hidden_states=output_hidden_states,
             cache_position=cache_position,
             attention_mask=attention_mask,
+            cache_metadata=cache_metadata,
         )
 
         logits = None
@@ -978,6 +1118,8 @@ class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaCon
             logits = self.apply_lm_head(outputs.last_hidden_state)
 
         return FalconMambaCausalLMOutput(
+            last_hidden_state=outputs.last_hidden_state,
+            past_key_values=outputs.past_key_values,
             logits=logits,
             cache_params=outputs.cache_params,
             hidden_states=outputs.hidden_states,

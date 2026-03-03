@@ -19,7 +19,10 @@ __version__ = "0.3.0"
 
 import os as _os
 import sys as _sys
+import types as _types
 import typing as _tp
+from importlib import machinery as _machinery
+from importlib import util as _importlib_util
 from logging import getLogger as _getlogger
 
 try:
@@ -38,6 +41,33 @@ from .utils import check_bool_flag as _check_bool_flag
 from .utils import is_package_available as _is_package_available
 
 _logger = _get_logger("EasyDeL")
+
+
+def _ensure_optional_deepspeed_stub() -> None:
+    """Provide a minimal deepspeed module for remote-code import checks.
+
+    Some HF Hub remote modules import `deepspeed` unconditionally even when
+    they can run without it. In environments where deepspeed is unavailable,
+    this keeps class loading functional without pretending the full package is
+    installed (`transformers.integrations.deepspeed.is_deepspeed_available()`
+    still returns `False` because distribution metadata is absent).
+    """
+    try:
+        if _importlib_util.find_spec("deepspeed") is not None:
+            return
+    except (ModuleNotFoundError, ValueError):
+        return
+
+    if "deepspeed" in _sys.modules:
+        return
+
+    _stub = _types.ModuleType("deepspeed")
+    _stub.__version__ = "0.0.0"
+    _stub.__spec__ = _machinery.ModuleSpec(name="deepspeed", loader=None)
+    _sys.modules["deepspeed"] = _stub
+
+
+_ensure_optional_deepspeed_stub()
 
 
 def _patch_transformers_import_utils() -> None:
@@ -200,11 +230,6 @@ if _check_bool_flag("EASYDEL_AUTO", True):
     _os.environ["TPU_LOG_DIR"] = "disabled"
     _os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-    _os.environ["JAX_ENABLE_PGLE"] = "true"
-    _os.environ["JAX_CAPTURED_CONSTANTS_WARN_BYTES"] = "-1"
-
-    _os.environ["JAX_PGLE_PROFILING_RUNS"] = "3"
-    _os.environ["JAX_PGLE_AGGREGATION_PERCENTILE"] = "85"
     _os.environ["XLA_FLAGS"] = (
         _os.getenv("XLA_FLAGS", "") + " "
         "--xla_gpu_triton_gemm_any=true  "
@@ -501,6 +526,11 @@ _import_structure = {
         "Glm4MoeLiteForCausalLM",
         "Glm4MoeLiteModel",
     ],
+    "modules.glm_moe_dsa": [
+        "GlmMoeDsaConfig",
+        "GlmMoeDsaForCausalLM",
+        "GlmMoeDsaModel",
+    ],
     "modules.glm4v": [
         "Glm4vConfig",
         "Glm4vForConditionalGeneration",
@@ -689,6 +719,24 @@ _import_structure = {
         "Qwen2VLForConditionalGeneration",
         "Qwen2VLModel",
     ],
+    "modules.qwen3_5": [
+        "Qwen3_5Config",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5Model",
+        "Qwen3_5TextConfig",
+        "Qwen3_5TextModel",
+        "Qwen3_5VisionConfig",
+    ],
+    "modules.qwen3_5_moe": [
+        "Qwen3_5MoeConfig",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5MoeModel",
+        "Qwen3_5MoeTextConfig",
+        "Qwen3_5MoeTextModel",
+        "Qwen3_5MoeVisionConfig",
+    ],
     "modules.qwen3": [
         "Qwen3Config",
         "Qwen3ForCausalLM",
@@ -823,6 +871,8 @@ _import_structure = {
         "PPOTrainer",
         "XPOConfig",
         "XPOTrainer",
+        "OnPolicyDistillationConfig",
+        "OnPolicyDistillationTrainer",
         "ORPOConfig",
         "ORPOTrainer",
         "RayDistributedTrainer",
@@ -832,6 +882,10 @@ _import_structure = {
         "SDPOTrainer",
         "SFTConfig",
         "SFTTrainer",
+        "SeqKDConfig",
+        "SeqKDTrainer",
+        "SparseDistillationConfig",
+        "SparseDistillationTrainer",
         "Trainer",
         "TrainingArguments",
         "pack_sequences",
@@ -971,6 +1025,7 @@ if _tp.TYPE_CHECKING:
         Glm4vMoeVisionModel,
     )
     from .modules.glm46v import Glm46VConfig, Glm46VForConditionalGeneration, Glm46VModel
+    from .modules.glm_moe_dsa import GlmMoeDsaConfig, GlmMoeDsaForCausalLM, GlmMoeDsaModel
     from .modules.gpt2 import GPT2Config, GPT2LMHeadModel, GPT2Model
     from .modules.gpt_j import GPTJConfig, GPTJForCausalLM, GPTJModel
     from .modules.gpt_neox import GPTNeoXConfig, GPTNeoXForCausalLM, GPTNeoXModel
@@ -1016,6 +1071,24 @@ if _tp.TYPE_CHECKING:
     from .modules.qwen2_moe import Qwen2MoeConfig, Qwen2MoeForCausalLM, Qwen2MoeForSequenceClassification, Qwen2MoeModel
     from .modules.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration, Qwen2VLModel
     from .modules.qwen3 import Qwen3Config, Qwen3ForCausalLM, Qwen3ForSequenceClassification, Qwen3Model
+    from .modules.qwen3_5 import (
+        Qwen3_5Config,
+        Qwen3_5ForCausalLM,
+        Qwen3_5ForConditionalGeneration,
+        Qwen3_5Model,
+        Qwen3_5TextConfig,
+        Qwen3_5TextModel,
+        Qwen3_5VisionConfig,
+    )
+    from .modules.qwen3_5_moe import (
+        Qwen3_5MoeConfig,
+        Qwen3_5MoeForCausalLM,
+        Qwen3_5MoeForConditionalGeneration,
+        Qwen3_5MoeModel,
+        Qwen3_5MoeTextConfig,
+        Qwen3_5MoeTextModel,
+        Qwen3_5MoeVisionConfig,
+    )
     from .modules.qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM, Qwen3MoeForSequenceClassification, Qwen3MoeModel
     from .modules.qwen3_next import (
         Qwen3NextConfig,
@@ -1136,6 +1209,8 @@ if _tp.TYPE_CHECKING:
         KTOTrainer,
         NashMDConfig,
         NashMDTrainer,
+        OnPolicyDistillationConfig,
+        OnPolicyDistillationTrainer,
         ORPOConfig,
         ORPOTrainer,
         RayDistributedTrainer,
@@ -1143,8 +1218,12 @@ if _tp.TYPE_CHECKING:
         RewardTrainer,
         SDPOConfig,
         SDPOTrainer,
+        SeqKDConfig,
+        SeqKDTrainer,
         SFTConfig,
         SFTTrainer,
+        SparseDistillationConfig,
+        SparseDistillationTrainer,
         Trainer,
         TrainingArguments,
         XPOConfig,
@@ -1171,7 +1250,7 @@ else:
     )
 
     _targeted_eformer_versions = ["0.0.98"]
-    _targeted_ejkernel_versions = ["0.0.66"]
+    _targeted_ejkernel_versions = ["0.0.67"]
 
     from eformer import __version__ as _eform_version
     from ejkernel import __version__ as _ejker_version

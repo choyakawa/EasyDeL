@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import collections.abc
 import copy
+import json
 import os
 import pprint
 import time
@@ -34,7 +35,6 @@ from eformer import common_types
 from eformer.escale import with_sharding_constraint
 from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
-from flax import nnx as nn
 from jax import numpy as jnp
 from jax._src.stages import Compiled
 from jax.sharding import NamedSharding, PartitionSpec
@@ -87,6 +87,7 @@ logger = get_logger(__name__)
 log_debug_maybe = logger.debug
 
 DEFAULT_ARGS_JSON_NAME = "easydel-training-arguments.json"
+RAW_PROGRESS_JSON_NAME = "easydel-raw-progress.json"
 
 
 class GenerationResults(NamedTuple):
@@ -196,6 +197,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 if checkpoint_path is not None:
                     logger.info(f"Found latest checkpoint: {checkpoint_path}")
                     model = model_state.model
+                    raw_progress_state = self._load_raw_progress_state(checkpoint_path)
                     resumed_state = EasyDeLState.load_state(
                         load_directory=checkpoint_path,
                         dtype=model.dtype,
@@ -219,6 +221,7 @@ class BaseTrainer(BaseTrainerProtocol):
 
                     model_state = resumed_state
                     self._resumed_from_checkpoint = True
+                    self._resumed_consumed_train_raw_items = int(raw_progress_state.get("consumed_train_raw_items", 0))
                 else:
                     logger.info("No checkpoints found. Starting fresh training.")
             except Exception as e:
@@ -280,6 +283,12 @@ class BaseTrainer(BaseTrainerProtocol):
         # Convert datasets to ShardedDataSource for unified internal handling
         self._train_source = self._to_sharded_source(dataset_train)
         self._eval_source = self._to_sharded_source(dataset_eval)
+        self._raw_train_item_count = self._safe_len(self._train_source if self._train_source is not None else dataset_train)
+        self._raw_eval_item_count = self._safe_len(self._eval_source if self._eval_source is not None else dataset_eval)
+        self._train_progress_uses_raw_items = self._raw_train_item_count is not None or self._raw_item_limit_active()
+        self._consumed_train_raw_items = 0
+        self._pending_train_progress_update = 0
+        self._resumed_consumed_train_raw_items = getattr(self, "_resumed_consumed_train_raw_items", 0)
 
         # Apply trainer-specific preprocessing transform if available
         self._apply_preprocess_transforms()
@@ -540,6 +549,158 @@ class BaseTrainer(BaseTrainerProtocol):
             return dataset
         # Use wrap_hf_dataset for HF datasets
         return wrap_hf_dataset(dataset)
+
+    @staticmethod
+    def _safe_len(obj) -> int | None:
+        """Return an exact length when available, otherwise metadata estimate."""
+        if obj is None:
+            return None
+        try:
+            return len(obj)
+        except (TypeError, AttributeError):
+            estimated = getattr(obj, "estimated_length", None)
+            return int(estimated) if estimated is not None else None
+
+    @staticmethod
+    def _load_raw_progress_state(checkpoint_dir: str | os.PathLike | ePathLike) -> dict[str, int]:
+        """Load raw-progress sidecar state from a checkpoint directory."""
+        path = ePath(checkpoint_dir) / RAW_PROGRESS_JSON_NAME
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text())
+        except Exception:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        out: dict[str, int] = {}
+        consumed = data.get("consumed_train_raw_items")
+        if consumed is not None:
+            out["consumed_train_raw_items"] = int(consumed)
+        return out
+
+    def _save_raw_progress_state(self, checkpoint_dir: str | os.PathLike | ePathLike) -> None:
+        """Persist raw-progress sidecar state into a checkpoint directory."""
+        path = ePath(checkpoint_dir) / RAW_PROGRESS_JSON_NAME
+        payload = {
+            "consumed_train_raw_items": int(getattr(self, "_consumed_train_raw_items", 0)),
+        }
+        path.write_text(json.dumps(payload, indent=2))
+
+    def _is_default_num_train_epochs(self) -> bool:
+        """Whether num_train_epochs still has its dataclass default value."""
+        field_info = type(self.arguments).__dataclass_fields__["num_train_epochs"]
+        return self.arguments.num_train_epochs == field_info.default
+
+    def _effective_train_epoch_limit(self) -> int | None:
+        """Return the epoch limit actually used by the trainer."""
+        raw_limit = getattr(self.arguments, "max_training_raw_items", None)
+        if raw_limit is not None and self.arguments.max_training_steps is None and self._is_default_num_train_epochs():
+            return None
+        return self.arguments.num_train_epochs
+
+    def _raw_item_limit_active(self) -> bool:
+        raw_limit = getattr(self.arguments, "max_training_raw_items", None)
+        return raw_limit is not None and raw_limit > 0
+
+    def _resolve_configured_step_fallback(self, is_train: bool) -> int | None:
+        """Return configured step fallback when dataset length is unavailable."""
+        per_epoch_steps = (
+            self.arguments.per_epoch_training_steps if is_train else self.arguments.per_epoch_evaluation_steps
+        )
+        if per_epoch_steps is None:
+            return None
+        if not is_train:
+            return int(per_epoch_steps)
+        num_epochs = self._effective_train_epoch_limit()
+        if num_epochs is None:
+            return int(per_epoch_steps)
+        return int(per_epoch_steps) * int(num_epochs)
+
+    def _calculate_steps_without_scanning(self, dataset, *, is_train: bool) -> int:
+        """Resolve step counts without pre-iterating source-backed datasets."""
+        forced_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
+        if forced_steps is not None:
+            return int(forced_steps)
+
+        total_data_len = self._safe_len(dataset)
+        if total_data_len is not None:
+            batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
+            num_epochs = self.arguments.num_train_epochs if is_train else 1
+            return resolve_total_steps(
+                forced_steps=None,
+                total_data_len=total_data_len,
+                batch_size=batch_size,
+                num_epochs=num_epochs,
+                gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
+                is_train=is_train,
+            )
+
+        configured_steps = self._resolve_configured_step_fallback(is_train)
+        if configured_steps is not None:
+            return configured_steps
+
+        raise ValueError(
+            f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
+            "steps for a generator/streaming dataset."
+        )
+
+    def _estimate_training_steps_from_raw_item_limit(self, raw_item_limit: int, effective_train_epochs: int | None) -> int:
+        """Estimate training steps from a raw-item budget without scanning the dataset."""
+        if raw_item_limit <= 0:
+            return 0
+        capped_raw_items = int(raw_item_limit)
+        if self._raw_train_item_count is not None and effective_train_epochs is not None:
+            capped_raw_items = min(capped_raw_items, int(self._raw_train_item_count) * int(effective_train_epochs))
+        return resolve_total_steps(
+            forced_steps=None,
+            total_data_len=capped_raw_items,
+            batch_size=self.arguments.total_batch_size,
+            num_epochs=1,
+            gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
+            is_train=True,
+        )
+
+    def _should_stop_training(self, current_step: int) -> bool:
+        """Check whether any active training stop condition has been reached."""
+        if self.max_training_steps is not None and current_step >= self.max_training_steps:
+            return True
+        raw_limit = getattr(self.arguments, "max_training_raw_items", None)
+        if raw_limit is not None and getattr(self, "_consumed_train_raw_items", 0) >= raw_limit:
+            return True
+        return False
+
+    @staticmethod
+    def _count_raw_progress_items_in_example(example: dict[str, tp.Any]) -> int:
+        """Count exact raw, un-packed examples represented by one loader item."""
+        segment_ids = example.get("segment_ids")
+        if segment_ids is None:
+            return 1
+
+        seg = np.asarray(segment_ids)
+        if seg.size == 0:
+            return 0
+
+        attention_mask = example.get("attention_mask")
+        if attention_mask is not None:
+            attn = np.asarray(attention_mask).astype(bool, copy=False)
+            if attn.shape == seg.shape:
+                seg = seg[attn]
+        if seg.size == 0:
+            return 0
+        return int(np.unique(seg).size)
+
+    def _count_raw_progress_items_in_batch(self, batch: tp.Any) -> int | None:
+        """Count exact raw, un-packed examples represented by a pre-collation batch."""
+        if not isinstance(batch, (list, tuple)):
+            return None
+        total = 0
+        found = False
+        for example in batch:
+            if isinstance(example, dict):
+                total += self._count_raw_progress_items_in_example(example)
+                found = True
+        return total if found else None
 
     def _apply_preprocess_transforms(self) -> None:
         """Apply preprocessing transforms to data sources.
@@ -1250,7 +1411,12 @@ class BaseTrainer(BaseTrainerProtocol):
 
             if prompts is None:
                 decoded_prompts = self._decode_prompt_batch(
-                    processor, input_ids, False, pad_token_id, True, attention_mask,
+                    processor,
+                    input_ids,
+                    False,
+                    pad_token_id,
+                    True,
+                    attention_mask,
                 )
                 prompts = self._normalize_esurge_prompts(decoded_prompts, apply_chat_template)
             else:
@@ -1928,8 +2094,7 @@ class BaseTrainer(BaseTrainerProtocol):
         expected_total = sum(count * num_return_sequences for count in prompt_row_counts)
         if len(all_completions) != expected_total:
             log_debug_maybe(
-                "Preview generation completion count mismatch: "
-                f"expected {expected_total}, got {len(all_completions)}"
+                "Preview generation completion count mismatch: " f"expected {expected_total}, got {len(all_completions)}"
             )
 
         needs_decoding = any(prepared.get("prompt_text") is None for prepared in prepared_prompts)
@@ -2099,8 +2264,6 @@ class BaseTrainer(BaseTrainerProtocol):
         partition rules to determine how parameters should be distributed across devices.
         """
         with self.timer("configure sharded state"):
-            from eformer.escale import match_partition_rules
-
             with self.model.mesh:
                 if self._resumed_from_checkpoint and self.model_state.opt_state is not None:
                     current_step = self.model_state.step
@@ -2115,12 +2278,9 @@ class BaseTrainer(BaseTrainerProtocol):
                 elif self.model_state.opt_state is not None and self.model_state.tx is None:
                     self.model_state = self.model_state.replace(tx=self.tx)
 
-                shape = nn.eval_shape(lambda: self.model_state)
                 rules = self.model._get_partition_rules(None)
-                state_shardings = specs_to_name_sharding(match_partition_rules(rules, shape))
-
-                self.state_shardings = state_shardings
-                self.model_state = self.model_state.shard_with_shape(state_shardings)
+                self.model_state = self.model_state.shard_state(partition_rules=rules, mesh=self.model.mesh)
+                self.state_shardings = self.model_state.shardings
 
         self.timer.log("configure sharded state")
 
@@ -2208,7 +2368,7 @@ class BaseTrainer(BaseTrainerProtocol):
         batch_size: int,
         is_train: bool = True,
         shuffle: bool = False,
-        num_epochs: int = 1,
+        num_epochs: int | None = 1,
         drop_remainder: bool = True,
     ) -> collections.abc.Iterator:
         """Create dataloader iterator from ShardedDataSource.
@@ -2228,7 +2388,7 @@ class BaseTrainer(BaseTrainerProtocol):
         Yields:
             Lists of examples (pre-tokenized dicts) to be collated.
         """
-        for _ in range(num_epochs):
+        while True:
             batch = []
             for shard_name in source.shard_names:
                 for example in source.open_shard(shard_name):
@@ -2239,6 +2399,11 @@ class BaseTrainer(BaseTrainerProtocol):
             # Handle remainder
             if batch and not drop_remainder:
                 yield batch
+            if num_epochs is None:
+                continue
+            num_epochs -= 1
+            if num_epochs <= 0:
+                break
 
     def _configure_grain_dataloader(self):
         """Configure Grain dataloaders for training and evaluation.
@@ -2313,36 +2478,18 @@ class BaseTrainer(BaseTrainerProtocol):
                 read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=128),
             )
 
-        def calculate_steps(dataset, is_train: bool) -> int:
-            forced_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
-            total_data_len: int | None = None
-            if forced_steps is None:
-                try:
-                    total_data_len = len(dataset)
-                except TypeError as e:
-                    total_data_len = (
-                        self.arguments.per_epoch_training_steps
-                        if is_train
-                        else self.arguments.per_epoch_evaluation_steps
-                    )
-                    if total_data_len is None:
-                        raise ValueError(
-                            f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
-                            "steps for a generator/streaming dataset."
-                        ) from e
-
-            batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
-            num_epochs = self.arguments.num_train_epochs if is_train else 1
-            return resolve_total_steps(
-                forced_steps=forced_steps,
-                total_data_len=total_data_len,
-                batch_size=batch_size,
-                num_epochs=num_epochs,
-                gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
-                is_train=is_train,
+        train_steps_source = self._train_source if self._train_source is not None else self.dataset_train
+        effective_train_epochs = self._effective_train_epoch_limit()
+        raw_item_limit = getattr(self.arguments, "max_training_raw_items", None)
+        if self.arguments.max_training_steps is not None:
+            max_training_steps = int(self.arguments.max_training_steps)
+        elif raw_item_limit is not None:
+            max_training_steps = self._estimate_training_steps_from_raw_item_limit(
+                raw_item_limit=int(raw_item_limit),
+                effective_train_epochs=effective_train_epochs,
             )
-
-        max_training_steps = calculate_steps(self.dataset_train, is_train=True)
+        else:
+            max_training_steps = self._calculate_steps_without_scanning(train_steps_source, is_train=True)
 
         # Use _train_source if available (has transforms applied)
         if self._train_source is not None:
@@ -2351,7 +2498,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 batch_size=self.training_batch_size,
                 is_train=True,
                 shuffle=self.arguments.shuffle_train_dataset,
-                num_epochs=self.arguments.num_train_epochs,
+                num_epochs=effective_train_epochs,
                 drop_remainder=True,
             )
         else:
@@ -2359,7 +2506,11 @@ class BaseTrainer(BaseTrainerProtocol):
 
         dataloader_eval, max_evaluation_steps = None, 0
         if self.dataset_eval is not None and self.arguments.do_eval:
-            max_evaluation_steps = calculate_steps(self.dataset_eval, is_train=False)
+            eval_steps_source = self._eval_source if self._eval_source is not None else self.dataset_eval
+            if self.arguments.max_evaluation_steps is not None:
+                max_evaluation_steps = int(self.arguments.max_evaluation_steps)
+            else:
+                max_evaluation_steps = self._calculate_steps_without_scanning(eval_steps_source, is_train=False)
             # Use _eval_source if available (has transforms applied)
             if self._eval_source is not None:
                 dataloader_eval = self._create_dataloader_from_source(
@@ -2489,48 +2640,6 @@ class BaseTrainer(BaseTrainerProtocol):
                 .as_numpy_iterator()
             )
 
-        def calculate_steps(dataset: Dataset | IterableDataset, is_train: bool) -> int:
-            """
-            Calculates the number of training or evaluation steps based on dataset length and arguments.
-
-            Args:
-              dataset (tp.Union[Dataset, IterableDataset]): The dataset to calculate steps for.
-              is_train (bool): Whether the dataset is for training.
-
-            Returns:
-              int: The number of steps.
-
-            Raises:
-              ValueError: If the dataset is a generator/streaming dataset and the number of steps is not specified.
-            """
-            forced_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
-            total_data_len: int | None = None
-            if forced_steps is None:
-                try:
-                    total_data_len = len(dataset)
-                except TypeError as e:
-                    total_data_len = (
-                        self.arguments.per_epoch_training_steps
-                        if is_train
-                        else self.arguments.per_epoch_evaluation_steps
-                    )
-                    if total_data_len is None:
-                        raise ValueError(
-                            f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
-                            "steps for a generator/streaming dataset."
-                        ) from e
-
-            batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
-            num_epochs = self.arguments.num_train_epochs if is_train else 1
-            return resolve_total_steps(
-                forced_steps=forced_steps,
-                total_data_len=total_data_len,
-                batch_size=batch_size,
-                num_epochs=num_epochs,
-                gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
-                is_train=is_train,
-            )
-
         def to_tf_dataloader(dataset: Dataset | IterableDataset, is_train: bool) -> collections.abc.Iterator[np.ndarray]:
             """
             Converts a Hugging Face Dataset to a TensorFlow dataloader.
@@ -2547,7 +2656,18 @@ class BaseTrainer(BaseTrainerProtocol):
             else:
                 return create_tf_dataset_from_iterable(dataset, is_train)
 
-        max_training_steps = calculate_steps(self.dataset_train, is_train=True)
+        train_steps_source = self._train_source if self._train_source is not None else self.dataset_train
+        effective_train_epochs = self._effective_train_epoch_limit()
+        raw_item_limit = getattr(self.arguments, "max_training_raw_items", None)
+        if self.arguments.max_training_steps is not None:
+            max_training_steps = int(self.arguments.max_training_steps)
+        elif raw_item_limit is not None:
+            max_training_steps = self._estimate_training_steps_from_raw_item_limit(
+                raw_item_limit=int(raw_item_limit),
+                effective_train_epochs=effective_train_epochs,
+            )
+        else:
+            max_training_steps = self._calculate_steps_without_scanning(train_steps_source, is_train=True)
 
         # Use _train_source if available (has transforms applied)
         if self._train_source is not None:
@@ -2556,14 +2676,18 @@ class BaseTrainer(BaseTrainerProtocol):
                 batch_size=self.training_batch_size,
                 is_train=True,
                 shuffle=self.arguments.shuffle_train_dataset,
-                num_epochs=self.arguments.num_train_epochs,
+                num_epochs=effective_train_epochs,
                 drop_remainder=True,
             )
         else:
             dataloader_train = to_tf_dataloader(self.dataset_train, is_train=True)
 
         if self.dataset_eval is not None and self.arguments.do_eval:
-            max_evaluation_steps = calculate_steps(self.dataset_eval, is_train=False)
+            eval_steps_source = self._eval_source if self._eval_source is not None else self.dataset_eval
+            if self.arguments.max_evaluation_steps is not None:
+                max_evaluation_steps = int(self.arguments.max_evaluation_steps)
+            else:
+                max_evaluation_steps = self._calculate_steps_without_scanning(eval_steps_source, is_train=False)
             # Use _eval_source if available (has transforms applied)
             if self._eval_source is not None:
                 dataloader_eval = self._create_dataloader_from_source(
@@ -2664,6 +2788,7 @@ class BaseTrainer(BaseTrainerProtocol):
             float_dtype=self.model.param_dtype,
             save_optimizer=self.arguments.save_optimizer_state,
         )
+        self._save_raw_progress_state(directory_name)
 
         return str(directory_name)
 
@@ -3115,7 +3240,7 @@ class BaseTrainer(BaseTrainerProtocol):
             elif isinstance(run_exception, StopIteration):
                 ...  # simply just pass
             else:
-                raise RuntimeError("EasyDeL Runtime dumped") from run_exception
+                raise RuntimeError(f"EasyDeL Runtime dumped due to {run_exception!s}") from run_exception
         checkpoint_path = "SAVING_SKIPPED"
         filename = None
 
@@ -3228,7 +3353,7 @@ class BaseTrainer(BaseTrainerProtocol):
 
     def create_progress_bar(
         self,
-        total: int,
+        total: int | None,
         desc: str = "",
         disabled: bool = False,
     ) -> BaseProgressBar:
@@ -3313,7 +3438,13 @@ class BaseTrainer(BaseTrainerProtocol):
             }
             # Update progress bar
             pbar.set_postfix(**display_metrics)
-            update_size = 0 if step == 0 else self.arguments.log_steps
-            pbar.update(update_size)
+            if mode == "train" and getattr(self, "_train_progress_uses_raw_items", False):
+                update_size = int(getattr(self, "_pending_train_progress_update", 0))
+                if update_size > 0:
+                    pbar.update(update_size)
+                    self._pending_train_progress_update = 0
+            else:
+                update_size = 0 if step == 0 else self.arguments.log_steps
+                pbar.update(update_size)
         if step % self.arguments.report_steps == 0:
             self.arguments.log_metrics(metrics=metrics, step=step)

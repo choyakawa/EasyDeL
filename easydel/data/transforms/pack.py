@@ -40,23 +40,89 @@ if tp.TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+_PADDING_SEGMENT_ID = -1
+
+
+def _build_decoder_positions(segment_ids: np.ndarray | None) -> np.ndarray | None:
+    """Build per-segment reset positions for packed loss normalization."""
+    if segment_ids is None:
+        return None
+
+    positions = np.zeros_like(segment_ids, dtype=np.int32)
+    current_segment: int | None = None
+    current_position = 0
+
+    for idx, segment_id in enumerate(segment_ids.tolist()):
+        if segment_id == _PADDING_SEGMENT_ID:
+            positions[idx] = 0
+            current_segment = None
+            current_position = 0
+            continue
+
+        if segment_id != current_segment:
+            current_segment = segment_id
+            current_position = 0
+
+        positions[idx] = current_position
+        current_position += 1
+
+    return positions
+
+
+def _normalize_sample(
+    tokens: list[int],
+    labels: list[int] | None,
+    eos_token_id: int,
+    seq_length: int,
+) -> tuple[list[int], list[int] | None]:
+    """Normalize a pre-tokenized sample before packing.
+
+    Ensures labels stay aligned and avoids introducing a second EOS when the
+    sample already ends with one. EOS is appended only when there is space.
+    """
+    if labels is not None and len(labels) != len(tokens):
+        raise ValueError("labels must be aligned with tokens when packing")
+
+    normalized_tokens = list(tokens[:seq_length])
+    normalized_labels = list(labels[:seq_length]) if labels is not None else None
+
+    should_append_eos = (
+        bool(normalized_tokens)
+        and normalized_tokens[-1] != eos_token_id
+        and len(normalized_tokens) < seq_length
+    )
+    if should_append_eos:
+        normalized_tokens.append(eos_token_id)
+        if normalized_labels is not None:
+            normalized_labels.append(-100)
+
+    return normalized_tokens, normalized_labels
+
+
 @dataclass
 class PackedSequence:
     """A packed sequence with metadata."""
 
     input_ids: np.ndarray
+    labels: np.ndarray | None = None
     attention_mask: np.ndarray | None = None
     segment_ids: np.ndarray | None = None
+    decoder_positions: np.ndarray | None = None
     source_ids: list[str] | None = None
     num_segments: int = 0
 
     def to_dict(self) -> dict[str, np.ndarray]:
         """Convert to dictionary for training."""
         result = {"input_ids": self.input_ids}
+        if self.labels is not None:
+            result["labels"] = self.labels
         if self.attention_mask is not None:
             result["attention_mask"] = self.attention_mask
         if self.segment_ids is not None:
             result["segment_ids"] = self.segment_ids
+            result["decoder_segment_ids"] = self.segment_ids
+        if self.decoder_positions is not None:
+            result["decoder_positions"] = self.decoder_positions
         return result
 
 
@@ -89,15 +155,17 @@ class GreedyPacker:
 
         # Current buffer
         self._buffer: list[int] = []
+        self._labels: list[int] = []
         self._segment_ids: list[int] = []
-        self._current_segment = 0
+        self._current_segment = 1
         self._source_ids: list[str] = []
 
-    def add(self, tokens: list[int], source_id: str | None = None) -> PackedSequence | None:
+    def add(self, tokens: list[int], labels: list[int] | None = None, source_id: str | None = None) -> PackedSequence | None:
         """Add tokens to the packer.
 
         Args:
             tokens: Token IDs to add.
+            labels: Optional labels aligned with tokens.
             source_id: Optional source identifier.
 
         Returns:
@@ -105,9 +173,18 @@ class GreedyPacker:
         """
         result = None
 
+        tokens, labels = _normalize_sample(tokens, labels, self.eos_token_id, self.seq_length)
+
         # Add tokens to buffer
-        for tok in tokens:
+        if labels is not None and len(self._labels) < len(self._buffer):
+            self._labels.extend([-100] * (len(self._buffer) - len(self._labels)))
+        if labels is None and self._labels:
+            labels = [-100] * len(tokens)
+
+        for idx, tok in enumerate(tokens):
             self._buffer.append(tok)
+            if labels is not None:
+                self._labels.append(labels[idx])
             if self.include_segment_ids:
                 self._segment_ids.append(self._current_segment)
 
@@ -115,18 +192,9 @@ class GreedyPacker:
             if len(self._buffer) >= self.seq_length:
                 result = self._flush()
 
-        # Add EOS and update segment
-        if len(self._buffer) > 0:
-            self._buffer.append(self.eos_token_id)
-            if self.include_segment_ids:
-                self._segment_ids.append(self._current_segment)
-            self._current_segment += 1
-            if source_id:
-                self._source_ids.append(source_id)
-
-        # Check if we hit the target length
-        if len(self._buffer) >= self.seq_length:
-            result = self._flush()
+        if tokens and source_id:
+            self._source_ids.append(source_id)
+        self._current_segment = max(self._segment_ids, default=0) + 1
 
         return result
 
@@ -134,6 +202,7 @@ class GreedyPacker:
         """Create a packed sequence from the current buffer."""
         # Take exactly seq_length tokens
         input_ids = np.array(self._buffer[: self.seq_length], dtype=np.int32)
+        labels = np.array(self._labels[: self.seq_length], dtype=np.int32) if self._labels else None
 
         segment_ids = None
         if self.include_segment_ids:
@@ -141,17 +210,21 @@ class GreedyPacker:
 
         result = PackedSequence(
             input_ids=input_ids,
+            labels=labels,
             segment_ids=segment_ids,
+            decoder_positions=_build_decoder_positions(segment_ids),
             source_ids=self._source_ids.copy() if self._source_ids else None,
-            num_segments=self._current_segment,
+            num_segments=max(self._segment_ids[: self.seq_length], default=0),
         )
 
         # Keep remainder
         self._buffer = self._buffer[self.seq_length :]
+        if self._labels:
+            self._labels = self._labels[self.seq_length :]
         if self.include_segment_ids:
             self._segment_ids = self._segment_ids[self.seq_length :]
         self._source_ids = []
-        self._current_segment = 0
+        self._current_segment = max(self._segment_ids, default=0) + 1
 
         return result
 
@@ -160,30 +233,39 @@ class GreedyPacker:
         if not self._buffer:
             return None
 
-        # Pad to seq_length
-        pad_len = self.seq_length - len(self._buffer)
-        input_ids = np.array(self._buffer + [self.pad_token_id] * pad_len, dtype=np.int32)
+        # Never exceed seq_length, even if buffer is longer
+        buf = self._buffer[: self.seq_length]
+        label_buf = self._labels[: self.seq_length] if self._labels else []
+        pad_len = self.seq_length - len(buf)
 
-        attention_mask = np.ones(self.seq_length, dtype=np.int32)
-        attention_mask[len(self._buffer) :] = 0
+        input_ids = np.array(buf + [self.pad_token_id] * pad_len, dtype=np.int32)
+        labels = np.array(label_buf + ([-100] * pad_len), dtype=np.int32) if self._labels else None
 
+        attention_mask = np.zeros(self.seq_length, dtype=np.int32)
+        attention_mask[: len(buf)] = 1
+
+        seg: list[int] = []
         segment_ids = None
         if self.include_segment_ids:
-            padded_segments = self._segment_ids + [self._current_segment] * pad_len
+            seg = self._segment_ids[: self.seq_length]
+            padded_segments = seg + [_PADDING_SEGMENT_ID] * pad_len
             segment_ids = np.array(padded_segments, dtype=np.int32)
 
         result = PackedSequence(
             input_ids=input_ids,
+            labels=labels,
             attention_mask=attention_mask,
             segment_ids=segment_ids,
+            decoder_positions=_build_decoder_positions(segment_ids),
             source_ids=self._source_ids.copy() if self._source_ids else None,
-            num_segments=self._current_segment + 1,
+            num_segments=max(seg, default=0),
         )
 
         self._buffer = []
+        self._labels = []
         self._segment_ids = []
         self._source_ids = []
-        self._current_segment = 0
+        self._current_segment = 1
 
         return result
 
@@ -218,7 +300,7 @@ class PoolPacker:
             GreedyPacker(seq_length, eos_token_id, pad_token_id, include_segment_ids) for _ in range(num_packers)
         ]
 
-    def add(self, tokens: list[int], source_id: str | None = None) -> list[PackedSequence]:
+    def add(self, tokens: list[int], labels: list[int] | None = None, source_id: str | None = None) -> list[PackedSequence]:
         """Add tokens to the best-fit packer.
 
         Args:
@@ -237,14 +319,15 @@ class PoolPacker:
 
         for i, packer in enumerate(self._packers):
             current_len = len(packer._buffer)
-            remaining_after = self.seq_length - (current_len + token_len + 1)  # +1 for EOS
+            estimated_tokens, _ = _normalize_sample(tokens, labels, packer.eos_token_id, self.seq_length)
+            remaining_after = self.seq_length - (current_len + len(estimated_tokens))
 
             if 0 <= remaining_after < best_fit:
                 best_fit = remaining_after
                 best_idx = i
 
         # Add to best packer
-        result = self._packers[best_idx].add(tokens, source_id)
+        result = self._packers[best_idx].add(tokens, labels, source_id)
         if result is not None:
             results.append(result)
 
@@ -290,9 +373,9 @@ class FirstFitPacker:
         self.include_segment_ids = include_segment_ids
         self.buffer_size = buffer_size
 
-        self._pending: list[tuple[list[int], str | None]] = []
+        self._pending: list[tuple[list[int], list[int] | None, str | None]] = []
 
-    def add(self, tokens: list[int], source_id: str | None = None) -> list[PackedSequence]:
+    def add(self, tokens: list[int], labels: list[int] | None = None, source_id: str | None = None) -> list[PackedSequence]:
         """Add tokens to the pending buffer.
 
         Args:
@@ -302,7 +385,7 @@ class FirstFitPacker:
         Returns:
             List of completed PackedSequences when buffer is full.
         """
-        self._pending.append((tokens, source_id))
+        self._pending.append((tokens, labels, source_id))
 
         if len(self._pending) >= self.buffer_size:
             return self._pack_buffer()
@@ -314,24 +397,35 @@ class FirstFitPacker:
         if not self._pending:
             return []
 
-        # Sort by length (decreasing)
-        sorted_pending = sorted(self._pending, key=lambda x: len(x[0]), reverse=True)
+        normalized_pending = [
+            (*_normalize_sample(raw_tokens, raw_labels, self.eos_token_id, self.seq_length), source_id)
+            for raw_tokens, raw_labels, source_id in self._pending
+        ]
+        sorted_pending = sorted(normalized_pending, key=lambda x: len(x[0]), reverse=True)
 
-        # Bins: list of (tokens, segment_ids, source_ids)
-        bins: list[tuple[list[int], list[int], list[str]]] = []
+        # Bins: list of [tokens, labels, segment_ids]
+        bins: list[list[tp.Any]] = []
 
-        for tokens, source_id in sorted_pending:
-            token_len = len(tokens) + 1  # +1 for EOS
+        for tokens, labels, source_id in sorted_pending:
+            token_len = len(tokens)
             placed = False
 
             # Find first bin that fits
-            for _i, (bin_tokens, bin_segments, bin_sources) in enumerate(bins):
+            for _i, bin_data in enumerate(bins):
+                bin_tokens, bin_labels, bin_segments, bin_sources = bin_data
                 if len(bin_tokens) + token_len <= self.seq_length:
                     # Add to this bin
-                    segment_id = max(bin_segments) + 1 if bin_segments else 0
+                    segment_id = max(bin_segments) + 1 if bin_segments else 1
+                    
+                    if labels is not None and bin_labels is None:
+                        bin_labels = [-100] * len(bin_tokens)
+                        bin_data[1] = bin_labels
+                        
                     bin_tokens.extend(tokens)
-                    bin_tokens.append(self.eos_token_id)
-                    bin_segments.extend([segment_id] * (len(tokens) + 1))
+                    
+                    if bin_labels is not None:
+                        bin_labels.extend(labels if labels is not None else [-100] * len(tokens))
+                    bin_segments.extend([segment_id] * len(tokens))
                     if source_id:
                         bin_sources.append(source_id)
                     placed = True
@@ -339,34 +433,44 @@ class FirstFitPacker:
 
             if not placed:
                 # Create new bin
-                new_tokens = [*tokens, self.eos_token_id]
-                new_segments = [0] * len(new_tokens)
+                new_tokens = list(tokens)
+                new_labels = list(labels) if labels is not None else None
+                new_segments = [1] * len(new_tokens)
                 new_sources = [source_id] if source_id else []
-                bins.append((new_tokens, new_segments, new_sources))
+                bins.append([new_tokens, new_labels, new_segments, new_sources])
 
         # Convert bins to PackedSequences
         results = []
-        for bin_tokens, bin_segments, bin_sources in bins:
+        for bin_tokens, bin_labels, bin_segments, bin_sources in bins:
+            if len(bin_tokens) > self.seq_length:
+                raise ValueError("packed bin exceeded seq_length after placement")
+
             # Pad if needed
             pad_len = self.seq_length - len(bin_tokens)
             input_ids = np.array(bin_tokens + [self.pad_token_id] * pad_len, dtype=np.int32)
+            
+            if bin_labels is not None:
+                labels_arr = np.array(bin_labels + ([-100] * pad_len), dtype=np.int32)
+            else:
+                labels_arr = None
 
             attention_mask = np.ones(self.seq_length, dtype=np.int32)
             attention_mask[len(bin_tokens) :] = 0
 
             segment_ids = None
             if self.include_segment_ids:
-                max_seg = max(bin_segments) if bin_segments else 0
-                padded_segments = bin_segments + [max_seg + 1] * pad_len
+                padded_segments = bin_segments + [_PADDING_SEGMENT_ID] * pad_len
                 segment_ids = np.array(padded_segments, dtype=np.int32)
 
             results.append(
                 PackedSequence(
                     input_ids=input_ids,
+                    labels=labels_arr,
                     attention_mask=attention_mask,
                     segment_ids=segment_ids,
+                    decoder_positions=_build_decoder_positions(segment_ids),
                     source_ids=bin_sources if bin_sources else None,
-                    num_segments=max(bin_segments) + 1 if bin_segments else 0,
+                    num_segments=max(bin_segments, default=0),
                 )
             )
 
@@ -456,6 +560,8 @@ class PackedShardedSource(ShardedDataSource[dict]):
 
     def open_shard(self, shard_name: str) -> "Iterator[dict]":
         """Open the packed shard."""
+        if shard_name not in self.shard_names:
+            raise KeyError(f"Unknown packed shard: {shard_name}")
         if self._seed is not None:
             random.seed(self._seed)
 
@@ -483,17 +589,18 @@ class PackedShardedSource(ShardedDataSource[dict]):
                 tokens = example.get(self._input_field, [])
                 if not tokens:
                     continue
+                labels = example.get("labels")
 
                 source_id = example.get("__source__")
 
                 if isinstance(packer, (PoolPacker, FirstFitPacker)):
-                    results = packer.add(list(tokens), source_id)
+                    results = packer.add(list(tokens), list(labels) if labels is not None else None, source_id)
                     for packed in results:
                         out = emit(packed)
                         if out is not None:
                             yield out
                 else:
-                    result = packer.add(list(tokens), source_id)
+                    result = packer.add(list(tokens), list(labels) if labels is not None else None, source_id)
                     if result is not None:
                         out = emit(result)
                         if out is not None:

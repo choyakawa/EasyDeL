@@ -11,3 +11,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Qwen3.5-MoE text and multimodal model family."""
+
+from .modeling_qwen3_5_moe import (
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5MoeForConditionalGeneration,
+    Qwen3_5MoeModel,
+    Qwen3_5MoeTextModel,
+)
+from .qwen3_5_moe_configuration import (
+    Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
+    Qwen3_5MoeVisionConfig,
+)
+
+__all__ = (
+    "Qwen3_5MoeConfig",
+    "Qwen3_5MoeForCausalLM",
+    "Qwen3_5MoeForConditionalGeneration",
+    "Qwen3_5MoeModel",
+    "Qwen3_5MoeTextConfig",
+    "Qwen3_5MoeTextModel",
+    "Qwen3_5MoeVisionConfig",
+)

@@ -145,11 +145,17 @@ class SFTTrainer(Trainer):
         if self._is_pretokenized():
             return None
 
+        mask_prompt = bool(getattr(self.arguments, "assistant_only_loss", False))
+        completion_only_loss = getattr(self.arguments, "completion_only_loss", None)
+        if completion_only_loss is not None:
+            mask_prompt = mask_prompt or bool(completion_only_loss)
+
         return SFTPreprocessTransform(
             tokenizer=self.processing_class,
             max_length=self.arguments.max_length,
             text_field=self._dataset_text_field or "text",
-            mask_prompt=getattr(self.arguments, "completion_only_loss", False),
+            mask_prompt=mask_prompt,
+            pad_to_max_length=not bool(getattr(self.arguments, "packing", False)),
             formatting_func=self._formatting_func,
         )
 

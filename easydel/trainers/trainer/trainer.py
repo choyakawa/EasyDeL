@@ -34,6 +34,8 @@ and multimodal architectures.
 import collections.abc
 import typing as tp
 
+import itertools
+
 import jax
 from jax.sharding import PartitionSpec
 
@@ -314,34 +316,43 @@ class Trainer(BaseTrainer):
         disabled = False
         if jax.process_index() != 0 and not self.arguments.log_all_workers:
             disabled = True
-        pbar = self.create_progress_bar(
-            total=self.max_training_steps,
-            disabled=disabled,
-            desc="training process",
-        )
+        raw_progress_total = None
+        raw_item_limit = getattr(self.arguments, "max_training_raw_items", None)
+        effective_epoch_limit = self._effective_train_epoch_limit()
+        if raw_item_limit is not None:
+            raw_progress_total = int(raw_item_limit)
+        elif getattr(self, "_raw_train_item_count", None) is not None and effective_epoch_limit is not None:
+            raw_progress_total = int(self._raw_train_item_count) * int(effective_epoch_limit)
+        pbar = self.create_progress_bar(total=raw_progress_total, disabled=disabled, desc="training process")
 
         # Handle resumption based on dataset type
         initial_step = int(jax.device_get(state.step))
         start_epoch = 0
+        self._consumed_train_raw_items = int(getattr(self, "_resumed_consumed_train_raw_items", 0))
+        self._pending_train_progress_update = 0
 
         if initial_step > 0:
-            pbar.update(initial_step)
-            assert self.max_training_steps is not None, "max_training_steps must be set before training"
-            steps_per_epoch = self.max_training_steps // self.arguments.num_train_epochs
-
-            if self.arguments.use_grain:
-                logger.info(f"Resuming Grain dataset from step {initial_step}")
-                start_epoch = initial_step // steps_per_epoch
+            if self.max_training_steps is not None and effective_epoch_limit is not None and effective_epoch_limit > 0:
+                steps_per_epoch = self.max_training_steps // effective_epoch_limit
+                if self.arguments.use_grain:
+                    logger.info(f"Resuming Grain dataset from step {initial_step}")
+                    start_epoch = initial_step // max(steps_per_epoch, 1)
+                else:
+                    logger.info(
+                        f"Resuming training from step {initial_step} (non-seekable dataset, starting fresh data iteration)"
+                    )
+            if getattr(self, "_train_progress_uses_raw_items", False):
+                if self._consumed_train_raw_items > 0:
+                    pbar.update(self._consumed_train_raw_items)
             else:
-                logger.info(
-                    f"Resuming training from step {initial_step} (non-seekable dataset, starting fresh data iteration)"
-                )
+                pbar.update(initial_step)
 
         train_iter = iter(self.dataloader_train)
         try:
             run_exception = None
+            epoch_iter = range(start_epoch, effective_epoch_limit) if effective_epoch_limit is not None else itertools.count(start_epoch)
             with self.mesh:
-                for epoch in range(start_epoch, self.arguments.num_train_epochs):
+                for epoch in epoch_iter:
                     state, run_exception, train_iter = self._train_epoch(
                         state=state,
                         train_dataset=self.dataloader_train,
@@ -353,7 +364,7 @@ class Trainer(BaseTrainer):
                     )
 
                     current_step = int(jax.device_get(state.step))
-                    if current_step >= self.max_training_steps:
+                    if self._should_stop_training(current_step):
                         break
                     if run_exception is not None:
                         break
@@ -482,16 +493,22 @@ class Trainer(BaseTrainer):
             def data_collator(x):
                 return x
 
-        assert self.max_training_steps is not None, "max_training_steps must be set before training"
-        steps_per_epoch = self.max_training_steps // self.arguments.num_train_epochs
+        effective_epoch_limit = self._effective_train_epoch_limit()
+        if self.max_training_steps is not None and effective_epoch_limit is not None and effective_epoch_limit > 0:
+            steps_per_epoch = max(self.max_training_steps // effective_epoch_limit, 1)
+        else:
+            steps_per_epoch = None
         run_exception: Exception | None = None
 
-        for _ in range(steps_per_epoch):
+        while True:
             current_step = int(jax.device_get(state.step))
-            if current_step >= self.max_training_steps:
+            if self._should_stop_training(current_step):
+                break
+            if steps_per_epoch is not None and current_step >= ((epoch + 1) * steps_per_epoch):
                 break
             try:
                 batch, train_iter = self._get_next_batch(train_iter, train_dataset)
+                raw_progress_items = self._count_raw_progress_items_in_batch(batch)
                 step_metrics.start_step()
                 state = self.on_step_start(state=state, step=current_step)
             except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, StopIteration) as exect:
@@ -504,6 +521,9 @@ class Trainer(BaseTrainer):
                     metrics.execution_time = execution_time()
                     current_step = int(jax.device_get(state.step))
             try:
+                if raw_progress_items is not None:
+                    self._consumed_train_raw_items += int(raw_progress_items)
+                    self._pending_train_progress_update += int(raw_progress_items)
                 mean_loss, mean_accuracy = metrics_tracker.update(
                     loss=metrics.loss,
                     accuracy=metrics.accuracy,
@@ -524,6 +544,8 @@ class Trainer(BaseTrainer):
                     mean_loss=mean_loss,
                     mean_accuracy=mean_accuracy,
                     mode="train",
+                    raw_items=self._consumed_train_raw_items,
+                    raw_items_limit=getattr(self.arguments, "max_training_raw_items", None),
                 )
                 state, metrics = self.on_step_end(
                     state=state,
