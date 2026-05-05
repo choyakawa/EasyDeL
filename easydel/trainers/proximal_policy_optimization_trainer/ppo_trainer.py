@@ -50,7 +50,12 @@ from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import capture_time, get_logger  # pyright: ignore[reportPrivateLocalImportUsage]
 from easydel.utils.traversals import deepcopy_model
 
-from ..prompt_transforms import GRPOPreprocessTransform, is_conversational
+from .._logprob_utils import (
+    compute_per_token_logps_and_entropies_from_hidden_states,
+    compute_token_logps_and_entropies_chunked,
+    resolve_lmhead_chunksize,
+)
+from ..prompt_transforms import GRPOPreprocessTransform
 from ..prompt_utils import apply_chat_template
 from ..trainer.trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
@@ -62,11 +67,6 @@ from ..training_utils import (
 from ._fn import ppo_step
 from .modeling_value_head import CausalLMWithValueHead
 from .ppo_config import PPOConfig
-
-try:
-    import wandb
-except ImportError:
-    wandb = None
 
 if tp.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
@@ -155,11 +155,13 @@ class PPOTrainer(Trainer):
             data_tokenize_fn: Optional custom tokenization function.
 
         Raises:
-            AssertionError: If arguments is None or not a PPOConfig.
-            ValueError: If model is None or reward weights don't match reward funcs.
+            ValueError: If arguments is None or model is None or reward weights don't match reward funcs.
+            TypeError: If arguments is not a PPOConfig.
         """
-        assert arguments is not None, "PPOTrainer requires `arguments`."
-        assert isinstance(arguments, PPOConfig), f"arguments type must be `PPOConfig` but got {type(arguments)}"
+        if arguments is None:
+            raise ValueError("PPOTrainer requires `arguments`.")
+        if not isinstance(arguments, PPOConfig):
+            raise TypeError(f"arguments type must be `PPOConfig` but got {type(arguments)}")
         self.arguments = arguments
 
         if model is None:
@@ -200,7 +202,8 @@ class PPOTrainer(Trainer):
                 raise ValueError("The number of reward processing classes must match the number of reward functions.")
 
         empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=model.model.mesh)
-        assert isinstance(reward_processing_classes, list)
+        if not isinstance(reward_processing_classes, list):
+            raise TypeError(f"reward_processing_classes must be a list, got {type(reward_processing_classes)}")
 
         for i, (reward_processing_class, reward_func) in enumerate(
             zip(reward_processing_classes, reward_funcs, strict=False)
@@ -251,64 +254,9 @@ class PPOTrainer(Trainer):
         self.num_generations = arguments.num_generations
         self.reward_processing_classes = reward_processing_classes
         self.reward_funcs = reward_funcs
-
-        if getattr(self.arguments, "generation_num_return_sequences", None) is None:
-            self.arguments.generation_num_return_sequences = self.num_generations
-        if getattr(self.arguments, "generation_top_p", None) is None:
-            self.arguments.generation_top_p = self.arguments.top_p
-        if getattr(self.arguments, "generation_top_k", None) is None:
-            self.arguments.generation_top_k = self.arguments.top_k
-        if getattr(self.arguments, "generation_temperature", None) is None:
-            self.arguments.generation_temperature = self.arguments.temperature
-        if getattr(self.arguments, "generation_extra_kwargs", None) is None:
-            self.arguments.generation_extra_kwargs = {}
-        if self.arguments.generation_kwargs is not None:
-            self.arguments.generation_extra_kwargs.update(self.arguments.generation_kwargs)
-        for key, value in (
-            ("min_p", self.arguments.min_p),
-            ("repetition_penalty", self.arguments.repetition_penalty),
-        ):
-            if value is not None and key not in self.arguments.generation_extra_kwargs:
-                self.arguments.generation_extra_kwargs[key] = value  # pyright: ignore[reportOptionalSubscript]
-
-        def _peek_first_example(dataset):
-            if dataset is None:
-                return None
-            if isinstance(dataset, dict):
-                for item in dataset.values():
-                    return _peek_first_example(item)
-                return None
-            try:
-                return dataset[0]
-            except Exception:
-                pass
-            try:
-                return next(iter(dataset))
-            except Exception:
-                pass
-            try:
-                shard_names = getattr(dataset, "shard_names", None)
-                open_shard = getattr(dataset, "open_shard", None)
-                if shard_names and open_shard:
-                    return next(iter(open_shard(shard_names[0])))
-            except Exception:
-                pass
-            return None
-
-        self.train_is_conversational = False
-        self.eval_is_conversational = False
-        train_sample = _peek_first_example(train_dataset)
-        if train_sample is not None:
-            self.train_is_conversational = is_conversational(train_sample)
-        eval_sample = _peek_first_example(eval_dataset)
-        if eval_sample is not None:
-            self.eval_is_conversational = is_conversational(eval_sample)
+        self._initialize_conversational_flags(train_dataset, eval_dataset)
 
         self.data_tokenize_fn = data_tokenize_fn
-        log_table = None
-        if self.arguments.use_wandb and self.arguments.can_log_metrics and wandb is not None:
-            log_table = wandb.Table(columns=["generated_result", "input_prompt", "took", "length", "step"])
-        self.log_table = log_table
 
         super().__init__(
             model_state=model,
@@ -422,7 +370,8 @@ class PPOTrainer(Trainer):
             float(self.arguments.cliprange),
             float(self.arguments.vf_coef),
             float(self.arguments.cliprange_value),
-            float(self.arguments.entropy_coef),
+            0.0 if self.arguments.entropy_coef is None else float(self.arguments.entropy_coef),
+            self.arguments.logprob_vocab_chunk_size,
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
@@ -430,7 +379,7 @@ class PPOTrainer(Trainer):
             True,  # is_train
             straight_through_emulator,
         )
-        static_argnums = tuple(range(2, 13))
+        static_argnums = tuple(range(2, 14))
         sharded_training_step_function = ejit(
             ppo_step,
             in_shardings=(self.state_shardings, empty_sharding),
@@ -444,7 +393,8 @@ class PPOTrainer(Trainer):
             float(self.arguments.cliprange),
             float(self.arguments.vf_coef),
             float(self.arguments.cliprange_value),
-            float(self.arguments.entropy_coef),
+            0.0 if self.arguments.entropy_coef is None else float(self.arguments.entropy_coef),
+            self.arguments.logprob_vocab_chunk_size,
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
@@ -468,14 +418,35 @@ class PPOTrainer(Trainer):
             with apply.mesh:
                 ids = with_sharding_constraint(ids, self.arguments.step_partition_spec)
                 mask = with_sharding_constraint(mask, self.arguments.step_partition_spec)
-                # Reuse GRPO logps utility implementation via PPO step helpers (fast path).
-                outputs = apply(input_ids=ids, attention_mask=mask)
+                target_ids = ids[:, prompt_length:]
+                call_kwargs = {"input_ids": ids, "attention_mask": mask}
+                lmhead_chunksize = resolve_lmhead_chunksize(apply)
+                if lmhead_chunksize is not None:
+                    call_kwargs["apply_lm_head"] = False
+                outputs = apply(**call_kwargs)
+                if outputs.logits is None and lmhead_chunksize is not None:
+                    hidden_states = outputs.last_hidden_state
+                    if hidden_states is None:
+                        raise ValueError("Reference model outputs do not provide last_hidden_state for PPO scoring.")
+                    score_hidden_states = hidden_states[:, prompt_length - 1 : -1, :]
+                    token_log_probs, _ = compute_per_token_logps_and_entropies_from_hidden_states(
+                        apply,
+                        score_hidden_states,
+                        target_ids,
+                        token_chunk_size=lmhead_chunksize,
+                        vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
+                        return_entropy=False,
+                    )
+                    return token_log_probs
                 logits = outputs.logits[:, prompt_length - 1 :]
                 logits = logits[:, :-1, :]
-                log_probs = jax.nn.log_softmax(logits, axis=-1)
-                target_ids = ids[:, prompt_length:]
-                token_log_probs = jnp.take_along_axis(log_probs, jnp.expand_dims(target_ids, axis=-1), axis=-1)
-                return jnp.squeeze(token_log_probs, axis=-1)
+                token_log_probs, _ = compute_token_logps_and_entropies_chunked(
+                    logits,
+                    target_ids,
+                    return_entropy=False,
+                    chunk_size=self.arguments.logprob_vocab_chunk_size,
+                )
+                return token_log_probs
 
         self.compute_refmodel_logps = ejit(
             partial(_compute_refmodel_logps, graphdef=self.ref_state.graphdef),
@@ -498,13 +469,16 @@ class PPOTrainer(Trainer):
             with apply.mesh:
                 ids = with_sharding_constraint(ids, self.arguments.step_partition_spec)
                 mask = with_sharding_constraint(mask, self.arguments.step_partition_spec)
-                outputs = apply(input_ids=ids, attention_mask=mask, output_hidden_states=True)
-                logits = outputs.logits[:, prompt_length - 1 :]
-                logits = logits[:, :-1, :]
-                log_probs = jax.nn.log_softmax(logits, axis=-1)
                 target_ids = ids[:, prompt_length:]
-                token_log_probs = jnp.take_along_axis(log_probs, jnp.expand_dims(target_ids, axis=-1), axis=-1)
-                token_log_probs = jnp.squeeze(token_log_probs, axis=-1)
+                call_kwargs = {
+                    "input_ids": ids,
+                    "attention_mask": mask,
+                    "output_hidden_states": True,
+                }
+                lmhead_chunksize = resolve_lmhead_chunksize(apply)
+                if lmhead_chunksize is not None:
+                    call_kwargs["apply_lm_head"] = False
+                outputs = apply(**call_kwargs)
 
                 hidden_states = getattr(outputs, "last_hidden_state", None)
                 if hidden_states is None:
@@ -512,6 +486,26 @@ class PPOTrainer(Trainer):
                     if hidden_states is None:
                         raise ValueError("Model outputs do not provide hidden states; cannot compute value outputs.")
                     hidden_states = hidden_states[-1]
+
+                if outputs.logits is None and lmhead_chunksize is not None:
+                    score_hidden_states = hidden_states[:, prompt_length - 1 : -1, :]
+                    token_log_probs, _ = compute_per_token_logps_and_entropies_from_hidden_states(
+                        apply,
+                        score_hidden_states,
+                        target_ids,
+                        token_chunk_size=lmhead_chunksize,
+                        vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
+                        return_entropy=False,
+                    )
+                else:
+                    logits = outputs.logits[:, prompt_length - 1 :]
+                    logits = logits[:, :-1, :]
+                    token_log_probs, _ = compute_token_logps_and_entropies_chunked(
+                        logits,
+                        target_ids,
+                        return_entropy=False,
+                        chunk_size=self.arguments.logprob_vocab_chunk_size,
+                    )
 
                 values_full = apply.value_head(hidden_states).squeeze(-1)
                 values = values_full[:, prompt_length - 1 : -1]
@@ -636,7 +630,12 @@ class PPOTrainer(Trainer):
                 - processed_batch: Dictionary with all tensors needed for PPO step.
                 - metrics: Dictionary with timing and reward statistics.
         """
+        reward_batch = self._extract_reward_batch_sidechannels(batch)
         batch = self._purify_batch(batch)
+        if reward_batch:
+            reward_batch = {**batch, **reward_batch}
+        else:
+            reward_batch = batch
         with capture_time() as preprocessing_time_fn:
             prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
 
@@ -687,11 +686,35 @@ class PPOTrainer(Trainer):
                 )
             rollout_stats_time = rollout_stats_time_fn()
 
-            host_completion_ids = np.asarray(jax.device_get(completion_ids), dtype=np.int64)
-            completions_text = self.processing_class.batch_decode(
-                host_completion_ids.tolist(),
-                skip_special_tokens=True,
+            raw_completions_text = self._coerce_generation_texts(
+                results.raw_text,
+                fallback=results.text,
             )
+            completions_text = self._coerce_generation_texts(
+                results.text,
+                fallback=raw_completions_text,
+            )
+            if not raw_completions_text or not completions_text:
+                host_completion_ids = np.asarray(jax.device_get(completion_ids), dtype=np.int64)
+                host_completion_mask = np.asarray(jax.device_get(completion_mask), dtype=np.int32)
+                if not raw_completions_text:
+                    raw_completions_text = self._decode_prompt_batch(
+                        self.processing_class,
+                        host_completion_ids,
+                        skip_special_tokens=False,
+                        pad_token_id=self._pad_token_id,
+                        pop_pad_tokens=True,
+                        attention_mask=host_completion_mask,
+                    )
+                if not completions_text:
+                    completions_text = self._decode_prompt_batch(
+                        self.processing_class,
+                        host_completion_ids,
+                        skip_special_tokens=True,
+                        pad_token_id=self._pad_token_id,
+                        pop_pad_tokens=True,
+                        attention_mask=host_completion_mask,
+                    )
 
             is_conv = self.train_is_conversational if is_train else self.eval_is_conversational
             if completion_prompts:
@@ -701,9 +724,28 @@ class PPOTrainer(Trainer):
             else:
                 is_conv = False
             if is_conv:
+                raw_completions = [[{"role": "assistant", "content": completion}] for completion in raw_completions_text]
                 completions = [[{"role": "assistant", "content": completion}] for completion in completions_text]
             else:
+                raw_completions = raw_completions_text
                 completions = completions_text
+            target_len = len(completions_text) or len(raw_completions_text) or int(completion_ids.shape[0])
+            reasoning_records = self._coerce_optional_generation_texts(
+                results.reasoning,
+                target_len=target_len,
+            )
+            tool_call_records = self._coerce_generation_metadata_list(
+                results.tool_calls,
+                target_len=target_len,
+            )
+            structured_completions = (
+                self._build_structured_assistant_messages(
+                    completions_text,
+                    tool_calls=tool_call_records,
+                )
+                if is_conv
+                else completions
+            )
 
             rewards_per_func = jnp.full((completion_ids.shape[0], len(self.reward_funcs)), jnp.nan, dtype="f4")
             with capture_time() as rewarding_time_fn:
@@ -713,9 +755,17 @@ class PPOTrainer(Trainer):
                     if isinstance(reward_func, EasyDeLState):
                         if is_conv:
                             messages = [
-                                {"messages": p + c} for p, c in zip(completion_prompts, completions, strict=False)
+                                {"messages": p + c}
+                                for p, c in zip(completion_prompts, structured_completions, strict=False)
                             ]
-                            texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+                            texts = [
+                                apply_chat_template(
+                                    x,
+                                    reward_processing_class,
+                                    tools=self._reward_chat_template_tools(),
+                                )["text"]
+                                for x in messages
+                            ]
                         else:
                             texts = [p + c for p, c in zip(completion_prompts, completions, strict=False)]
 
@@ -737,18 +787,26 @@ class PPOTrainer(Trainer):
                             ),
                         ).logits[:, 0]
                     else:
-                        output_reward_func = reward_func(
+                        reward_call_kwargs = self._build_reward_call_kwargs(
+                            reward_func,
                             prompts=completion_prompts,
                             completions=completions,
+                            raw_completions=raw_completions,
+                            completion_texts=completions_text,
+                            raw_text=raw_completions_text,
+                            reasoning=reasoning_records,
+                            tool_calls=tool_call_records,
                             max_length=self.arguments.max_length,
-                            batch=batch,
+                            batch=reward_batch,
                         )
+                        output_reward_func = reward_func(**reward_call_kwargs)
                         rew = jnp.array(
                             [val if val is not None else jnp.nan for val in output_reward_func],
                             dtype="f4",
                         )
                     rewards_per_func = rewards_per_func.at[:, i].set(rew.reshape(-1))
             rewarding_time = rewarding_time_fn()
+            log_completion_length = jnp.sum(completion_mask, axis=1)
 
             prompt_ids = self._all_gather(prompt_ids)
             prompt_mask = self._all_gather(prompt_mask)
@@ -806,6 +864,16 @@ class PPOTrainer(Trainer):
         }
         for i, reward_func_name in enumerate(self.reward_func_names):
             metrics_dict[reward_func_name] = float(jnp.nanmean(rewards_per_func[:, i]))
+        self._log_training_generations_to_wandb(
+            state=state,
+            prompts=completion_prompts,
+            completions=completions_text,
+            completion_lengths=log_completion_length,
+            generation_time=generation_time,
+            reasoning=reasoning_records,
+            tool_calls=tool_call_records,
+            source="policy",
+        )
 
         return (
             {

@@ -96,7 +96,8 @@ class DistillationTrainer(Trainer):
             tokenizer = processing_class.tokenizer
         if getattr(tokenizer, "pad_token", None) is None and hasattr(tokenizer, "eos_token"):
             tokenizer.pad_token = tokenizer.eos_token
-        assert isinstance(arguments, DistillationConfig), "passed argument must be a `DistillationConfig`."
+        if not isinstance(arguments, DistillationConfig):
+            raise TypeError("passed argument must be a `DistillationConfig`.")
 
         self.arguments = arguments
 
@@ -150,14 +151,14 @@ class DistillationTrainer(Trainer):
             True,  # is_train
             self.arguments.temperature,
             self.arguments.alpha,
-            float(self.arguments.hidden_state_loss_weight),
+            0.0 if self.arguments.hidden_state_loss_weight is None else float(self.arguments.hidden_state_loss_weight),
             hidden_layers,
             self.arguments.hidden_state_loss,
-            float(self.arguments.attention_loss_weight),
+            0.0 if self.arguments.attention_loss_weight is None else float(self.arguments.attention_loss_weight),
             attention_layers,
             bool(self.arguments.attention_normalize),
             straight_through_emulator,
-            int(self.arguments.logits_chunk_size),
+            self.arguments.logits_chunk_size,
         )
 
         static_argnames = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)
@@ -177,14 +178,14 @@ class DistillationTrainer(Trainer):
             False,  # is_train
             self.arguments.temperature,
             self.arguments.alpha,
-            float(self.arguments.hidden_state_loss_weight),
+            0.0 if self.arguments.hidden_state_loss_weight is None else float(self.arguments.hidden_state_loss_weight),
             hidden_layers,
             self.arguments.hidden_state_loss,
-            float(self.arguments.attention_loss_weight),
+            0.0 if self.arguments.attention_loss_weight is None else float(self.arguments.attention_loss_weight),
             attention_layers,
             bool(self.arguments.attention_normalize),
             None,
-            int(self.arguments.logits_chunk_size),
+            self.arguments.logits_chunk_size,
         )
 
         sharded_evaluation_step_function = ejit(

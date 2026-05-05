@@ -27,10 +27,13 @@ from collections.abc import Iterator
 # Re-export base classes from data_managers
 from easydel.data.transforms.base import Example, ExpandTransform, Transform
 
+from .prompt_utils import apply_chat_template as apply_conversational_template
 from .prompt_utils import (
     maybe_apply_chat_template,
     maybe_convert_to_chatml,
     maybe_extract_prompt,
+    normalize_message_payload,
+    resolve_example_tools,
 )
 
 _TOKENIZED_FIELDS = {
@@ -38,6 +41,10 @@ _TOKENIZED_FIELDS = {
     "attention_mask",
     "labels",
     "position_ids",
+    "pixel_values",
+    "pixel_attention_mask",
+    "pixel_values_videos",
+    "image_sizes",
     "completion_mask",
     "assistant_masks",
     "prompt_input_ids",
@@ -58,6 +65,10 @@ _TOKENIZED_FIELDS = {
     "label",
     "embedding_input_ids",
     "embedding_attention_mask",
+    "ref_chosen_logps",
+    "ref_rejected_logps",
+    "reference_chosen_log_probs",
+    "reference_rejected_log_probs",
 }
 
 
@@ -69,107 +80,18 @@ def purify_example(example: dict, keep_fields: set[str] | None = None) -> dict:
 
     Args:
         example: Example dict that may contain both text and tokenized fields.
-        keep_fields: Optional set of additional field names to keep.
+        keep_fields: Optional set of additional field names to keep. ``tools``
+            is always preserved when present.
 
     Returns:
         Purified example with only JAX-compatible fields.
     """
     fields_to_keep = _TOKENIZED_FIELDS.copy()
+    fields_to_keep.add("tools")
     if keep_fields:
         fields_to_keep.update(keep_fields)
 
     return {k: v for k, v in example.items() if k in fields_to_keep}
-
-
-def is_conversational(example: dict) -> bool:
-    """Check if example has conversational format (messages/conversations field).
-
-    Args:
-        example: Dataset example to check.
-
-    Returns:
-        True if example contains messages or prompt list format.
-    """
-    return ("messages" in example and isinstance(example["messages"], list)) or (
-        "prompt" in example and isinstance(example["prompt"], list)
-    )
-
-
-def is_conversational_from_value(example: dict) -> bool:
-    """Check if example has from/value conversation format.
-
-    This is an alternative format where conversations use 'from' and 'value'
-    keys instead of 'role' and 'content'.
-
-    Args:
-        example: Dataset example to check.
-
-    Returns:
-        True if example has conversations in from/value format.
-    """
-    conversations_key = None
-    if "conversations" in example:
-        conversations_key = "conversations"
-    elif "conversation" in example:
-        conversations_key = "conversation"
-
-    if conversations_key is None:
-        return False
-
-    conversations = example[conversations_key]
-    if not isinstance(conversations, list) or len(conversations) == 0:
-        return False
-
-    first_turn = conversations[0]
-    return isinstance(first_turn, dict) and "from" in first_turn and "value" in first_turn
-
-
-def convert_to_chatml(example: dict) -> dict:
-    """Convert from/value format to standard role/content ChatML format.
-
-    Args:
-        example: Example with 'conversations' or 'conversation' field
-                using from/value format.
-
-    Returns:
-        Example with 'messages' field in role/content format.
-
-    Raises:
-        KeyError: If neither 'conversations' nor 'conversation' field exists.
-    """
-    if "conversations" in example:
-        conversations_key = "conversations"
-    elif "conversation" in example:
-        conversations_key = "conversation"
-    else:
-        raise KeyError("Example must have 'conversations' or 'conversation' field")
-    conversations = example[conversations_key]
-
-    role_mapping = {
-        "human": "user",
-        "gpt": "assistant",
-        "system": "system",
-        "user": "user",
-        "assistant": "assistant",
-    }
-
-    messages = []
-    for turn in conversations:
-        role = turn.get("from", "user")
-        content = turn.get("value", "")
-        messages.append(
-            {
-                "role": role_mapping.get(role, role),
-                "content": content,
-            }
-        )
-
-    result = dict(example)
-    result["messages"] = messages
-    # Remove old format keys
-    result.pop("conversations", None)
-    result.pop("conversation", None)
-    return result
 
 
 def extract_prompt_from_preference(example: dict) -> dict:
@@ -185,12 +107,17 @@ def extract_prompt_from_preference(example: dict) -> dict:
     Returns:
         Example with 'prompt' field extracted if applicable.
     """
-    result = maybe_extract_prompt(example)
+    # Preserve auxiliary payload columns (e.g. multimodal tensors) when prompt
+    # extraction rebuilds the text fields from chosen/rejected, but drop the
+    # reserved conversational keys that would collide with prompt/chosen/rejected
+    # chat-templating afterwards.
+    sideband = {key: value for key, value in dict(example).items() if key not in {"messages"}}
+    result = {**sideband, **maybe_extract_prompt(example)}
     if "prompt" in result:
         return result
     # Some RL datasets store the prompt as a single-turn chat under `messages`.
     # GRPO/PPO expect a prompt field (string or list-of-messages), so normalize it.
-    messages = result.get("messages")
+    messages = example.get("messages")
     if isinstance(messages, list):
         out = dict(result)
         out["prompt"] = messages
@@ -216,36 +143,7 @@ def apply_chat_template_to_preference(
     Raises:
         KeyError: If required fields (prompt, chosen, rejected) are missing.
     """
-    result = dict(example)
-
-    # Strict field access - will raise KeyError if missing
-    prompt = example["prompt"]
-    chosen = example["chosen"]
-    rejected = example["rejected"]
-
-    # Handle message list format
-    if isinstance(prompt, list):
-        result["prompt"] = tokenizer.apply_chat_template(
-            prompt,
-            tokenize=False,
-            add_generation_prompt=True,
-            tools=tools,
-        )
-
-        if isinstance(chosen, list):
-            result["chosen"] = tokenizer.apply_chat_template(
-                chosen,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-        if isinstance(rejected, list):
-            result["rejected"] = tokenizer.apply_chat_template(
-                rejected,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-
-    return result
+    return apply_conversational_template(example, tokenizer, tools)
 
 
 class GRPOPreprocessTransform(Transform):
@@ -337,7 +235,7 @@ class GRPOPreprocessTransform(Transform):
                 prompt,
                 tokenize=False,
                 add_generation_prompt=True,
-                tools=self._tools,
+                tools=resolve_example_tools(result, self._tools),
             )
 
         # Tokenize with left padding for generation
@@ -369,8 +267,9 @@ class GRPOPreprocessTransform(Transform):
         result["input_ids"] = input_ids
         result["attention_mask"] = attention_mask
 
-        # Remove non-tokenized fields
-        return purify_example(result)
+        # Preserve per-example sideband metadata such as `tools` for reward functions.
+        keep_fields = {"tools"} if "tools" in result else None
+        return purify_example(result, keep_fields=keep_fields)
 
     def __repr__(self) -> str:
         return f"GRPOPreprocessTransform(max_prompt={self._max_prompt_length})"
@@ -428,6 +327,7 @@ class KTOPreprocessTransform(Transform):
         add_special_tokens: bool = False,
         label_pad_token_id: int = -100,
         embedding_tokenizer: tp.Any = None,
+        tools: list | None = None,
     ):
         self._tokenizer = tokenizer
         self._max_prompt_length = max_prompt_length
@@ -436,6 +336,7 @@ class KTOPreprocessTransform(Transform):
         self._label_pad_token_id = label_pad_token_id
         self._pad_token_id = getattr(tokenizer, "pad_token_id", 0) or 0
         self._embedding_tokenizer = embedding_tokenizer
+        self._tools = tools
 
     def __call__(self, example: Example) -> Example:
         """Apply KTO preprocessing to example.
@@ -455,21 +356,16 @@ class KTOPreprocessTransform(Transform):
 
         # Convert from/value format to role/content if needed (ShareGPT → ChatML)
         example = maybe_convert_to_chatml(example)
-
-        result = dict(example)
+        result = maybe_apply_chat_template(
+            dict(example),
+            self._tokenizer,
+            resolve_example_tools(example, self._tools),
+        )
 
         # Strict field access - will raise KeyError if missing
-        prompt = example["prompt"]
-        completion = example["completion"]
-        label = example["label"]
-
-        # Handle conversational format
-        if isinstance(prompt, list):
-            prompt = self._tokenizer.apply_chat_template(
-                prompt,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
+        prompt = result["prompt"]
+        completion = result["completion"]
+        label = result["label"]
 
         # Tokenize prompt and completion separately
         prompt_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
@@ -627,17 +523,27 @@ class BCOPreprocessTransform(ExpandTransform):
         example = extract_prompt_from_preference(example)
 
         # Step 3: Apply chat template if conversational (uses maybe_apply_chat_template)
-        example = maybe_apply_chat_template(example, self._tokenizer, self._tools)
+        example = maybe_apply_chat_template(
+            example,
+            self._tokenizer,
+            resolve_example_tools(example, self._tools),
+        )
 
         # Step 4: Get fields with strict access - missing fields will raise KeyError
         prompt = example["prompt"]
         chosen = example["chosen"]
         rejected = example["rejected"]
+        sideband_fields = {
+            key: value
+            for key, value in example.items()
+            if key not in {"prompt", "chosen", "rejected", "completion", "label", "messages", "text"}
+        }
 
         # Step 5: Yield TWO tokenized examples (unpair operation)
         # Chosen example (label=True)
         yield self._tokenize_unpaired(
             {
+                **sideband_fields,
                 "prompt": prompt,
                 "completion": chosen,
                 "label": True,
@@ -647,6 +553,7 @@ class BCOPreprocessTransform(ExpandTransform):
         # Rejected example (label=False)
         yield self._tokenize_unpaired(
             {
+                **sideband_fields,
                 "prompt": prompt,
                 "completion": rejected,
                 "label": False,
@@ -665,20 +572,17 @@ class BCOPreprocessTransform(ExpandTransform):
         Raises:
             KeyError: If required fields (prompt, completion, label) are missing.
         """
-        result = dict(example)
+        result = maybe_convert_to_chatml(dict(example))
+        result = maybe_apply_chat_template(
+            result,
+            self._tokenizer,
+            resolve_example_tools(result, self._tools),
+        )
 
         # Strict field access - will raise KeyError if missing
-        prompt = example["prompt"]
-        completion = example["completion"]
-        label = example["label"]
-
-        # Handle conversational format for prompt (if not already converted)
-        if isinstance(prompt, list):
-            prompt = self._tokenizer.apply_chat_template(
-                prompt,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
+        prompt = result["prompt"]
+        completion = result["completion"]
+        label = result["label"]
 
         # Tokenize prompt and completion separately
         prompt_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
@@ -809,12 +713,11 @@ class DPOPreprocessTransform(Transform):
         result = extract_prompt_from_preference(example)
 
         # Step 3: Apply chat template if conversational
-        if isinstance(result["prompt"], list):
-            result = apply_chat_template_to_preference(
-                result,
-                self._tokenizer,
-                self._tools,
-            )
+        result = maybe_apply_chat_template(
+            result,
+            self._tokenizer,
+            resolve_example_tools(result, self._tools),
+        )
 
         # Step 4: Tokenize
         return self._tokenize(result)
@@ -989,18 +892,27 @@ class RewardPreprocessTransform(Transform):
 
         # Convert from/value format to role/content if needed (ShareGPT → ChatML)
         example = maybe_convert_to_chatml(example)
-
-        result = dict(example)
+        had_prompt = "prompt" in example
+        had_conversational_prompt = isinstance(example.get("prompt"), list)
+        had_conversational_pair = any(isinstance(example.get(key), list) for key in ("chosen", "rejected"))
+        result = extract_prompt_from_preference(example)
+        result = maybe_apply_chat_template(
+            result,
+            self._tokenizer,
+            resolve_example_tools(result),
+        )
 
         # Strict field access - will raise KeyError if missing
-        chosen = example["chosen"]
-        rejected = example["rejected"]
+        chosen = result["chosen"]
+        rejected = result["rejected"]
+        prompt = result.get("prompt", "")
 
-        # Handle conversational format
-        if isinstance(chosen, list):
-            chosen = self._tokenizer.apply_chat_template(chosen, tokenize=False)
-        if isinstance(rejected, list):
-            rejected = self._tokenizer.apply_chat_template(rejected, tokenize=False)
+        prompt_was_extracted = (not had_prompt) and ("prompt" in result)
+        should_prefix_prompt = prompt_was_extracted or had_conversational_prompt or had_conversational_pair
+
+        if should_prefix_prompt and prompt:
+            chosen = prompt + chosen
+            rejected = prompt + rejected
 
         # Tokenize both
         chosen_tokens = self._tokenizer(
@@ -1121,19 +1033,24 @@ class SFTPreprocessTransform(Transform):
                 result = dict(example)
                 result[self._text_field] = str(formatted)
 
-        # Step 1: Convert from/value format to ChatML
-        if is_conversational_from_value(result):
-            result = convert_to_chatml(result)
+        # Step 1: Normalize conversational payloads (ChatML / stringified JSON / tools)
+        result = maybe_convert_to_chatml(result)
 
         # Step 2: Handle conversational format
-        if is_conversational(result):
-            messages = result.get(self._messages_field) or result.get("messages")
-            if messages:
-                return self._tokenize_conversational(result, messages)
+        raw_messages = result.get(self._messages_field)
+        if raw_messages is None and self._messages_field != "messages":
+            raw_messages = result.get("messages")
+        messages = normalize_message_payload(raw_messages, allow_plain_text=True)
+        if messages:
+            if self._messages_field in result:
+                result[self._messages_field] = messages
+            elif "messages" in result:
+                result["messages"] = messages
+            return self._tokenize_conversational(result, messages)
 
         text_value = result.get(self._text_field)
-        if isinstance(text_value, list) and text_value and all(isinstance(item, dict) for item in text_value):
-            messages = self._normalize_message_list(text_value)
+        messages = self._normalize_message_list(text_value)
+        if messages:
             return self._tokenize_conversational(result, messages)
 
         # Step 3: Handle prompt/completion format
@@ -1148,37 +1065,18 @@ class SFTPreprocessTransform(Transform):
         return result
 
     @staticmethod
-    def _normalize_message_list(messages: list[dict]) -> list[dict]:
-        if not messages:
-            return messages
-        first = messages[0]
-        if "role" in first and "content" in first:
-            return messages
-        if "from" in first and "value" in first:
-            role_mapping = {
-                "human": "user",
-                "gpt": "assistant",
-                "system": "system",
-                "user": "user",
-                "assistant": "assistant",
-            }
-            normalized: list[dict] = []
-            for turn in messages:
-                if not isinstance(turn, dict):
-                    continue
-                role = role_mapping.get(turn.get("from", "user"), turn.get("from", "user"))
-                normalized.append({"role": role, "content": turn.get("value", "")})
-            return normalized
-        return messages
+    def _normalize_message_list(messages: tp.Any) -> list[dict[str, tp.Any]] | None:
+        return normalize_message_payload(messages, allow_plain_text=False)
 
     def _tokenize_conversational(self, example: dict, messages: list) -> dict:
         """Tokenize conversational data using chat template."""
         result = dict(example)
+        normalized_messages = normalize_message_payload(messages, allow_plain_text=True)
+        if normalized_messages:
+            messages = normalized_messages
 
         # Handle tools if present
-        tools = example.get("tools")
-        if isinstance(tools, str):
-            tools = json.loads(tools)
+        tools = resolve_example_tools(result)
 
         try:
             processed = self._tokenizer.apply_chat_template(
@@ -1224,8 +1122,15 @@ class SFTPreprocessTransform(Transform):
         This handles cases where the tokenizer's chat template has strict
         requirements (e.g., tool messages must follow assistant tool calls).
         """
+        normalized_messages = normalize_message_payload(messages, allow_plain_text=True)
+        if normalized_messages:
+            messages = normalized_messages
+
         parts = []
         for msg in messages:
+            if not isinstance(msg, dict):
+                parts.append(f"<|user|>\n{msg}")
+                continue
             role = msg.get("role", "user")
             content = msg.get("content", "")
 
@@ -1251,28 +1156,30 @@ class SFTPreprocessTransform(Transform):
 
     def _tokenize_prompt_completion(self, example: dict) -> dict:
         """Tokenize prompt/completion format with optional masking."""
-        result = dict(example)
+        raw_example = maybe_convert_to_chatml(dict(example))
+        raw_prompt = raw_example.get("prompt")
+        result = maybe_apply_chat_template(
+            raw_example,
+            self._tokenizer,
+            resolve_example_tools(raw_example),
+        )
 
-        prompt = example["prompt"]
-        completion = example["completion"]
+        prompt = result["prompt"]
+        completion = result["completion"]
 
         # Add EOS to completion if needed
         if self._add_eos and not completion.endswith(self._tokenizer.eos_token):
             completion = completion + self._tokenizer.eos_token
 
-        # Check if conversational prompt
-        if isinstance(prompt, list):
+        if isinstance(raw_prompt, list):
             prompt_ids = self._tokenizer.apply_chat_template(
-                prompt,
+                raw_prompt,
                 add_generation_prompt=True,
-            )
-            full_text = self._tokenizer.apply_chat_template(
-                [*prompt, {"role": "assistant", "content": completion}],
-                tokenize=False,
+                tools=resolve_example_tools(raw_example),
             )
         else:
             prompt_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
-            full_text = prompt + completion
+        full_text = prompt + completion
 
         # Use tokenizer for truncation and padding
         tokens = self._tokenizer(
@@ -1358,3 +1265,82 @@ class SFTPreprocessTransform(Transform):
 
     def __repr__(self) -> str:
         return f"SFTPreprocessTransform(max_length={self._max_length}, mask_prompt={self._mask_prompt})"
+
+
+class EmbeddingPreprocessTransform(Transform):
+    """Transform that tokenizes query/positive/negative text columns for contrastive embedding training.
+
+    Converts raw text strings from dataset columns into tokenized ``input_ids``
+    and ``attention_mask`` arrays with ``query_``/``positive_``/``negative_``
+    prefixes expected by the ``EmbeddingTrainer``.
+
+    Args:
+        tokenizer: Tokenizer instance for text encoding.
+        max_length: Maximum sequence length for tokenization.
+        query_field: Dataset column name containing query/anchor texts.
+        positive_field: Dataset column name containing positive texts.
+        negative_field: Optional column name for hard negative texts.
+
+    Example:
+        >>> transform = EmbeddingPreprocessTransform(
+        ...     tokenizer=tokenizer,
+        ...     max_length=512,
+        ...     query_field="query",
+        ...     positive_field="positive",
+        ... )
+        >>> result = transform({"query": "What is JAX?", "positive": "JAX is a NumPy library."})
+        >>> list(result.keys())
+        ['query_input_ids', 'query_attention_mask', 'positive_input_ids', 'positive_attention_mask']
+    """
+
+    def __init__(
+        self,
+        tokenizer: tp.Any,
+        max_length: int = 512,
+        query_field: str = "query",
+        positive_field: str = "positive",
+        negative_field: str | None = None,
+    ):
+        self._tokenizer = tokenizer
+        self._max_length = max_length
+        self._query_field = query_field
+        self._positive_field = positive_field
+        self._negative_field = negative_field
+
+    def __call__(self, example: Example) -> Example:
+        result: dict[str, tp.Any] = {}
+
+        for prefix, field_name in [
+            ("query", self._query_field),
+            ("positive", self._positive_field),
+        ]:
+            text = example[field_name]
+            encoded = self._tokenizer(
+                text,
+                truncation=True,
+                max_length=self._max_length,
+                padding="max_length",
+                return_attention_mask=True,
+            )
+            result[f"{prefix}_input_ids"] = encoded["input_ids"]
+            result[f"{prefix}_attention_mask"] = encoded["attention_mask"]
+
+        if self._negative_field and self._negative_field in example:
+            encoded = self._tokenizer(
+                example[self._negative_field],
+                truncation=True,
+                max_length=self._max_length,
+                padding="max_length",
+                return_attention_mask=True,
+            )
+            result["negative_input_ids"] = encoded["input_ids"]
+            result["negative_attention_mask"] = encoded["attention_mask"]
+
+        return result
+
+    def __repr__(self) -> str:
+        return (
+            f"EmbeddingPreprocessTransform(max_length={self._max_length}, "
+            f"query={self._query_field}, positive={self._positive_field}, "
+            f"negative={self._negative_field})"
+        )

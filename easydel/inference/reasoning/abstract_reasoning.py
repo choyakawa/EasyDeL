@@ -56,6 +56,7 @@ ReasoningParserName: TypeAlias = Literal[
     "step3.5",
     "openai_gptoss",
     "gptoss",
+    "gemma4",
     "identity",
     "none",
     "passthrough",
@@ -81,6 +82,12 @@ class ReasoningParser:
     """
 
     def __init__(self, tokenizer: AnyTokenizer):
+        """Initialize the reasoning parser with a tokenizer.
+
+        Args:
+            tokenizer: Tokenizer instance for encoding/decoding tokens.
+                Stored as model_tokenizer attribute.
+        """
         self.model_tokenizer = tokenizer
         self.assume_reasoning: bool = False
 

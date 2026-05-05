@@ -181,6 +181,9 @@ class ExecutionManagerProtocol(Protocol):
         top_p_cpu: np.ndarray,
         top_k_cpu: np.ndarray,
         min_p_cpu: np.ndarray,
+        frequency_penalties_cpu: np.ndarray,
+        presence_penalties_cpu: np.ndarray,
+        repetition_penalties_cpu: np.ndarray,
         page_table_cpu: np.ndarray,
         padded_num_reqs_in: int,
         page_table_version: int | None = None,
@@ -213,6 +216,9 @@ class ExecutionManagerProtocol(Protocol):
             top_p_cpu: Top-p sampling parameters (CPU array).
             top_k_cpu: Top-k sampling parameters (CPU array).
             min_p_cpu: Min-p sampling parameters (CPU array).
+            frequency_penalties_cpu: Frequency penalties (CPU array).
+            presence_penalties_cpu: Presence penalties (CPU array).
+            repetition_penalties_cpu: Repetition penalties (CPU array).
             page_table_cpu: KV cache page table (CPU array).
             padded_num_reqs_in: Padded request count for bucketing.
             page_table_version: Optional version for cache invalidation.
@@ -259,31 +265,64 @@ class ExecutionManagerProtocol(Protocol):
         num_tokens: int,
         padded_num_reqs: int,
         *,
-        batch_metadata: BatchMetadata,
+        sampler_padded_num_reqs: int,
+        sampler_num_reqs: int,
+        sampler_total_tokens: int,
         req_num_tokens_full: jax.Array,
-        active_mask_full: jax.Array,
         logits: jax.Array,
         rng_key: jax.Array,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        gather_positions_cpu: np.ndarray,
+        sampling_seeds_cpu: np.ndarray,
+        scatter_positions_cpu: np.ndarray,
+        compact_window_row_indices_cpu: np.ndarray,
+        compact_scheduled_cpu: np.ndarray,
+        compact_seq_lens_cpu: np.ndarray,
+        compact_active_mask_cpu: np.ndarray,
+        compact_temperature_cpu: np.ndarray,
+        compact_top_p_cpu: np.ndarray,
+        compact_top_k_cpu: np.ndarray,
+        compact_min_p_cpu: np.ndarray,
+        compact_frequency_penalties_cpu: np.ndarray,
+        compact_presence_penalties_cpu: np.ndarray,
+        compact_repetition_penalties_cpu: np.ndarray,
+        need_penalties: bool,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
         """Sample tokens from logits.
 
-        Runs the compiled sampler function to generate new tokens based on
-        the model's output logits and sampling parameters.
+        Runs the compiled sampler function to generate new tokens from a
+        compacted sampler window derived from the model outputs.
 
         Args:
             num_tokens: Number of tokens (for bucket selection).
-            padded_num_reqs: Padded request count (for bucket selection).
-            batch_metadata: Batch metadata containing sampling parameters.
+            padded_num_reqs: Model-side padded request count for the current window.
+            sampler_padded_num_reqs: Sampler-side padded request count after compaction.
+            sampler_num_reqs: Actual compacted sampler rows.
+            sampler_total_tokens: Total scheduled tokens in the compacted sampler batch.
             req_num_tokens_full: Target token count per request.
-            active_mask_full: Boolean mask for active requests.
             logits: Model output logits [padded_num_reqs, vocab_size].
             rng_key: JAX random key for stochastic sampling.
+            gather_positions_cpu: Model-row indices used to gather compact logits.
+            sampling_seeds_cpu: Per-row RNG fold-in seeds preserving row identity.
+            scatter_positions_cpu: Output positions for restoring compact samples.
+            compact_window_row_indices_cpu: Global request-row indices for compact rows.
+            compact_scheduled_cpu: Scheduled tokens for compact rows.
+            compact_seq_lens_cpu: Sequence lengths after the forward pass.
+            compact_active_mask_cpu: Active compact rows.
+            compact_temperature_cpu: Temperature per compact row.
+            compact_top_p_cpu: Top-p per compact row.
+            compact_top_k_cpu: Top-k per compact row.
+            compact_min_p_cpu: Min-p per compact row.
+            compact_frequency_penalties_cpu: Frequency penalty per compact row.
+            compact_presence_penalties_cpu: Presence penalty per compact row.
+            compact_repetition_penalties_cpu: Repetition penalty per compact row.
+            need_penalties: Whether any request in the batch needs penalties.
 
         Returns:
-            Tuple of (updated_rng_key, sampled_tokens, valid_mask) where:
+            Tuple of (updated_rng_key, sampled_tokens, valid_mask, updated_token_counts) where:
             - updated_rng_key: New RNG key for next step.
-            - sampled_tokens: Generated token IDs [max_num_reqs], -1 for invalid.
-            - valid_mask: Boolean mask indicating valid samples [max_num_reqs].
+            - sampled_tokens: Generated token IDs [padded_num_reqs], -1 for invalid.
+            - valid_mask: Boolean mask indicating valid samples [padded_num_reqs].
+            - updated_token_counts: Exact device-side token counts [max_num_reqs, vocab_size].
         """
         ...
 

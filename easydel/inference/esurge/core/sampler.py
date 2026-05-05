@@ -19,6 +19,7 @@ for top-k, top-p, and min-p filtering. The sampling functions are pure JAX funct
 (no stateful modules) and support dtype-aware optimizations for bfloat16.
 
 Functions:
+    - apply_history_penalties: Apply presence/frequency/repetition penalties
     - sample_tokens: Main entry point for token sampling
     - _regular_sample: Stochastic sampling with filtering
     - _greedy_sample: Deterministic argmax sampling
@@ -80,7 +81,10 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
     need_top_k = jnp.any(sampling_metadata.top_ks > 0)
 
     def apply_topk(legi):
+        """Apply top-k filtering to each sample in the batch."""
+
         def topk_per_sample(logits_i, k_i):
+            """Apply top-k mask to a single sample if k > 0."""
             return lax.cond(k_i > 0, lambda: apply_topk_mask(logits_i[None, :], k_i, min_val)[0], lambda: logits_i)
 
         return jax.vmap(topk_per_sample)(legi, sampling_metadata.top_ks)
@@ -91,7 +95,10 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
     need_top_p = jnp.any(sampling_metadata.top_ps < 1.0)
 
     def apply_topp(legi):
+        """Apply top-p (nucleus) filtering to each sample in the batch."""
+
         def topp_per_sample(logits_i, p_i):
+            """Apply top-p mask to a single sample if p < 1.0."""
             return lax.cond(p_i < 1.0, lambda: apply_topp_mask(logits_i[None, :], p_i, min_val)[0], lambda: logits_i)
 
         return jax.vmap(topp_per_sample)(legi, sampling_metadata.top_ps)
@@ -102,6 +109,7 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
     need_temp = jnp.any(sampling_metadata.temperatures != 1.0)
 
     def apply_temp(legi):
+        """Scale logits by per-sample temperature values."""
         return legi / sampling_metadata.temperatures
 
     logits = lax.cond(need_temp, apply_temp, lambda legi: legi, logits)
@@ -117,12 +125,180 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
     # Sample from filtered distribution
     batch_size = logits.shape[0]
 
-    def sample_one(i):
-        per_sample_rng = jax.random.fold_in(rng, i)
-        return jax.random.categorical(per_sample_rng, logits[i]).astype(jnp.int32)
+    if sampling_metadata.sampling_seeds is None:
+        sampling_seeds = jnp.arange(batch_size, dtype=jnp.int32)
+    else:
+        sampling_seeds = sampling_metadata.sampling_seeds[:batch_size].astype(jnp.int32)
 
-    samples = jax.vmap(sample_one)(jnp.arange(batch_size))
+    def sample_one(logits_i, seed_i):
+        """Sample a single token from a filtered logit distribution."""
+        per_sample_rng = jax.random.fold_in(rng, seed_i)
+        return jax.random.categorical(per_sample_rng, logits_i).astype(jnp.int32)
+
+    samples = jax.vmap(sample_one)(logits, sampling_seeds)
     return samples
+
+
+def build_history_token_counts(
+    *,
+    token_history: jax.Array,
+    seq_lens: jax.Array,
+    active_mask: jax.Array,
+    vocab_size: int,
+    count_dtype: jnp.dtype = jnp.uint32,
+) -> jax.Array:
+    """Build exact per-token history counts from token IDs.
+
+    Args:
+        token_history: Token IDs [batch, max_len].
+        seq_lens: Effective history lengths [batch].
+        active_mask: Active request mask [batch].
+        vocab_size: Vocabulary size for the output count matrix.
+        count_dtype: Integer dtype used to store exact counts.
+
+    Returns:
+        Dense count matrix [batch, vocab_size].
+    """
+    batch_size = token_history.shape[0]
+    history_width = token_history.shape[1]
+    positions = jnp.arange(history_width, dtype=jnp.int32)[None, :]
+    valid_positions = (positions < seq_lens[:, None]) & active_mask[:, None]
+    safe_history = jnp.where(valid_positions, token_history, 0)
+    batch_indices = jnp.broadcast_to(jnp.arange(batch_size, dtype=jnp.int32)[:, None], safe_history.shape)
+    return (
+        jnp.zeros((batch_size, vocab_size), dtype=count_dtype)
+        .at[batch_indices, safe_history]
+        .add(valid_positions.astype(count_dtype))
+    )
+
+
+def apply_history_penalties_from_counts(
+    logits: jax.Array,
+    *,
+    token_counts: jax.Array,
+    active_mask: jax.Array,
+    presence_penalties: jax.Array,
+    frequency_penalties: jax.Array,
+    repetition_penalties: jax.Array,
+) -> jax.Array:
+    """Apply history penalties from precomputed token counts.
+
+    Args:
+        logits: Next-token logits [batch, vocab_size].
+        token_counts: Exact token counts [batch, vocab_size].
+        active_mask: Active request mask [batch].
+        presence_penalties: Presence penalty per request [batch].
+        frequency_penalties: Frequency penalty per request [batch].
+        repetition_penalties: Repetition penalty per request [batch].
+
+    Returns:
+        Penalized logits [batch, vocab_size].
+    """
+    batch_size = logits.shape[0]
+    active_mask = active_mask[:batch_size].astype(jnp.bool_)
+    presence_penalties = presence_penalties[:batch_size].astype(logits.dtype)
+    frequency_penalties = frequency_penalties[:batch_size].astype(logits.dtype)
+    repetition_penalties = repetition_penalties[:batch_size].astype(logits.dtype)
+
+    need_penalties = jnp.any(
+        active_mask & ((presence_penalties != 0.0) | (frequency_penalties != 0.0) | (repetition_penalties != 1.0))
+    )
+
+    def _apply(legi: jax.Array) -> jax.Array:
+        counts = token_counts[:batch_size]
+        count_values = counts.astype(legi.dtype)
+        presence_mask = counts > 0
+
+        adjusted = legi
+        adjusted = adjusted - presence_mask.astype(legi.dtype) * presence_penalties[:, None]
+        adjusted = adjusted - count_values * frequency_penalties[:, None]
+
+        safe_repetition = repetition_penalties[:, None]
+        positive_scores = adjusted / safe_repetition
+        negative_scores = adjusted * safe_repetition
+        repeated_scores = jnp.where(adjusted > 0, positive_scores, adjusted)
+        repeated_scores = jnp.where(adjusted < 0, negative_scores, repeated_scores)
+        adjusted = jnp.where(presence_mask, repeated_scores, adjusted)
+
+        return jnp.where(active_mask[:, None], adjusted, legi)
+
+    return lax.cond(need_penalties, _apply, lambda legi: legi, logits)
+
+
+def update_token_counts(
+    token_counts: jax.Array,
+    *,
+    row_indices: jax.Array,
+    sampled_tokens: jax.Array,
+    valid_mask: jax.Array,
+) -> jax.Array:
+    """Increment exact token counts with newly sampled tokens.
+
+    Args:
+        token_counts: Existing count matrix [max_num_reqs, vocab_size].
+        row_indices: Global request-row indices for the current window [batch].
+        sampled_tokens: Sampled token IDs [batch].
+        valid_mask: True for rows that emitted a real token [batch].
+
+    Returns:
+        Updated count matrix with sampled tokens incremented in-place.
+    """
+    row_indices = row_indices.astype(jnp.int32)
+    sampled_tokens = sampled_tokens.astype(jnp.int32)
+    valid_mask = valid_mask.astype(jnp.bool_)
+    safe_rows = jnp.where(valid_mask, row_indices, 0)
+    safe_tokens = jnp.where(valid_mask, sampled_tokens, 0)
+    increments = valid_mask.astype(token_counts.dtype)
+    return token_counts.at[safe_rows, safe_tokens].add(increments)
+
+
+def apply_history_penalties(
+    logits: jax.Array,
+    *,
+    token_history: jax.Array,
+    seq_lens: jax.Array,
+    active_mask: jax.Array,
+    presence_penalties: jax.Array,
+    frequency_penalties: jax.Array,
+    repetition_penalties: jax.Array,
+) -> jax.Array:
+    """Apply history-aware penalties to logits.
+
+    This matches the host-side `SamplingParams` processor ordering used by
+    EasyDeL: presence penalty, then frequency penalty, then repetition penalty.
+
+    Args:
+        logits: Next-token logits [batch, vocab_size].
+        token_history: Token IDs generated/consumed so far [batch_or_more, max_len].
+        seq_lens: Effective history length per request [batch_or_more].
+        active_mask: Active request mask [batch].
+        presence_penalties: Presence penalty per request [batch_or_more].
+        frequency_penalties: Frequency penalty per request [batch_or_more].
+        repetition_penalties: Repetition penalty per request [batch_or_more].
+
+    Returns:
+        Penalized logits [batch, vocab_size].
+    """
+    batch_size = logits.shape[0]
+    seq_lens = seq_lens[:batch_size].astype(jnp.int32)
+    active_mask = active_mask[:batch_size].astype(jnp.bool_)
+    presence_penalties = presence_penalties[:batch_size].astype(logits.dtype)
+    frequency_penalties = frequency_penalties[:batch_size].astype(logits.dtype)
+    repetition_penalties = repetition_penalties[:batch_size].astype(logits.dtype)
+    token_counts = build_history_token_counts(
+        token_history=token_history[:batch_size],
+        seq_lens=seq_lens,
+        active_mask=active_mask,
+        vocab_size=logits.shape[1],
+    )
+    return apply_history_penalties_from_counts(
+        logits,
+        token_counts=token_counts,
+        active_mask=active_mask,
+        presence_penalties=presence_penalties,
+        frequency_penalties=frequency_penalties,
+        repetition_penalties=repetition_penalties,
+    )
 
 
 def sample_tokens(

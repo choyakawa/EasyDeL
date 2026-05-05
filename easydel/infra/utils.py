@@ -71,18 +71,37 @@ from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, DTypeLike, PRNGKeyArray
 from tqdm.auto import tqdm
 
-from easydel.layers import EasyQuantizer, ParallelLinear, QuantizationConfig
+from easydel.layers import EasyQuantizer, ParallelLinear, QuantizationConfig, eLoRA
 from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
 from .errors import EasyDeLBlockWiseFFNError
-from .etils import AVAILABLE_SPARSE_MODULE_TYPES, EasyDeLGradientCheckPointers
+from .etils import AVAILABLE_SPARSE_MODULE_TYPES, GRADIENT_CHECKPOINT_TARGETS, EasyDeLGradientCheckPointers
 
 warnings.filterwarnings(
     "ignore",
     message="Primitive dynamic_update_slice was not handled by class",
 )
 logger = get_logger(__name__)
+
+_ATTN_CHECKPOINT_NAME_PATTERN = re.compile(r"^attn_")
+_MLP_CHECKPOINT_NAME_PATTERN = re.compile(r"^mlp_")
+
+
+def _select_checkpoint_names_by_regex(
+    *,
+    include_patterns: Sequence[re.Pattern[str]] | None = None,
+    exclude_patterns: Sequence[re.Pattern[str]] | None = None,
+) -> list[str]:
+    """Resolve known checkpoint names using include/exclude regex filters."""
+    names = list(GRADIENT_CHECKPOINT_TARGETS)
+    if include_patterns:
+        names = [name for name in names if any(pattern.search(name) for pattern in include_patterns)]
+    if exclude_patterns:
+        names = [name for name in names if not any(pattern.search(name) for pattern in exclude_patterns)]
+    if not names:
+        raise ValueError("Regex-based checkpoint target selection resolved to an empty set.")
+    return names
 
 
 def quick_gelu(x):
@@ -181,6 +200,9 @@ def get_gradient_checkpoint_policy(
             - 'save_anything_except_these_names': Save all except specified names
             - 'save_any_names_but_these': Save any names except specified
             - 'save_only_these_names': Save only specified names
+            - 'mlp_notsaveable': Save all known checkpoint names except MLP-family names
+            - 'attn_notsaveable': Save all known checkpoint names except attention-family names
+            - 'mlp_attn_notsaveable': Save all known checkpoint names except MLP and attention names
             - 'save_from_both_policies': Combine two policies
         save_names: List of checkpoint names to save (used with 'save_only_these_names')
         exclude_names: List of checkpoint names to exclude (used with 'save_anything_except_these_names')
@@ -208,6 +230,20 @@ def get_gradient_checkpoint_policy(
     if name == "save_only_these_names":
         if save_names is None:
             raise ValueError("save_names must be provided when using 'save_only_these_names' policy")
+        return jax.checkpoint_policies.save_only_these_names(*save_names)
+
+    elif name == "mlp_notsaveable":
+        save_names = _select_checkpoint_names_by_regex(exclude_patterns=[_MLP_CHECKPOINT_NAME_PATTERN])
+        return jax.checkpoint_policies.save_only_these_names(*save_names)
+
+    elif name == "attn_notsaveable":
+        save_names = _select_checkpoint_names_by_regex(exclude_patterns=[_ATTN_CHECKPOINT_NAME_PATTERN])
+        return jax.checkpoint_policies.save_only_these_names(*save_names)
+
+    elif name == "mlp_attn_notsaveable":
+        save_names = _select_checkpoint_names_by_regex(
+            exclude_patterns=[_MLP_CHECKPOINT_NAME_PATTERN, _ATTN_CHECKPOINT_NAME_PATTERN]
+        )
         return jax.checkpoint_policies.save_only_these_names(*save_names)
 
     elif name in ["save_anything_except_these_names", "save_any_names_but_these"]:
@@ -357,7 +393,7 @@ def block_wise_ffn(remat_ffn: tp.Callable, inputs: jax.Array, chunk_size: int) -
     except Exception as e:
         raise EasyDeLBlockWiseFFNError(
             "You Are using BlockWise FFN from near-infinite-context length paper and you might be passing "
-            "input arguments in wrong way in case that you don'position_ids want to use this just pass "
+            "input arguments in wrong way in case that you don't want to use this just pass "
             "`use_scan_mlp=False` in "
             "model config or in config_kwargs in AutoEasyDeLModelFor... or change `scan_mlp_chunk_size` "
             f"in configs for more information read Docs.\nOriginal Error\n{e}"
@@ -376,7 +412,7 @@ def is_flatten(pytree: dict):
         True if the pytree is a flattened tree, and false otherwise
     """
     mpl = next(iter(pytree.keys()))
-    return True if isinstance(mpl, tuple) else False
+    return isinstance(mpl, tuple)
 
 
 def quantize_linear_layers(
@@ -413,19 +449,26 @@ def apply_lora_to_layers(
     verbose: bool = True,
     rngs: nn.Rngs | None = None,
 ) -> nn.Module:
-    """
-    Applies LoRA (Low-Rank Adaptation) to specified linear layers within a model.
+    """Wrap matching ``ParallelLinear`` modules with EasyDeL's LoRA adapter.
 
     Args:
         model: The EasyDeL model to modify.
-        lora_rank: The rank of the LoRA adapters.
+        lora_rank: Rank of the low-rank adapter matrices. Must be positive.
         lora_pattern: A regular expression pattern to match the names of
-                      modules to which LoRA should be applied. Defaults to ".*" (all linear layers).
-        verbose: Whether to display a progress bar.
-        rngs:  A `flax.nnx.Rngs` instance for random number generation. If None, initializes with a seed of 0.
+            modules to which LoRA should be applied. Defaults to ``".*"`` so
+            every ``ParallelLinear`` encountered is wrapped.
+        verbose: Whether to display a progress bar while traversing modules.
+        rngs: Random source used to initialize the LoRA adapter weights. When
+            omitted, ``nn.Rngs(0)`` is used.
 
     Returns:
-        The modified model with LoRA applied to the specified layers.
+        The input model after matching layers have been replaced in-place by
+        :class:`eLoRA` wrappers.
+
+    Notes:
+        The wrapper used here is EasyDeL's ``eLoRA`` instead of Flax's raw
+        ``nn.LoRA`` so the adapted layers continue to support EasyDeL-specific
+        call conventions such as keyword forwarding and ``native_forward``.
     """
     from easydel.utils.traversals import get_module_from_path, iter_module_search, set_module_from_path
 
@@ -445,7 +488,7 @@ def apply_lora_to_layers(
         for path, _ in iter_module_search(model, ParallelLinear):
             if pattern.search(".".join([str(p) for p in path])):
                 base_module: ParallelLinear = get_module_from_path(model=model, path=path)
-                lora_module = nn.LoRA(
+                lora_module = eLoRA(
                     base_module=base_module,
                     rngs=rngs,
                     dtype=base_module.dtype,
@@ -571,9 +614,10 @@ def unwrap_lora_to_layers(
     """
     from easydel.utils.traversals import get_module_from_path, iter_module_search, set_module_from_path
 
+    lora_paths = [p[0] for p in iter_module_search(model, nn.LoRA)]
     with tqdm(
-        total=len([p[0] for p in iter_module_search(model, ParallelLinear)]),
-        desc="Unwarping LoRA Layers",
+        total=len(lora_paths),
+        desc="Unwrapping LoRA Layers",
         disable=not verbose,
     ) as pbar:
         for path, _ in iter_module_search(model, nn.LoRA):
@@ -588,7 +632,7 @@ def unwrap_lora_to_layers(
                 path=path,
                 new_value=base_module.base_module,
             )
-        pbar.update(1)
+            pbar.update(1)
 
     return model
 
@@ -609,7 +653,8 @@ def apply_sparsity_to_params(
         "coo": sparse.COO,
         "csr": sparse.CSR,
     }.get(sparsify_module, None)
-    assert sparser is not None, f"unkown type of sparser {sparsify_module}"
+    if sparser is None:
+        raise ValueError(f"unknown type of sparser {sparsify_module}")
 
     def _path_to_str(path):
         path_keys = []
@@ -1314,12 +1359,14 @@ class AttnMaskType(StrEnum):
             "chunk_attention",
             "chunked_attention",
             "linear_attention",
+            "kda_linear_attention",
+            "hybrid",
             "parallel_hybrid",
         ],
     ):
         if hf_type == "sliding_attention":
             return AttnMaskType.SLIDING
-        elif hf_type in ("full_attention", "linear_attention", "parallel_hybrid"):
+        elif hf_type in ("full_attention", "linear_attention", "kda_linear_attention", "hybrid", "parallel_hybrid"):
             # eSurge cache grouping is page-table based; linear attention layers
             # and parallel hybrid layers (attention+SSM) are treated as
             # full-attention groups for scheduler compatibility.
@@ -1359,21 +1406,7 @@ class AttnMaskDetail:
     bricks: int | None = None
 
 
-class TaskType(StrEnum):
-    CAUSAL_LM = "causal-language-model"
-    VISION_LM = "vision-language-model"
-    DIFFUSION_LM = "diffusion-language-model"
-    IMAGE_TEXT_TO_TEXT = "image-text-to-text"
-    BASE_MODULE = "base-module"
-    BASE_VISION = "vision-module"
-    SEQUENCE_TO_SEQUENCE = "sequence-to-sequence"
-    SPEECH_SEQUENCE_TO_SEQUENCE = "speech-sequence-to-sequence"
-    ZERO_SHOT_IMAGE_CLASSIFICATION = "zero-shot-image-classification"
-    SEQUENCE_CLASSIFICATION = "sequence-classification"
-    AUDIO_CLASSIFICATION = "audio-classification"
-    IMAGE_CLASSIFICATION = "image-classification"
-    ANY_TO_ANY = "any-to-any"
-    AUTO_BIND = "auto-bind"
+from easydel.infra.factory import TaskType  # noqa: E402
 
 
 @dataclass

@@ -59,6 +59,9 @@ class SeqKDTrainer(Trainer):
            generates completions via ``generate_unified``.
         2. **External teacher function** (``teacher_fn``): A callable
            ``(prompts: list[str]) -> list[str]`` for API-based teachers.
+           When ``num_generations_per_prompt > 1``, prompts are repeated in
+           prompt-major order and the callable must return one completion per
+           repeated prompt.
 
     Training loop:
         1. Sample prompts from the dataset
@@ -102,10 +105,10 @@ class SeqKDTrainer(Trainer):
         if getattr(tokenizer, "pad_token", None) is None and hasattr(tokenizer, "eos_token"):
             tokenizer.pad_token = tokenizer.eos_token
 
-        assert isinstance(arguments, SeqKDConfig), "passed argument must be a `SeqKDConfig`."
-        assert teacher_model is not None or teacher_fn is not None, (
-            "Either `teacher_model` or `teacher_fn` must be provided."
-        )
+        if not isinstance(arguments, SeqKDConfig):
+            raise TypeError("passed argument must be a `SeqKDConfig`.")
+        if teacher_model is None and teacher_fn is None:
+            raise ValueError("Either `teacher_model` or `teacher_fn` must be provided.")
 
         self.arguments = arguments
 
@@ -124,18 +127,6 @@ class SeqKDTrainer(Trainer):
             pad_token_id = getattr(processing_class.tokenizer, "pad_token_id", None)
         self.padding_value = 0 if pad_token_id is None else int(pad_token_id)
 
-        # Wire generation config into arguments for generate_unified
-        if getattr(self.arguments, "generation_num_return_sequences", None) is None:
-            self.arguments.generation_num_return_sequences = arguments.num_generations_per_prompt
-        if getattr(self.arguments, "generation_top_p", None) is None:
-            self.arguments.generation_top_p = arguments.top_p
-        if getattr(self.arguments, "generation_top_k", None) is None:
-            self.arguments.generation_top_k = arguments.top_k
-        if getattr(self.arguments, "generation_temperature", None) is None:
-            self.arguments.generation_temperature = arguments.temperature_sampling
-        if getattr(self.arguments, "generation_extra_kwargs", None) is None:
-            self.arguments.generation_extra_kwargs = {}
-
         super().__init__(
             arguments=arguments,
             dataset_train=train_dataset,
@@ -153,6 +144,7 @@ class SeqKDTrainer(Trainer):
             tokenizer=self.processing_class,
             max_prompt_length=self.arguments.max_prompt_length,
             skip_apply_chat_template=self.arguments.skip_apply_chat_template,
+            tools=getattr(self.arguments, "tools", None),
         )
 
     def _is_pretokenized(self) -> bool:
@@ -199,8 +191,9 @@ class SeqKDTrainer(Trainer):
     ) -> tuple[dict[str, tp.Any], dict[str, float | int | str]]:
         """Generate completions from teacher and prepare a CE training batch.
 
-        If ``teacher_fn`` is set, prompts are decoded to text, passed to the
-        callable, and the returned completions are re-tokenized.  Otherwise
+        If ``teacher_fn`` is set, prompts are decoded to text, optionally
+        repeated per prompt when ``num_generations_per_prompt > 1``, passed to
+        the callable, and the returned completions are re-tokenized.  Otherwise
         ``generate_unified`` is called on the local teacher model.
         """
         batch = self._purify_batch(batch)
@@ -208,6 +201,7 @@ class SeqKDTrainer(Trainer):
         generation_time: float = 0.0
         with capture_time() as preprocessing_time_fn:
             prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
+            generated_completions_text: list[str] | None = None
 
             if self.teacher_fn is not None:
                 with capture_time() as generation_time_fn:
@@ -215,8 +209,23 @@ class SeqKDTrainer(Trainer):
                         prompt_ids,
                         skip_special_tokens=True,
                     )
-                    completion_texts = self.teacher_fn(prompt_texts)
-
+                    generation_factor = int(
+                        getattr(self.arguments, "generation_num_return_sequences", None)
+                        or getattr(self.arguments, "num_generations_per_prompt", 1)
+                        or 1
+                    )
+                    generation_factor = max(generation_factor, 1)
+                    expanded_prompt_texts = [
+                        prompt_text for prompt_text in prompt_texts for _ in range(generation_factor)
+                    ]
+                    completion_texts = list(self.teacher_fn(expanded_prompt_texts))
+                    if len(completion_texts) != len(expanded_prompt_texts):
+                        raise ValueError(
+                            "`teacher_fn` must return exactly one completion per prompt. "
+                            f"Expected {len(expanded_prompt_texts)} completions for "
+                            f"{len(prompt_texts)} prompts with generation_factor={generation_factor}, "
+                            f"but got {len(completion_texts)}."
+                        )
                     encoded = self.processing_class(
                         completion_texts,
                         padding="max_length",
@@ -225,6 +234,7 @@ class SeqKDTrainer(Trainer):
                         return_tensors="np",
                         add_special_tokens=False,
                     )
+                    generated_completions_text = completion_texts
                     completion_ids = jnp.array(encoded["input_ids"])
                     completion_mask = jnp.array(encoded["attention_mask"])
                 generation_time = generation_time_fn()
@@ -241,6 +251,7 @@ class SeqKDTrainer(Trainer):
                     prompt_ids = results.prompt_ids
                     prompt_mask = results.prompt_mask
                     completion_ids = results.completion_ids
+                    generated_completions_text = self._coerce_generation_texts(results.text)
                 generation_time = generation_time_fn()
 
                 completion_mask = self._make_attn_mask(completion_ids)
@@ -274,6 +285,16 @@ class SeqKDTrainer(Trainer):
             "generation_time": generation_time,
             "preprocessing_time": preprocessing_time,
         }
+        self._log_training_generations_to_wandb(
+            state=state,
+            prompts=expanded_prompt_ids,
+            prompt_mask=expanded_prompt_mask,
+            completions=generated_completions_text,
+            completion_ids=completion_ids,
+            completion_mask=completion_mask,
+            generation_time=generation_time,
+            source="teacher",
+        )
 
         return (
             {

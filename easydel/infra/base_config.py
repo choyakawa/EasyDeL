@@ -54,6 +54,7 @@ from typing import Any, NotRequired
 
 import jax
 import jax.extend
+import numpy as np
 import transformers
 from eformer import common_types
 from eformer.common_types import DP, EP, FSDP, MODE_TRAIN, NOT_GIVEN, SP, TP
@@ -113,6 +114,7 @@ from .etils import (
     AVAILABLE_GRADIENT_CHECKPOINTS,
     AVAILABLE_MOE_METHODS,
     DEFAULT_ATTENTION_MECHANISM,
+    DEFAULT_MLA_ATTENTION_MECHANISM,
     EasyDeLBackends,
     EasyDeLGradientCheckPointers,
     EasyDeLPlatforms,
@@ -243,25 +245,33 @@ def _mesh_shape_ep(mesh, pm, fsdp_is_ep_bound, sp_is_ep_bound):
         _resolve_eformer_axis(SP, pm),
     )
 
-    # Resolve sizes
-    odpsize, ofsdpsize, oepsize, otpsize, ospsize = (
-        mesh.shape.get(dpname, 1),
-        mesh.shape.get(fsdpname, 1),
-        mesh.shape.get(epname, 1),
-        mesh.shape.get(tpname, 1),
-        mesh.shape.get(spname, 1),
-    )
+    axis_sizes = mesh.shape
+    assigned_axes: dict[str, str] = {}
+    size_by_group = {"dp": 1, "ep": 1, "tp": 1}
 
-    epsize = oepsize
-    if fsdp_is_ep_bound:
-        epsize *= ofsdpsize
-    else:
-        odpsize *= ofsdpsize
+    def assign_axis(axis_name: str | None, group: str) -> None:
+        if axis_name is None:
+            return
 
-    if sp_is_ep_bound:
-        epsize *= ospsize
-    else:
-        odpsize *= ospsize
+        existing_group = assigned_axes.get(axis_name)
+        if existing_group is not None:
+            return
+
+        assigned_axes[axis_name] = group
+        size_by_group[group] *= axis_sizes.get(axis_name, 1)
+
+    # Give dedicated TP/EP axes priority, then place DP and any bound axes.
+    # This keeps the folded mesh shape valid when multiple semantic roles alias
+    # the same physical mesh dimension.
+    assign_axis(tpname, "tp")
+    assign_axis(epname, "ep")
+    assign_axis(dpname, "dp")
+    assign_axis(fsdpname, "ep" if fsdp_is_ep_bound else "dp")
+    assign_axis(spname, "ep" if sp_is_ep_bound else "dp")
+
+    odpsize = size_by_group["dp"]
+    epsize = size_by_group["ep"]
+    otpsize = size_by_group["tp"]
     return (odpsize, epsize, otpsize), (dpname, epname, tpname)
 
 
@@ -403,6 +413,9 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     sharding_axis_names: NotRequired[collections.abc.Sequence[str]]
     attn_mechanism: NotRequired[AVAILABLE_ATTENTION_MECHANISMS]
     decode_attn_mechanism: NotRequired[AVAILABLE_ATTENTION_MECHANISMS]
+    mla_attn_mechanism: NotRequired[AVAILABLE_ATTENTION_MECHANISMS]
+    mla_attn_dtype: NotRequired[jnp.dtype | str | None]
+    mla_attn_softmax_dtype: NotRequired[jnp.dtype | str | None]
     blocksize_k: NotRequired[int]
     blocksize_q: NotRequired[int]
     blocksize_b: NotRequired[int]
@@ -449,6 +462,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     mask_max_position_embeddings: NotRequired[int]
     freq_max_position_embeddings: NotRequired[int]
     precompute_masks: NotRequired[bool]
+    lmhead_chunksize: NotRequired[int | None]
 
 
 class EasyDeLBaseConfig(PretrainedConfig):
@@ -468,6 +482,13 @@ class EasyDeLBaseConfig(PretrainedConfig):
         attn_mechanism: Attention implementation to use during training/forward passes.
         decode_attn_mechanism: Attention implementation to use during decoding
             (falls back to ``attn_mechanism`` if left as ``None``).
+        mla_attn_mechanism: Attention mechanism override for MLA layers.
+            Use ``"auto"`` to infer MLA-specific serving kernels (defaults to
+            ``"auto"``). Non-MLA layers ignore this field.
+        mla_attn_dtype: Optional MLA-specific attention activation dtype.
+            Defaults to ``attn_dtype`` when unset.
+        mla_attn_softmax_dtype: Optional MLA-specific attention softmax dtype.
+            Defaults to ``attn_softmax_dtype`` when unset.
         blocksize_k: Key block size for attention kernels. Defaults to ``128``.
         blocksize_q: Query block size for attention kernels. Defaults to ``128``.
         blocksize_b: Batch/block size used by some attention backends. Defaults to ``1``.
@@ -491,6 +512,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         gradient_checkpointing_targets: Optional list of target names to include or
             exclude when using selective checkpointing policies.
         precompute_masks: Whether to precompute and cache causal masks on the mesh.
+        lmhead_chunksize: Optional token chunk size for chunked LM-head projection.
+            When set, models may project hidden states to logits in sequence chunks
+            instead of a single full-sequence LM-head matmul.
         kv_cache_quantization_config: Quantization config for KV cache tensors. Pass ``None`` to disable.
         quantization_config: Quantization config for linear layers. Pass ``None`` to disable.
         use_qmm_best_config: Whether quantized linear kernels should request
@@ -552,6 +576,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         "is_decoder": False,
         "tie_word_embeddings": True,
         "cross_attention_hidden_size": None,
+        "_output_attentions": False,
+        "_attn_implementation_internal": None,
+        "_experts_implementation_internal": None,
     }
 
     _rope_relevant_keys: tp.ClassVar[set[str]] = {
@@ -582,6 +609,12 @@ class EasyDeLBaseConfig(PretrainedConfig):
             return None
 
         cls.get_partition_rules = _return_none_partition_rules
+        # PreTrainedConfig provides value-based equality, which causes Python to
+        # set ``__hash__ = None`` on subclasses unless we restore it explicitly.
+        # EasyDeL passes configs through static JIT paths, so config subclasses
+        # must remain hashable for graph definitions to compile.
+        if cls.__dict__.get("__hash__") is None:
+            cls.__hash__ = hash_fn
 
     @staticmethod
     def _normalize_rope_parameters_dict(
@@ -762,8 +795,11 @@ class EasyDeLBaseConfig(PretrainedConfig):
         sharding_axis_names: collections.abc.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
         attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_ATTENTION_MECHANISM,
         decode_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = None,
-        blocksize_k: int = 128,
-        blocksize_q: int = 128,
+        mla_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_MLA_ATTENTION_MECHANISM,
+        mla_attn_dtype: jnp.dtype | str | None = None,
+        mla_attn_softmax_dtype: jnp.dtype | str | None = None,
+        blocksize_k: int = 512,
+        blocksize_q: int = 512,
         blocksize_b: int = 1,
         moe_tiling_size_batch: int = 4,
         moe_tiling_size_seqlen: int = 128,
@@ -783,6 +819,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         gradient_checkpointing_targets: list[AVAILABLE_GRADIENT_CHECKPOINT_TARGETS] | None = None,
         precompute_masks: bool = True,
+        lmhead_chunksize: int | None = None,
         kv_cache_quantization_config: QuantizationConfig | None = None,
         quantization_config: QuantizationConfig | None = None,
         use_qmm_best_config: bool = False,
@@ -827,9 +864,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             try:
                 resolved_backend = jax.default_backend()
             except Exception as err:
-                logger.warning(
-                    f"Unable to resolve JAX default backend ({err}); falling back to 'cpu' for config init."
-                )
+                logger.warning(f"Unable to resolve JAX default backend ({err}); falling back to 'cpu' for config init.")
                 resolved_backend = "cpu"
 
         self.backend = getattr(self, "backend", resolved_backend)
@@ -842,6 +877,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.easy_method = getattr(self, "easy_method", easy_method)
         self.attn_mechanism = getattr(self, "attn_mechanism", attn_mechanism)
         self.decode_attn_mechanism = getattr(self, "decode_attn_mechanism", decode_attn_mechanism)
+        self.mla_attn_mechanism = getattr(self, "mla_attn_mechanism", mla_attn_mechanism)
         self.blocksize_b = getattr(self, "blocksize_b", blocksize_b)
         self.blocksize_k = getattr(self, "blocksize_k", blocksize_k)
         self.blocksize_q = getattr(self, "blocksize_q", blocksize_q)
@@ -869,6 +905,16 @@ class EasyDeLBaseConfig(PretrainedConfig):
             self, "gradient_checkpointing_targets", gradient_checkpointing_targets
         )
         self.precompute_masks = getattr(self, "precompute_masks", precompute_masks)
+        self.lmhead_chunksize = getattr(self, "lmhead_chunksize", lmhead_chunksize)
+        if self.lmhead_chunksize is not None:
+            if not isinstance(self.lmhead_chunksize, (int, np.integer)):
+                raise TypeError(
+                    "`lmhead_chunksize` must be an int when provided, got "
+                    f"{type(self.lmhead_chunksize).__name__}: {self.lmhead_chunksize!r}"
+                )
+            self.lmhead_chunksize = int(self.lmhead_chunksize)
+            if self.lmhead_chunksize <= 0:
+                raise ValueError("`lmhead_chunksize` must be positive when provided.")
 
         self.kv_cache_quantization_config = getattr(self, "kv_cache_quantization_config", kv_cache_quantization_config)
         self.quantization_config = getattr(self, "quantization_config", quantization_config)
@@ -881,6 +927,17 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.attn_dtype = getattr(self, "attn_dtype", attn_dtype)
         self.kvdtype = getattr(self, "kvdtype", kvdtype if kvdtype is not None else self.attn_dtype)
         self.attn_softmax_dtype = getattr(self, "attn_softmax_dtype", attn_softmax_dtype)
+        self.mla_attn_dtype = getattr(
+            self,
+            "mla_attn_dtype",
+            mla_attn_dtype if mla_attn_dtype is not None else self.attn_dtype,
+        )
+        self.mla_attn_softmax_dtype = getattr(
+            self,
+            "mla_attn_softmax_dtype",
+            mla_attn_softmax_dtype if mla_attn_softmax_dtype is not None else self.attn_softmax_dtype,
+        )
+        self._coerce_runtime_dtype_fields()
         self.fcm_max_ratio = getattr(self, "fcm_max_ratio", fcm_max_ratio)
         self.fcm_min_ratio = getattr(self, "fcm_min_ratio", fcm_min_ratio)
         self.hardware_abstraction = getattr(self, "hardware_abstraction", hardware_abstraction)
@@ -995,8 +1052,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             if known_product > 1:
                 normalized_axis_dims = tuple(-1 if dim == -1 else 1 for dim in axis_dims)
                 logger.warning(
-                    "Single-device runtime detected with multi-device sharding axis_dims=%s; "
-                    "normalizing to %s.",
+                    "Single-device runtime detected with multi-device sharding axis_dims=%s; normalizing to %s.",
                     axis_dims,
                     normalized_axis_dims,
                 )
@@ -1205,32 +1261,47 @@ class EasyDeLBaseConfig(PretrainedConfig):
             axis_types=(jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto),
         )
 
+    def _propagate_mesh_to_sub_configs(
+        self,
+        mesh: common_types.Mesh,
+        attr_name_on_self: str,
+        setter_method_name: str,
+    ):
+        """Propagate a mesh to all sub-configurations.
+
+        Args:
+            mesh: JAX device mesh to propagate.
+            attr_name_on_self: The hidden attribute name to set (e.g. '_hidden_mesh').
+            setter_method_name: The setter method name on sub-configs (e.g. 'set_model_mesh').
+        """
+        setattr(self, attr_name_on_self, mesh)
+
+        sub_configs = getattr(self, "sub_configs", None)
+        if not isinstance(sub_configs, dict):
+            return
+
+        for cfg_key in sub_configs.keys():
+            sub_cfg = getattr(self, cfg_key, None)
+            if sub_cfg is None:
+                continue
+            try:
+                if hasattr(sub_cfg, setter_method_name):
+                    getattr(sub_cfg, setter_method_name)(mesh)
+                else:
+                    setattr(sub_cfg, attr_name_on_self, mesh)
+            except (AttributeError, TypeError):
+                try:
+                    setattr(sub_cfg, attr_name_on_self, mesh)
+                except (AttributeError, TypeError):
+                    pass
+
     def set_model_mesh(self, mesh: common_types.Mesh):
         """Sets a custom mesh for the model, overriding the auto-generated one.
 
         Args:
             mesh: JAX device mesh to use for this model.
         """
-        self._hidden_mesh = mesh
-
-        sub_configs = getattr(self, "sub_configs", None)
-        if not isinstance(sub_configs, dict):
-            return
-
-        for attr_name in sub_configs.keys():
-            sub_cfg = getattr(self, attr_name, None)
-            if sub_cfg is None:
-                continue
-            try:
-                if hasattr(sub_cfg, "set_model_mesh"):
-                    sub_cfg.set_model_mesh(mesh)
-                else:
-                    sub_cfg._hidden_mesh = mesh
-            except Exception:
-                try:
-                    sub_cfg._hidden_mesh = mesh
-                except Exception:
-                    pass
+        self._propagate_mesh_to_sub_configs(mesh, "_hidden_mesh", "set_model_mesh")
 
     def set_explicit_mesh(self, mesh: common_types.Mesh):
         """Sets a custom explicit-axis mesh for the model.
@@ -1238,26 +1309,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         Args:
             mesh: JAX device mesh to use for this model.
         """
-        self._hidden_explicit_mesh = mesh
-
-        sub_configs = getattr(self, "sub_configs", None)
-        if not isinstance(sub_configs, dict):
-            return
-
-        for attr_name in sub_configs.keys():
-            sub_cfg = getattr(self, attr_name, None)
-            if sub_cfg is None:
-                continue
-            try:
-                if hasattr(sub_cfg, "set_explicit_mesh"):
-                    sub_cfg.set_explicit_mesh(mesh)
-                else:
-                    sub_cfg._hidden_explicit_mesh = mesh
-            except Exception:
-                try:
-                    sub_cfg._hidden_explicit_mesh = mesh
-                except Exception:
-                    pass
+        self._propagate_mesh_to_sub_configs(mesh, "_hidden_explicit_mesh", "set_explicit_mesh")
 
     def set_manual_mesh(self, mesh: common_types.Mesh):
         """Sets a custom manual-axis mesh for the model.
@@ -1265,26 +1317,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         Args:
             mesh: JAX device mesh to use for this model.
         """
-        self._hidden_manual_mesh = mesh
-
-        sub_configs = getattr(self, "sub_configs", None)
-        if not isinstance(sub_configs, dict):
-            return
-
-        for attr_name in sub_configs.keys():
-            sub_cfg = getattr(self, attr_name, None)
-            if sub_cfg is None:
-                continue
-            try:
-                if hasattr(sub_cfg, "set_manual_mesh"):
-                    sub_cfg.set_manual_mesh(mesh)
-                else:
-                    sub_cfg._hidden_manual_mesh = mesh
-            except Exception:
-                try:
-                    sub_cfg._hidden_manual_mesh = mesh
-                except Exception:
-                    pass
+        self._propagate_mesh_to_sub_configs(mesh, "_hidden_manual_mesh", "set_manual_mesh")
 
     def jax_mesh(self):
         """Deprecated method for getting the JAX mesh.
@@ -1406,6 +1439,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "sharding_axis_names",
             "attn_mechanism",
             "decode_attn_mechanism",
+            "mla_attn_mechanism",
+            "mla_attn_dtype",
+            "mla_attn_softmax_dtype",
             "blocksize_k",
             "blocksize_q",
             "blocksize_b",
@@ -1427,6 +1463,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "gradient_checkpointing",
             "gradient_checkpointing_targets",
             "precompute_masks",
+            "lmhead_chunksize",
             "kv_cache_quantization_config",
             "quantization_config",
             "use_qmm_best_config",
@@ -1451,6 +1488,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         for key in base_reads:
             if hasattr(config, key):
                 setattr(self, key, getattr(config, key))
+        self._coerce_runtime_dtype_fields()
 
     def add_basic_configurations(
         self,
@@ -1459,6 +1497,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         sharding_axis_names: collections.abc.Sequence[str] = NOT_GIVEN,
         attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = NOT_GIVEN,
         decode_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = NOT_GIVEN,
+        mla_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = NOT_GIVEN,
+        mla_attn_dtype: jnp.dtype | str | None = NOT_GIVEN,
+        mla_attn_softmax_dtype: jnp.dtype | str | None = NOT_GIVEN,
         blocksize_k: int = NOT_GIVEN,
         blocksize_q: int = NOT_GIVEN,
         blocksize_b: int = NOT_GIVEN,
@@ -1519,6 +1560,12 @@ class EasyDeLBaseConfig(PretrainedConfig):
             sharding_axis_names: Mesh axis labels, default ``("dp", "fsdp", "ep", "tp", "sp")``.
             attn_mechanism: Attention mechanism to use (default ``"vanilla"``).
             decode_attn_mechanism: Optional decode-time attention mechanism.
+            mla_attn_mechanism: MLA-layer-specific attention mechanism override
+                (default ``"auto"``).
+            mla_attn_dtype: Optional MLA-specific attention activation dtype
+                (defaults to ``attn_dtype``).
+            mla_attn_softmax_dtype: Optional MLA-specific softmax dtype
+                (defaults to ``attn_softmax_dtype``).
             blocksize_k: Attention key block size, default ``512`` when unset.
             blocksize_q: Attention query block size, default ``512`` when unset.
             blocksize_b: Batch/block size used by attention kernels (default ``1``).
@@ -1580,11 +1627,12 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "platform", "jax", platform)
         set_attrs_smartly(self, "use_sharded_kv_caching", False, use_sharded_kv_caching)
         set_attrs_smartly(self, "attn_mechanism", "vanilla", attn_mechanism)
+        set_attrs_smartly(self, "mla_attn_mechanism", "auto", mla_attn_mechanism)
         set_attrs_smartly(self, "decode_attn_mechanism", None, decode_attn_mechanism)
 
         set_attrs_smartly(self, "easy_method", EasyMethod.TRAIN, easy_method)
         set_attrs_smartly(self, "bits", None, bits)
-        set_attrs_smartly(self, "scan_attention_layers", True, scan_attention_layers)
+        set_attrs_smartly(self, "scan_attention_layers", False, scan_attention_layers)
         set_attrs_smartly(self, "scan_ring_attention", True, scan_ring_attention)
         set_attrs_smartly(self, "use_scan_mlp", False, use_scan_mlp)
         set_attrs_smartly(self, "scan_mlp_chunk_size", 1024, scan_mlp_chunk_size)
@@ -1599,9 +1647,12 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "qmm_platform_override", None, qmm_platform_override)
         set_attrs_smartly(self, "qmm_tpu_path_override", None, qmm_tpu_path_override)
         set_attrs_smartly(self, "flash_attention_backward_pass_impl", "triton", flash_attention_backward_pass_impl)
-        set_attrs_smartly(self, "attn_dtype", jnp.float32, attn_dtype)
+        set_attrs_smartly(self, "attn_dtype", jnp.bfloat16, attn_dtype)
         set_attrs_smartly(self, "kvdtype", jnp.bfloat16, kvdtype if kvdtype is not None else self.attn_dtype)
         set_attrs_smartly(self, "attn_softmax_dtype", jnp.float32, attn_softmax_dtype)
+        set_attrs_smartly(self, "mla_attn_dtype", self.attn_dtype, mla_attn_dtype)
+        set_attrs_smartly(self, "mla_attn_softmax_dtype", self.attn_softmax_dtype, mla_attn_softmax_dtype)
+        self._coerce_runtime_dtype_fields()
         set_attrs_smartly(self, "hardware_abstraction", DEFAULT_HARDWARE_ABSTRACTION, hardware_abstraction)
         set_attrs_smartly(self, "pallas_m_block_size", DEFAULT_PALLAS_M_BLOCK_SIZE, pallas_m_block_size)
         set_attrs_smartly(self, "pallas_k_block_size", DEFAULT_PALLAS_K_BLOCK_SIZE, pallas_k_block_size)
@@ -1632,6 +1683,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         "sharding_axis_names",
         "attn_mechanism",
         "decode_attn_mechanism",
+        "mla_attn_mechanism",
+        "mla_attn_dtype",
+        "mla_attn_softmax_dtype",
         "blocksize_k",
         "blocksize_q",
         "blocksize_b",
@@ -1829,6 +1883,123 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.dict_dtype_to_str(serializable_config_dict)
 
         return serializable_config_dict
+
+    @staticmethod
+    def _is_dtype_like(value: tp.Any) -> bool:
+        """Return True for JAX/NumPy dtype objects and scalar type classes."""
+        if isinstance(value, np.dtype):
+            return True
+        value_module = getattr(value.__class__, "__module__", "")
+        if value_module.startswith("torch") and value.__class__.__name__ == "dtype":
+            return True
+        if isinstance(value, type):
+            module = getattr(value, "__module__", "")
+            return (
+                module.startswith("numpy")
+                or module.startswith("ml_dtypes")
+                or module.startswith("jax.")
+                or module.startswith("torch")
+            )
+        return False
+
+    @staticmethod
+    def _is_torch_dtype_instance(value: tp.Any) -> bool:
+        """Return True for concrete ``torch.dtype`` objects without importing torch eagerly."""
+        value_module = getattr(value.__class__, "__module__", "")
+        return value_module.startswith("torch") and value.__class__.__name__ == "dtype"
+
+    @staticmethod
+    def _dtype_name(value: tp.Any) -> str:
+        """Convert framework-specific dtype objects into a stable string name."""
+        try:
+            return np.dtype(value).name
+        except TypeError:
+            pass
+        text = str(value).strip()
+        if text.startswith("torch."):
+            text = text.removeprefix("torch.")
+        return text
+
+    @classmethod
+    def _coerce_dtype_spec(cls, value: tp.Any) -> tp.Any:
+        """Convert persisted dtype strings back into runtime dtype objects."""
+        if value is None:
+            return None
+        if cls._is_torch_dtype_instance(value):
+            # HF configs expose `torch_dtype` through the `dtype` property. Preserve
+            # concrete torch dtypes so downstream HF model init keeps working.
+            return value
+        if cls._is_dtype_like(value):
+            return jnp.dtype(cls._dtype_name(value))
+        if isinstance(value, str):
+            aliases = {
+                "bf16": "bfloat16",
+                "fp16": "float16",
+                "f16": "float16",
+                "fp32": "float32",
+                "f32": "float32",
+                "fp64": "float64",
+                "f64": "float64",
+                "nvfp8": "float8_e4m3",
+                "mxfp8": "float8_e5m2",
+                "fp8": "float8_e5m2",
+                "float8": "float8_e5m2",
+                "fp8_e4m3": "float8_e4m3",
+                "fp8_e4m3fn": "float8_e4m3fn",
+                "fp8_e4m3fnuz": "float8_e4m3fnuz",
+                "fp8_e4m3b11fnuz": "float8_e4m3b11fnuz",
+                "fp8_e3m4": "float8_e3m4",
+                "fp8_e8m0fnu": "float8_e8m0fnu",
+                "mxfp4": "float4_e2m1fn",
+                "fp4": "float4_e2m1fn",
+                "float4": "float4_e2m1fn",
+            }
+            normalized = value.strip().lower()
+            if normalized.startswith("torch."):
+                normalized = normalized.removeprefix("torch.")
+            normalized = aliases.get(normalized, normalized)
+            try:
+                return jnp.dtype(normalized)
+            except TypeError:
+                return value
+        return value
+
+    def _coerce_runtime_dtype_fields(self) -> None:
+        """Rehydrate known dtype config fields after loading from serialized JSON."""
+        for field_name in (
+            "dtype",
+            "attn_dtype",
+            "kvdtype",
+            "attn_softmax_dtype",
+            "mla_attn_dtype",
+            "mla_attn_softmax_dtype",
+        ):
+            if hasattr(self, field_name):
+                setattr(self, field_name, self._coerce_dtype_spec(getattr(self, field_name)))
+
+    @classmethod
+    def _normalize_json_value(cls, value: tp.Any) -> tp.Any:
+        """Recursively normalize dtype-like values into JSON-safe primitives."""
+        if isinstance(value, dict):
+            return {k: cls._normalize_json_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [cls._normalize_json_value(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(cls._normalize_json_value(v) for v in value)
+        if isinstance(value, (set, frozenset)):
+            return [cls._normalize_json_value(v) for v in value]
+        if hasattr(value, "to_dict") and callable(value.to_dict):
+            return cls._normalize_json_value(value.to_dict())
+        if isinstance(value, np.generic):
+            return value.item()
+        if cls._is_dtype_like(value):
+            return cls._dtype_name(value)
+        return value
+
+    def dict_dtype_to_str(self, d: dict[str, Any]) -> None:
+        """Normalize dtype-like values anywhere in the config tree."""
+        for key, value in list(d.items()):
+            d[key] = self._normalize_json_value(value)
 
     def to_dict(self) -> dict[str, tp.Any]:
         """Serialize config to a dictionary while temporarily hiding forbidden types.
@@ -2129,6 +2300,13 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """
         ePath(json_file_path).write_text(self.to_json_string(use_diff=use_diff))
 
+    def to_json_string(self, use_diff: bool = True) -> str:
+        """Serialize the config to JSON with a dtype-aware fallback."""
+        config_dict = self.to_diff_dict() if use_diff else self.to_dict()
+        config_dict = self._encode_special_floats(config_dict)
+        config_dict = self._normalize_json_value(config_dict)
+        return json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
+
     @classmethod
     def _dict_from_json_file(cls, json_file: str | os.PathLike | ePathLike):
         """Load a configuration dictionary from a JSON file.
@@ -2298,8 +2476,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 Falls back to `max_position_embeddings` if `freq_max_position_embeddings`
                 is not set.
         """
-        result = getattr(self, "freq_max_position_embeddings", self.max_position_embeddings)
-        assert result is not None, "max_position_embeddings must be set"
+        result = getattr(self, "freq_max_position_embeddings", getattr(self, "max_position_embeddings", None))
+        if result is None:
+            raise ValueError("`max_position_embeddings` must be set before requesting rope cache bounds.")
         return result
 
     @property
@@ -2315,8 +2494,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 Falls back to `max_position_embeddings` if `mask_max_position_embeddings`
                 is not set.
         """
-        result = getattr(self, "mask_max_position_embeddings", self.max_position_embeddings)
-        assert result is not None, "max_position_embeddings must be set"
+        result = getattr(self, "mask_max_position_embeddings", getattr(self, "max_position_embeddings", None))
+        if result is None:
+            raise ValueError("`max_position_embeddings` must be set before requesting mask cache bounds.")
         return result
 
     def _get_rope_config(self) -> RopeConfig:
@@ -2659,6 +2839,18 @@ class EasyDeLBaseConfig(PretrainedConfig):
             fcm_mask = None
         return fcm_mask
 
+    def get_kv_shared_layer_mapping(self) -> dict[int, int]:
+        """Return a mapping from KV-shared layer indices to their donor indices.
+
+        Layers beyond the ``num_kv_shared_layers`` threshold reuse K/V from
+        the last non-shared layer of the same attention type (sliding or full).
+
+        Returns:
+            Dict mapping ``shared_layer_idx -> donor_layer_idx``.  Empty when
+            ``num_kv_shared_layers`` is 0 or ``layer_types`` is not set.
+        """
+        return {}
+
     @staticmethod
     def _fix_parent_kws(kw1, kw2):
         """Merge two keyword argument dictionaries, with kw1 taking precedence.
@@ -2743,6 +2935,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """
         if self.partition_axis is None:
             self.partition_axis = PartitionAxis()
+        elif isinstance(self.partition_axis, dict):
+            self.partition_axis = PartitionAxis(**self.partition_axis)
         return PartitionManager(self.partition_axis)
 
     __hash__ = hash_fn

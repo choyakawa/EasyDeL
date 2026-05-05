@@ -335,17 +335,8 @@ class Olmo3DecoderLayer(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        attn_block = Olmo3Attention
-        mlp_block = Olmo3MLP
 
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.self_attn = attn_block(
+        self.self_attn = Olmo3Attention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -353,7 +344,7 @@ class Olmo3DecoderLayer(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.mlp = mlp_block(
+        self.mlp = Olmo3MLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -522,9 +513,15 @@ class Olmo3Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = auto_remat(
+            Olmo3DecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Olmo3DecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=i,
                     dtype=dtype,
@@ -830,7 +827,7 @@ class Olmo3ForCausalLM(BaseCausalLMModule[Olmo3Model, Olmo3Config]):
 
         lm_logits = None
         if apply_lm_head:
-            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
+            lm_logits = self.compute_lm_logits(hidden_states)
 
         return CausalLMOutput(
             logits=lm_logits,

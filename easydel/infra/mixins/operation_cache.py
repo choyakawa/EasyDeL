@@ -38,7 +38,6 @@ Example:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 from easydel.operations import OperationRegistry
 from easydel.operations.requirements import (
@@ -47,9 +46,6 @@ from easydel.operations.requirements import (
     MetadataField,
     OperationRequirements,
 )
-
-if TYPE_CHECKING:
-    pass
 
 __all__ = [
     "LayerOperationInfo",
@@ -1051,6 +1047,7 @@ class OperationCacheMixin:
             return result
 
         from easydel.caching import (
+            MLARaggedPagesCacheView,
             ParallelHybridCacheView,
             RaggedPagesCacheView,
             RecurrentCacheView,
@@ -1061,6 +1058,7 @@ class OperationCacheMixin:
         _parallel_hybrid_combos = [
             {TransformerCacheView, RecurrentCacheView},
             {RaggedPagesCacheView, RecurrentCacheView},
+            {MLARaggedPagesCacheView, RecurrentCacheView},
             {UnifiedAttentionCacheView, RecurrentCacheView},
         ]
 

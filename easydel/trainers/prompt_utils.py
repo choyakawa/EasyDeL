@@ -27,6 +27,7 @@ Key functionality:
 """
 
 import copy
+import json
 import typing as tp
 from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
@@ -54,6 +55,121 @@ OutputType = OutputDict | OutputListDict | None
 OpenAIMessageList = list[OpenAIMessage]
 TListOrMapping = tp.TypeVar("TListOrMapping", list, Mapping)
 DatasetLike = Dataset | DatasetDict
+
+_CHATML_ROLE_MAPPING = {
+    "human": "user",
+    "gpt": "assistant",
+    "system": "system",
+    "user": "user",
+    "assistant": "assistant",
+}
+
+
+def _maybe_json_load(value: str) -> tp.Any:
+    stripped = value.strip()
+    if not stripped or stripped[0] not in {"{", "["}:
+        return value
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return value
+
+
+def normalize_message_payload(
+    payload: tp.Any,
+    *,
+    allow_plain_text: bool = False,
+) -> list[dict[str, tp.Any]] | None:
+    """Normalize chat payloads into ``[{role, content, ...}, ...]`` form."""
+
+    def _normalize_single(item: tp.Any) -> list[dict[str, tp.Any]] | None:
+        if isinstance(item, str):
+            parsed = _maybe_json_load(item)
+            if parsed is not item:
+                return normalize_message_payload(parsed, allow_plain_text=allow_plain_text)
+            if allow_plain_text:
+                return [{"role": "user", "content": item}]
+            return None
+
+        if isinstance(item, dict):
+            if "from" in item and "value" in item:
+                normalized = dict(item)
+                normalized["role"] = _CHATML_ROLE_MAPPING.get(item.get("from", "user"), item.get("from", "user"))
+                normalized["content"] = item.get("value", "")
+                normalized.pop("from", None)
+                normalized.pop("value", None)
+                return [normalized]
+
+            if "role" in item:
+                normalized = dict(item)
+                normalized.setdefault("content", "")
+                return [normalized]
+
+            if "content" in item and allow_plain_text:
+                normalized = dict(item)
+                normalized.setdefault("role", "user")
+                return [normalized]
+            return None
+
+        if isinstance(item, list):
+            return normalize_message_payload(item, allow_plain_text=allow_plain_text)
+
+        return None
+
+    if payload is None:
+        return None
+
+    if isinstance(payload, list):
+        normalized: list[dict[str, tp.Any]] = []
+        for item in payload:
+            turns = _normalize_single(item)
+            if turns is None:
+                return None
+            normalized.extend(turns)
+        return normalized
+
+    return _normalize_single(payload)
+
+
+def normalize_tool_payload(payload: tp.Any) -> tp.Any:
+    """Normalize stringified JSON tool payloads into dict/list form."""
+    if isinstance(payload, str):
+        parsed = _maybe_json_load(payload)
+        if parsed is not payload:
+            return normalize_tool_payload(parsed)
+        return payload
+
+    if isinstance(payload, list):
+        normalized: list[tp.Any] = []
+        for item in payload:
+            parsed = normalize_tool_payload(item)
+            if isinstance(parsed, list):
+                normalized.extend(parsed)
+            else:
+                normalized.append(parsed)
+        return normalized
+
+    if isinstance(payload, tuple):
+        return normalize_tool_payload(list(payload))
+
+    if isinstance(payload, dict):
+        return dict(payload)
+
+    return payload
+
+
+def resolve_example_tools(
+    example: dict[str, tp.Any],
+    fallback_tools: list | None = None,
+) -> list | None:
+    """Return per-example tool schemas when available, otherwise ``fallback_tools``."""
+
+    example_tools = normalize_tool_payload(example.get("tools"))
+    if isinstance(example_tools, dict):
+        example_tools = [example_tools]
+    if example_tools is not None and example.get("tools") is not example_tools:
+        example["tools"] = example_tools
+    return example_tools if example_tools is not None else fallback_tools
 
 
 def _is_valid_openai_message_list(data: tp.Any) -> bool:
@@ -329,26 +445,125 @@ def is_conversational(example: dict[str, tp.Any]) -> bool:
     Note:
         Used to determine whether to apply chat templates during processing.
     """
-    supported_keys = ["prompt", "chosen", "rejected", "completion", "messages"]
-    example_keys = {key for key in example.keys() if key in supported_keys}
-
-    if example_keys:
-        key = example_keys.pop()
-        maybe_messages = example[key]
-        if isinstance(maybe_messages, list):
-            maybe_message = maybe_messages[0]
-            if isinstance(maybe_message, dict) and "role" in maybe_message and "content" in maybe_message:
-                return True
+    for key in ["prompt", "chosen", "rejected", "completion", "messages", "conversations", "conversation"]:
+        maybe_messages = normalize_message_payload(example.get(key), allow_plain_text=(key == "messages"))
+        if maybe_messages:
+            return True
 
     return False
 
 
+def _normalize_chat_suffix(
+    value: list[dict[str, tp.Any]] | str,
+    field_name: str,
+) -> list[dict[str, tp.Any]]:
+    """Normalize a prompt or completion suffix value into a conversational message list.
+
+    This helper ensures that suffix values (which may come from dataset
+    columns or trainer configuration) are always represented as a list of
+    chat-style message dictionaries suitable for passing to a chat template.
+
+    If the value is already a list, it is returned unchanged (assumed to be
+    a well-formed list of ``{"role": ..., "content": ...}`` dicts).  If it
+    is a plain string, it is wrapped as a single assistant message:
+    ``[{"role": "assistant", "content": value}]``.
+
+    Args:
+        value: The suffix to normalize. Either a string (interpreted as
+            assistant-role content) or a pre-formed list of message dicts.
+        field_name: Name of the field being normalized, used in the error
+            message when the type is unsupported.
+
+    Returns:
+        A list of message dictionaries representing the suffix.
+
+    Raises:
+        TypeError: If ``value`` is neither a string nor a list.
+    """
+    normalized = normalize_message_payload(value, allow_plain_text=False)
+    if normalized is not None:
+        return normalized
+    if isinstance(value, str):
+        return [{"role": "assistant", "content": value}]
+    raise TypeError(f"`{field_name}` must be a string or a list of chat messages, received {type(value)}.")
+
+
+def render_prompt_with_suffix(
+    prompt_messages: list[dict[str, str]],
+    suffix: list[dict[str, str]] | str,
+    tokenizer: ProcessingClassType,
+    *,
+    field_name: str,
+    tools: list[dict | tp.Callable] | None = None,
+    **template_kwargs,
+) -> tuple[str, str, str]:
+    """Render a conversational prompt using a chat template and derive the rendered suffix.
+
+    The function first renders the prompt messages alone (with
+    ``add_generation_prompt=True``) to obtain the prompt text.  It then
+    renders the full conversation (prompt messages + normalized suffix
+    messages) to obtain the complete text.  The suffix text is computed as
+    the difference between the full rendering and the prompt-only
+    rendering, i.e. ``full_text[len(prompt_text):]``.
+
+    This two-step approach ensures that the suffix text is exactly what the
+    chat template would produce for the suffix portion, including any
+    special tokens or formatting that the template inserts between turns.
+
+    Args:
+        prompt_messages: List of message dicts forming the prompt portion of
+            the conversation (e.g. ``[{"role": "user", "content": "..."}]``).
+        suffix: The suffix to append after the prompt. Can be a plain
+            string (treated as assistant content) or a list of message
+            dicts. Normalized via ``_normalize_chat_suffix``.
+        tokenizer: Tokenizer or processor with an ``apply_chat_template``
+            method.
+        field_name: Identifier for the field being rendered, used in error
+            messages and passed through to ``_normalize_chat_suffix``.
+        tools: Optional list of tool/function schemas to pass to the chat
+            template (for function-calling models).
+        **template_kwargs: Additional keyword arguments forwarded to
+            ``tokenizer.apply_chat_template``.
+
+    Returns:
+        A 3-tuple of ``(prompt_text, suffix_text, full_text)`` where:
+            - ``prompt_text`` is the rendered prompt with generation prompt.
+            - ``suffix_text`` is the rendered suffix (completion) portion.
+            - ``full_text`` is the complete rendered conversation.
+
+    Raises:
+        ValueError: If the full conversation rendering does not start with
+            the prompt-only rendering, which indicates an incompatible chat
+            template.
+    """
+    prompt_text = tokenizer.apply_chat_template(
+        prompt_messages,
+        tools=tools,
+        tokenize=False,
+        add_generation_prompt=True,
+        **template_kwargs,
+    )
+    full_conversation = tokenizer.apply_chat_template(
+        prompt_messages + _normalize_chat_suffix(suffix, field_name),
+        tools=tools,
+        tokenize=False,
+        **template_kwargs,
+    )
+    if not full_conversation.startswith(prompt_text):
+        raise ValueError(
+            "The chat template applied to the prompt + suffix does not start with the chat template "
+            f"applied to the prompt alone for `{field_name}`."
+            f"\n**Prompt**:\n{prompt_text}\n\n**Prompt + Suffix**:\n{full_conversation}"
+        )
+    return prompt_text, full_conversation[len(prompt_text) :], full_conversation
+
+
 def apply_chat_template(
-    example: dict[str, list[dict[str, str]]],
+    example: dict[str, tp.Any],
     tokenizer: ProcessingClassType,
     tools: list[dict | tp.Callable] | None = None,
     **template_kwargs,
-) -> dict[str, str]:
+) -> dict[str, tp.Any]:
     """Apply chat template to conversational examples.
 
     Formats conversation data using the tokenizer's chat template,
@@ -361,7 +576,8 @@ def apply_chat_template(
         tools: Optional list of tool/function schemas for function calling.
 
     Returns:
-        dict: Formatted example with chat template applied to text fields.
+        dict: Formatted example with chat template applied to text fields
+            while preserving unrelated payload columns.
 
     Raises:
         ValueError: If example format is not supported.
@@ -370,6 +586,9 @@ def apply_chat_template(
         Handles both single and multi-turn conversations.
         Preserves original structure while applying templates.
     """
+    example = maybe_convert_to_chatml(dict(example))
+    tools = resolve_example_tools(example, tools)
+
     supported_keys = ["prompt", "chosen", "rejected", "completion", "messages", "label"]
     example_keys = {key for key in example.keys() if key in supported_keys}
     if example_keys not in [
@@ -388,9 +607,6 @@ def apply_chat_template(
     chosen: str = ""
     rejected: str = ""
     completion: str = ""
-    prompt_chosen: str = ""
-    prompt_rejected: str = ""
-    prompt_completion: str = ""
 
     if "messages" in example:
         messages = tokenizer.apply_chat_template(
@@ -400,69 +616,84 @@ def apply_chat_template(
             **template_kwargs,
         )
 
-    if "prompt" in example:
+    prompt_value = example.get("prompt")
+    if isinstance(prompt_value, list):
         prompt = tokenizer.apply_chat_template(
-            example["prompt"],
+            prompt_value,
             tools=tools,
             tokenize=False,
             add_generation_prompt=True,
             **template_kwargs,
         )
-    if "prompt" in example:
         if "chosen" in example:
-            prompt_chosen = tokenizer.apply_chat_template(
-                example["prompt"] + example["chosen"],
-                tools=tools,
-                tokenize=False,
-                **template_kwargs,
-            )
-            chosen = prompt_chosen[len(prompt) :]
-        if "rejected" in example and "prompt" in example:
-            prompt_rejected = tokenizer.apply_chat_template(
-                example["prompt"] + example["rejected"],
-                tools=tools,
-                tokenize=False,
-                **template_kwargs,
-            )
-            rejected = prompt_rejected[len(prompt) :]
-        if "completion" in example:
-            prompt_completion = tokenizer.apply_chat_template(
-                example["prompt"] + example["completion"],
-                tools=tools,
-                tokenize=False,
-                **template_kwargs,
-            )
-            completion = prompt_completion[len(prompt) :]
-    else:
-        if "chosen" in example:
-            chosen = tokenizer.apply_chat_template(
+            prompt, chosen, _prompt_chosen = render_prompt_with_suffix(
+                prompt_value,
                 example["chosen"],
+                tokenizer,
+                field_name="chosen",
                 tools=tools,
-                tokenize=False,
                 **template_kwargs,
             )
         if "rejected" in example:
-            rejected = tokenizer.apply_chat_template(
+            prompt, rejected, _prompt_rejected = render_prompt_with_suffix(
+                prompt_value,
                 example["rejected"],
+                tokenizer,
+                field_name="rejected",
                 tools=tools,
-                tokenize=False,
                 **template_kwargs,
             )
+        if "completion" in example:
+            prompt, completion, _prompt_completion = render_prompt_with_suffix(
+                prompt_value,
+                example["completion"],
+                tokenizer,
+                field_name="completion",
+                tools=tools,
+                **template_kwargs,
+            )
+    elif "prompt" in example:
+        prompt = example["prompt"]
+        if any(isinstance(example.get(key), list) for key in ("chosen", "rejected", "completion")):
+            raise ValueError(
+                "Conversational chosen/rejected/completion values require `prompt` to be a conversational "
+                "message list so the full conversation can be rendered safely."
+            )
+        if "chosen" in example:
+            chosen = example["chosen"]
+        if "rejected" in example:
+            rejected = example["rejected"]
+        if "completion" in example:
+            completion = example["completion"]
+    else:
+        if "chosen" in example:
+            chosen = (
+                tokenizer.apply_chat_template(
+                    example["chosen"],
+                    tools=tools,
+                    tokenize=False,
+                    **template_kwargs,
+                )
+                if isinstance(example["chosen"], list)
+                else example["chosen"]
+            )
+        if "rejected" in example:
+            rejected = (
+                tokenizer.apply_chat_template(
+                    example["rejected"],
+                    tools=tools,
+                    tokenize=False,
+                    **template_kwargs,
+                )
+                if isinstance(example["rejected"], list)
+                else example["rejected"]
+            )
 
-    if "prompt" in example:
-        error_message = (
-            "The chat template applied to the prompt + completion does not start with the chat template applied to "
-            "the prompt alone."
-            "\n**Prompt**:\n{}\n\n**Prompt + Completion**:\n{}"
-        )
-        if "chosen" in example and not prompt_chosen.startswith(prompt):
-            raise ValueError(error_message.format(prompt, prompt_chosen))
-        if "rejected" in example and not prompt_rejected.startswith(prompt):
-            raise ValueError(error_message.format(prompt, prompt_rejected))
-        if "completion" in example and not prompt_completion.startswith(prompt):
-            raise ValueError(error_message.format(prompt, prompt_completion))
-
-    output = {}
+    output = {
+        key: value
+        for key, value in example.items()
+        if key not in {"messages", "prompt", "chosen", "rejected", "completion"}
+    }
     if "messages" in example:
         output["text"] = messages
     if "prompt" in example:
@@ -480,10 +711,10 @@ def apply_chat_template(
 
 
 def maybe_apply_chat_template(
-    example: dict[str, list[dict[str, str]]],
+    example: dict[str, tp.Any],
     tokenizer: ProcessingClassType,
     tools: list[dict | tp.Callable] | None = None,
-) -> dict[str, str]:
+) -> dict[str, tp.Any]:
     """Conditionally apply chat template to conversational examples.
 
     Checks if the example is in conversational format and applies the
@@ -537,23 +768,23 @@ def maybe_convert_to_chatml(example: dict[str, list]) -> dict[str, list]:
                   {'role': 'assistant', 'content': 'It is blue.'}]}
     ```
     """
-    for key in ["prompt", "completion", "chosen", "rejected", "messages", "conversations", "conversation"]:
-        if key in example and isinstance(example[key], list):
-            messages = example[key]
-            for message in messages:
-                if isinstance(message, dict):
-                    if "from" in message:
-                        message["role"] = message.pop("from")
-                    if "value" in message:
-                        message["content"] = message.pop("value")
+    result = dict(example)
 
-    if "conversations" in example:
-        example["messages"] = example.pop("conversations")
+    if "conversations" in result:
+        result["messages"] = result.pop("conversations")
 
-    if "conversation" in example:
-        example["messages"] = example.pop("conversation")
+    if "conversation" in result:
+        result["messages"] = result.pop("conversation")
 
-    return example
+    for key in ["prompt", "completion", "chosen", "rejected", "messages"]:
+        if key not in result:
+            continue
+        normalized = normalize_message_payload(result[key], allow_plain_text=(key == "messages"))
+        if normalized is not None:
+            result[key] = normalized
+
+    resolve_example_tools(result)
+    return result
 
 
 def remove_none_values(example: TListOrMapping) -> TListOrMapping:
@@ -928,7 +1159,8 @@ class _SegmentTree:
         self.tree = [0] * (2 * self.tree_size)
 
     def add(self, val):
-        assert 0 < val <= self.maxval
+        if not (0 < val <= self.maxval):
+            raise ValueError(f"val must satisfy 0 < val <= {self.maxval}, got {val}")
         i = self.tree_size + val - 1
         self.tree[i] = val
         while i > 1:
@@ -938,7 +1170,8 @@ class _SegmentTree:
             self.tree[i] = left if left >= right else right
 
     def remove(self, val):
-        assert 0 < val <= self.maxval
+        if not (0 < val <= self.maxval):
+            raise ValueError(f"val must satisfy 0 < val <= {self.maxval}, got {val}")
         i = self.tree_size + val - 1
         self.tree[i] = 0
         while i > 1:
@@ -948,7 +1181,8 @@ class _SegmentTree:
             self.tree[i] = left if left >= right else right
 
     def search(self, val):
-        assert 0 < val <= self.maxval
+        if not (0 < val <= self.maxval):
+            raise ValueError(f"val must satisfy 0 < val <= {self.maxval}, got {val}")
         i = 1
         while i < self.tree_size:
             if self.tree[i << 1] >= val:
@@ -971,7 +1205,8 @@ def _pack_bfd(examples: pa.Table, seq_length: int) -> pa.Table:
     examples = pa.Table.from_arrays(columns, names=examples.column_names)
 
     ids = np.arange(len(examples))
-    assert list_column_idx is not None
+    if list_column_idx is None:
+        raise ValueError("No list-type column found in the table; cannot determine sequence lengths for packing")
     lengths = pc.list_value_length(examples[list_column_idx]).combine_chunks()
     examples = examples.append_column("seq_lengths", lengths)
     lengths = pc.make_struct(lengths, ids)
@@ -1005,11 +1240,12 @@ def _pack_bfd(examples: pa.Table, seq_length: int) -> pa.Table:
     offsets = np.array([0] + [bin["length"] for bin in bins])  # noqa
     offsets = np.cumsum(offsets)
 
-    assert all(column.num_chunks == 1 for column in examples.columns)
+    if not all(column.num_chunks == 1 for column in examples.columns):
+        raise RuntimeError("Expected all columns to have exactly 1 chunk after pc.take, but found multi-chunk columns")
 
     lengths = examples["seq_lengths"].chunks[0]
     examples = examples.drop_columns("seq_lengths")
-    lengths = pa.ListArray.from_arrays(np.cumsum([0] + [len(bin["ids"]) for bin in bins], dtype=np.int32), lengths)  # noqa
+    lengths = pa.ListArray.from_arrays(np.cumsum([0] + [len(bie["ids"]) for bie in bins], dtype=np.int32), lengths)
 
     columns = []
     for column in examples.columns:

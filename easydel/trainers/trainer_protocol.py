@@ -608,7 +608,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         self,
         state: EasyDeLState,
         save_directory: str | None = None,
-        gather_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None = None,
         to_torch: bool = False,
         easystate_to_huggingface_model_kwargs: dict | None = None,
         torch_save_pretrained_kwargs: dict | None = None,
@@ -733,8 +732,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         self,
         state: EasyDeLState,
         exception: Exception,
-        shard_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
-        gather_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
     ):
         """
         Handle training interruption gracefully.
@@ -742,8 +739,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         Args:
             state: Current model state at interruption.
             exception: The exception that caused interruption.
-            shard_fns: Functions for sharding data.
-            gather_fns: Functions for gathering sharded data.
 
         Returns:
             TrainerOutput or similar containing saved state.
@@ -831,12 +826,25 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         """
 
     @abstractmethod
+    def log_watchers(self, state: EasyDeLState, step: int):
+        """Run registered LogWatcher instances and log their metrics.
+
+        Args:
+            state: Model state containing parameters.
+            step: Current training step.
+        """
+
+    @abstractmethod
     def log_metrics(
         self,
         metrics: dict[str, float],
         pbar: BaseProgressBar,
         step: int,
         mode: str = "train",
+        *,
+        update_progress: bool = True,
+        log_to_backends: bool = True,
+        force_report: bool = False,
     ) -> None:
         """
         Log metrics and update progress bar.
@@ -846,6 +854,9 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
             pbar: Progress bar instance to update.
             step: Current step number.
             mode: "train" or "eval" to prefix metrics.
+            update_progress: Whether to update the local progress bar.
+            log_to_backends: Whether to forward metrics to external trackers.
+            force_report: Whether to bypass ``report_steps`` gating.
 
         Note:
             - Updates progress bar every log_steps
@@ -859,9 +870,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         state: EasyDeLState,
         metrics_tracker: MetricsTracker,
         step_metrics: StepMetrics,
-        start_time: float,
-        shard_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
-        gather_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
     ):
         """
         Execute the core training loop.
@@ -874,9 +882,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
             state: Initial model state
             metrics_tracker: Tracker for accumulating metrics
             step_metrics: Calculator for per-step metrics
-            start_time: Training start timestamp
-            shard_fns: Functions for sharding data
-            gather_fns: Functions for gathering sharded data
 
         Returns:
             Tuple of final output and any exception encountered

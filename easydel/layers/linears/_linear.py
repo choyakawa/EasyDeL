@@ -1,5 +1,4 @@
 # Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
-# Copyright 2024 The Improved Version Contributors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -191,8 +190,8 @@ class ParallelLinear(nn.Module):
         else:
             scale_computed = scale
 
-        scale_is_one: bool = scale_computed != 1.0
-        if scale_is_one:
+        needs_scaling: bool = scale_computed != 1.0
+        if needs_scaling:
 
             def _scale_operator(x: Array) -> Array:
                 scaled: Array = x * scale_computed
@@ -409,7 +408,7 @@ class ParallelLinear(nn.Module):
             >>> config = QuantizationConfig(dtype=QuantizationType.INT8)
             >>> quantized_layer = layer.to_quantized(config)
         """
-        firend = self._quantized_firend
+        firend = self._quantized_friend
         lazy_module = jax.eval_shape(
             lambda rngs: firend(
                 in_features=self.in_features,
@@ -433,7 +432,7 @@ class ParallelLinear(nn.Module):
         return lazy_module.restage(kernel=self.kernel, bias=self.bias)
 
     @property
-    def _quantized_firend(self) -> type[RowParallelLinearQuantized] | type[ColumnParallelLinearQuantized]:
+    def _quantized_friend(self) -> type[RowParallelLinearQuantized] | type[ColumnParallelLinearQuantized]:
         """Get the corresponding quantized layer class.
 
         Returns:
@@ -450,7 +449,7 @@ class ParallelLinear(nn.Module):
         elif self._direction == "column":
             return ColumnParallelLinearQuantized
         else:
-            raise ValueError("uknown direction, with no firend!")
+            raise ValueError("unknown direction, with no friend!")
 
 
 class RowParallelLinear(ParallelLinear):

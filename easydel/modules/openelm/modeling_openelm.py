@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import types
 import typing
 from functools import cached_property
 
@@ -44,6 +45,41 @@ from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule
 
 from .openelm_configuration import OpenELMConfig, make_divisible
+
+
+def _openelm_decoder_layer_block(config: OpenELMConfig) -> type["OpenELMDecoderLayer"]:
+    """Return the decoder-layer class to instantiate for this config.
+
+    OpenELM generation rebuilds a no-checkpoint graph for traced decoding. That
+    only works if the original decoder-layer class stays unmodified, so we wrap a
+    throwaway subclass when gradient checkpointing is enabled instead of mutating
+    ``OpenELMDecoderLayer`` in place.
+
+    Args:
+        config: OpenELM model configuration. Its ``gradient_checkpointing``
+            and ``gradient_checkpointing_targets`` fields control whether a
+            rematerialized subclass is created.
+
+    Returns:
+        Either the plain ``OpenELMDecoderLayer`` class (when checkpointing is
+        disabled) or a dynamically created ``auto_remat``-wrapped subclass.
+    """
+    policy = getattr(config, "gradient_checkpointing", None)
+    policy_value = getattr(policy, "value", policy)
+    if policy is None or str(policy_value).lower() in {"", "none"}:
+        return OpenELMDecoderLayer
+
+    remat_layer_block = types.new_class(
+        "OpenELMDecoderLayerRemat",
+        (OpenELMDecoderLayer,),
+    )
+    remat_layer_block.__module__ = OpenELMDecoderLayer.__module__
+    return auto_remat(
+        remat_layer_block,
+        policy=policy,
+        save_names=config.gradient_checkpointing_targets,
+        exclude_names=config.gradient_checkpointing_targets,
+    )
 
 
 class OpenELMMultiHeadCausalAttention(UnifiedAttention):
@@ -505,17 +541,8 @@ class OpenELMDecoderLayer(nn.Module):
         self.precision = precision
         self.rngs = rngs
         self.layer_idx = layer_idx
-        attn_block = OpenELMMultiHeadCausalAttention
-        mlp_block = OpenELMFeedForwardNetwork
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
 
-        self.attn = attn_block(
+        self.attn = OpenELMMultiHeadCausalAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -523,7 +550,7 @@ class OpenELMDecoderLayer(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.ffn = mlp_block(
+        self.ffn = OpenELMFeedForwardNetwork(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -668,9 +695,10 @@ class OpenELMModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = _openelm_decoder_layer_block(config)
         self.layers = nn.List(
             [
-                OpenELMDecoderLayer(
+                remat_layer_block(
                     config=config,
                     dtype=dtype,
                     param_dtype=param_dtype,

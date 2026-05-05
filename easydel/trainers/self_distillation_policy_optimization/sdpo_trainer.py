@@ -66,11 +66,6 @@ from ..training_utils import resolve_straight_through_emulator
 from ._fn import sdpo_step
 from .sdpo_config import SDPOConfig
 
-try:
-    import wandb  # type: ignore[import-untyped]
-except ImportError:
-    wandb = None
-
 if tp.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
@@ -180,7 +175,8 @@ class SDPOTrainer(GRPOTrainer):
         data_tokenize_fn: tp.Callable | None = None,
         feedback_func: FeedbackFunc | None = None,
     ):
-        assert isinstance(arguments, SDPOConfig), f"arguments must be SDPOConfig, got {type(arguments)}"
+        if not isinstance(arguments, SDPOConfig):
+            raise TypeError(f"arguments must be SDPOConfig, got {type(arguments)}")
 
         self.feedback_func = feedback_func
         self._effective_feedback_length = arguments.max_feedback_length
@@ -268,12 +264,15 @@ class SDPOTrainer(GRPOTrainer):
             self.teacher_prompt_length,
             self.arguments.beta,
             self.arguments.distillation_type,
+            self.arguments.logprob_vocab_chunk_size,
+            self.arguments.max_loss_completion_tokens,
+            self.arguments.completion_chunk_size,
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
         )
-        static_argnames = tuple(range(2, 12))
+        static_argnames = tuple(range(2, 15))
 
         self._train_shared_fn_static_args = (*shared_static, True, straight_through_emulator)
 
@@ -303,7 +302,13 @@ class SDPOTrainer(GRPOTrainer):
             with apply.mesh:
                 ids = with_sharding_constraint(ids, self.arguments.step_partition_spec)
                 mask = with_sharding_constraint(mask, self.arguments.step_partition_spec)
-                return get_per_token_logps(apply, ids, mask, self.arguments.max_prompt_length)
+                return get_per_token_logps(
+                    apply,
+                    ids,
+                    mask,
+                    self.arguments.max_prompt_length,
+                    logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
+                )
 
         self.compute_refmodel_logps = ejit(
             partial(_compute_refmodel_logps, graphdef=self.model_state.graphdef),
@@ -486,7 +491,12 @@ class SDPOTrainer(GRPOTrainer):
         6. Optionally compute ref-model log-probs when ``beta > 0``.
         7. Return the batch dict consumed by :func:`sdpo_step`.
         """
+        reward_batch = self._extract_reward_batch_sidechannels(batch)
         batch = self._purify_batch(batch)
+        if reward_batch:
+            reward_batch = {**batch, **reward_batch}
+        else:
+            reward_batch = batch
 
         with capture_time() as preprocessing_time_fn:
             prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
@@ -523,14 +533,61 @@ class SDPOTrainer(GRPOTrainer):
             generation_factor = max(generation_factor, 1)
             ridmask = prompt_mask.repeat(generation_factor, 0)
 
-            # HF tokenizers expect Python / NumPy token ids; JAX arrays can fail in Rust decode bindings.
-            completion_ids_for_decode = np.asarray(jax.device_get(completion_ids)).tolist()
-            completions_text = self.processing_class.batch_decode(completion_ids_for_decode, skip_special_tokens=True)
+            raw_completions_text = self._coerce_generation_texts(
+                results.raw_text,
+                fallback=results.text,
+            )
+            completions_text = self._coerce_generation_texts(
+                results.text,
+                fallback=raw_completions_text,
+            )
+            if not raw_completions_text or not completions_text:
+                # HF tokenizers expect Python / NumPy token ids; JAX arrays can fail in Rust decode bindings.
+                completion_ids_for_decode = np.asarray(jax.device_get(completion_ids)).tolist()
+                completion_mask_for_decode = np.asarray(jax.device_get(completion_mask), dtype=np.int32)
+                completion_ids_array = np.asarray(completion_ids_for_decode, dtype=np.int64)
+                if not raw_completions_text:
+                    raw_completions_text = self._decode_prompt_batch(
+                        self.processing_class,
+                        completion_ids_array,
+                        skip_special_tokens=False,
+                        pad_token_id=self._pad_token_id,
+                        pop_pad_tokens=True,
+                        attention_mask=completion_mask_for_decode,
+                    )
+                if not completions_text:
+                    completions_text = self._decode_prompt_batch(
+                        self.processing_class,
+                        completion_ids_array,
+                        skip_special_tokens=True,
+                        pad_token_id=self._pad_token_id,
+                        pop_pad_tokens=True,
+                        attention_mask=completion_mask_for_decode,
+                    )
             is_conv = self.train_is_conversational if is_train else self.eval_is_conversational
             if is_conv:
+                raw_completions = [[{"role": "assistant", "content": c}] for c in raw_completions_text]
                 completions = [[{"role": "assistant", "content": c}] for c in completions_text]
             else:
+                raw_completions = raw_completions_text
                 completions = completions_text
+            target_len = len(completions_text) or len(raw_completions_text) or int(completion_ids.shape[0])
+            reasoning_records = self._coerce_optional_generation_texts(
+                results.reasoning,
+                target_len=target_len,
+            )
+            tool_call_records = self._coerce_generation_metadata_list(
+                results.tool_calls,
+                target_len=target_len,
+            )
+            structured_completions = (
+                self._build_structured_assistant_messages(
+                    completions_text,
+                    tool_calls=tool_call_records,
+                )
+                if is_conv
+                else completions
+            )
 
             rewards_per_func = jnp.full(
                 (prompt_ids.shape[0] * generation_factor, len(self.reward_funcs)),
@@ -544,9 +601,17 @@ class SDPOTrainer(GRPOTrainer):
                     if isinstance(reward_func, EasyDeLState):
                         if is_conv:
                             messages = [
-                                {"messages": p + c} for p, c in zip(completion_prompts, completions, strict=False)
+                                {"messages": p + c}
+                                for p, c in zip(completion_prompts, structured_completions, strict=False)
                             ]
-                            texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+                            texts = [
+                                apply_chat_template(
+                                    x,
+                                    reward_processing_class,
+                                    tools=self._reward_chat_template_tools(),
+                                )["text"]
+                                for x in messages
+                            ]
                         else:
                             texts = [p + c for p, c in zip(completion_prompts, completions, strict=False)]
                         rew = reward_func.apply_fn(
@@ -567,12 +632,19 @@ class SDPOTrainer(GRPOTrainer):
                             ),
                         ).logits[:, 0]
                     else:
-                        output_reward_func = reward_func(
+                        reward_call_kwargs = self._build_reward_call_kwargs(
+                            reward_func,
                             prompts=completion_prompts,
                             completions=completions,
+                            raw_completions=raw_completions,
+                            completion_texts=completions_text,
+                            raw_text=raw_completions_text,
+                            reasoning=reasoning_records,
+                            tool_calls=tool_call_records,
                             max_length=self.arguments.max_length,
-                            batch=batch,
+                            batch=reward_batch,
                         )
+                        output_reward_func = reward_func(**reward_call_kwargs)
                         rew = jnp.array(
                             [v if v is not None else jnp.nan for v in output_reward_func],
                             dtype="f4",
@@ -616,6 +688,7 @@ class SDPOTrainer(GRPOTrainer):
                 else:
                     ref_per_token_logps = None
             token_logps_time = token_logps_time_fn()
+            log_completion_length = jnp.sum(completion_mask, -1)
 
             prompt_ids = self._all_gather(prompt_ids)
             prompt_mask = self._all_gather(prompt_mask)
@@ -642,6 +715,16 @@ class SDPOTrainer(GRPOTrainer):
         }
         for i, name in enumerate(self.reward_func_names):
             metrics_dict[name] = float(jnp.nanmean(rewards_per_func[:, i]))
+        self._log_training_generations_to_wandb(
+            state=state,
+            prompts=completion_prompts,
+            completions=completions_text,
+            completion_lengths=log_completion_length,
+            generation_time=generation_time,
+            reasoning=reasoning_records,
+            tool_calls=tool_call_records,
+            source="policy",
+        )
 
         out_batch: dict[str, jax.Array] = {
             "prompt_ids": prompt_ids,

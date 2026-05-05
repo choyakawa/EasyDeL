@@ -189,8 +189,8 @@ def evaluation_step(
         Computes loss metrics for the evaluation batch given a merged graph state.
 
         This inner function merges the provided tree with the current state,
-        sets the module to evaluation mode, removes the labels from the batch,
-        and computes the loss metrics via the module's compute_loss method.
+        sets the module to evaluation mode, excludes labels from the forward-pass
+        batch, and computes the loss metrics via the module's compute_loss method.
 
         Args:
             tree: The current update of the model's graph state.
@@ -205,11 +205,12 @@ def evaluation_step(
         from flax import nnx as nn
         module = nn.merge(state.graphdef, tree, tree_other)
         module.eval()
-        labels = batch.pop("labels", None)
+        call_batch = {k: v for k, v in batch.items() if k != "labels"}
+        labels = batch.get("labels", None)
         _outputs, metrics = module.compute_loss(
             labels=labels,
             loss_config=loss_config,
-            **batch,  # Additional inputs passed directly to the model.
+            **call_batch,  # Additional inputs passed directly to the model.
         )
         return metrics
 

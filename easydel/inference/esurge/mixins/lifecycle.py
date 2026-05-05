@@ -20,7 +20,6 @@ import threading
 import time
 import traceback
 import typing
-from typing import Any
 
 import flax
 import jax
@@ -37,6 +36,24 @@ if typing.TYPE_CHECKING:
 
 
 class EngineLifecycleMixin:
+    """Mixin managing the scheduler lifecycle for the eSurge engine.
+
+    Provides methods to start, stop, pause, and resume the background
+    scheduler thread that drives inference. Also handles error classification,
+    fatal abort propagation, model weight hot-swapping, JAX profiling,
+    and signal-based diagnostics for debugging hangs or OOM kills.
+
+    Methods:
+        initiate: Start the background scheduler thread.
+        terminate: Stop the scheduler gracefully.
+        pause: Temporarily pause scheduling without clearing state.
+        resume: Resume a paused scheduler.
+        update_model_weights: Hot-swap model weights while idle.
+        start_profiling: Begin a JAX profiler trace.
+        stop_profiling: End the active profiler trace.
+        release_model_state: Free model weights to reduce memory usage.
+    """
+
     @staticmethod
     def _is_nonrecoverable_scheduler_error(exc: BaseException) -> bool:
         """Classify scheduler errors that should abort immediately.
@@ -49,6 +66,67 @@ class EngineLifecycleMixin:
         return isinstance(exc, ValueError) and (
             "Non-DP-local page IDs detected" in msg or "Distributed step synchronization failure" in msg
         )
+
+    @staticmethod
+    def _model_overrides_esurge_graphdef(model: EasyDeLBaseModule) -> bool:
+        """Return whether the model delegates eSurge graph construction."""
+        return type(model).__dict__.get("esurge_graphdef") is not None
+
+    @classmethod
+    def _split_graph_components_for_weight_update(cls, model: EasyDeLBaseModule):
+        """Split graph components from the module that actually backs eSurge."""
+        split_model = model
+        if cls._model_overrides_esurge_graphdef(model):
+            try:
+                split_model = model.esurge_compatible_model
+            except Exception:
+                split_model = model
+        split_graphdef, split_graphstate, split_graphother = split_model.split_module()
+        return split_model, split_graphdef, split_graphstate, split_graphother
+
+    @staticmethod
+    def _can_prefetch_scheduler_output(scheduler: Scheduler, current: SchedulerOutput) -> bool:
+        """Return whether the next schedule can be computed before current output lands.
+
+        Prefetch is only safe for pure prefill batches whose requests cannot
+        terminate based on the current step's sampled token. Once a request has
+        reached prompt length, or the async scheduler has already inserted output
+        placeholders for it, the scheduler must wait for `update_from_output()`
+        to run before computing the next batch.
+        """
+        try:
+            for rid in current.num_scheduled_tokens:
+                req = scheduler.requests.get(rid)
+                if req is None:
+                    continue
+                if getattr(req, "num_output_placeholders", 0) > 0:
+                    return False
+                if req.num_computed_tokens >= req.num_tokens:
+                    return False
+        except Exception:
+            return False
+        return True
+
+    @classmethod
+    def _resolve_graphdef_for_weight_update(cls, model: EasyDeLBaseModule, split_graphdef=None):
+        """Resolve the graphdef to use for a model-weight refresh.
+
+        Some wrapper types override ``esurge_graphdef`` to delegate eSurge graph
+        construction to an underlying base LM because the wrapper itself cannot
+        be lazily rebuilt from config. Respect that override instead of forcing
+        ``_esurge_graphdef_from_graphdef(...)`` on the wrapper graphdef.
+        """
+        if cls._model_overrides_esurge_graphdef(model):
+            try:
+                compatible_model = model.esurge_compatible_model
+            except Exception:
+                compatible_model = None
+            if compatible_model is not None:
+                return split_graphdef if split_graphdef is not None else compatible_model.graphdef
+            return model.esurge_graphdef
+
+        base_graphdef = split_graphdef if split_graphdef is not None else model.graphdef
+        return model._esurge_graphdef_from_graphdef(base_graphdef)
 
     def _abort_scheduler_due_to_error(self, exc: BaseException) -> None:
         """Record a fatal scheduler error and wake all waiting callers.
@@ -151,7 +229,7 @@ class EngineLifecycleMixin:
                 return
             self._scheduler_heartbeat_last_warn = now
             logger.warning(
-                "Scheduler heartbeat stale: last update %.1fs ago " "(threshold=%.0fs). Possible hang or deadlock.",
+                "Scheduler heartbeat stale: last update %.1fs ago (threshold=%.0fs). Possible hang or deadlock.",
                 age,
                 _SCHEDULER_HEARTBEAT_WARN_S,
             )
@@ -301,7 +379,7 @@ class EngineLifecycleMixin:
                     self._info("Background scheduler loop stopped")
                     return
 
-                pending_future: tuple[Any, SchedulerOutput] | None = None
+                pending_execution: tuple[typing.Any, SchedulerOutput] | None = None
                 prefetched_schedule: SchedulerOutput | None = None
 
                 if distributed_controller is not None and distributed_controller.has_remote_workers:
@@ -311,34 +389,31 @@ class EngineLifecycleMixin:
                     )
 
                 def _can_prefetch_next(current: SchedulerOutput) -> bool:
-                    # Only prefetch when the current batch is guaranteed not to
-                    # generate new output tokens. That keeps scheduler state
-                    # deterministic (no token-dependent stop conditions) while
-                    # overlapping schedule work with device execution.
-                    try:
-                        for rid in current.num_scheduled_tokens:
-                            req = self.scheduler.requests.get(rid)
-                            if req is None:
-                                continue
-                            if req.num_computed_tokens >= req.num_tokens:
-                                return False
-                    except Exception:
-                        return False
-                    return True
+                    return self._can_prefetch_scheduler_output(self.scheduler, current)
 
                 while self._scheduler_running:
                     try:
-                        if pending_future is not None:
-                            future, prev_sched_out = pending_future
+                        if pending_execution is not None:
+                            future, prev_sched_out = pending_execution
 
-                            # Opportunistically prefetch the next schedule while the
-                            # current batch is still running on device (prefill-only).
                             if prefetched_schedule is None and _can_prefetch_next(prev_sched_out):
                                 with self._scheduler_lock:
                                     prefetched_schedule = self.scheduler.schedule()
 
-                            self._drain_runner_future(future, prev_sched_out)
-                            pending_future = None
+                            try:
+                                self._drain_runner_future(future, prev_sched_out)
+                            except Exception as e:
+                                if prefetched_schedule is not None:
+                                    pending_execution = None
+                                    prefetched_schedule = None
+                                    logger.critical(
+                                        "Overlap drain failed after speculatively advancing scheduler state. "
+                                        "Aborting scheduler instead of retrying with an unexecuted prefetched batch."
+                                    )
+                                    self._abort_scheduler_due_to_error(e)
+                                    break
+                                raise
+                            pending_execution = None
 
                         if prefetched_schedule is not None:
                             scheduler_output = prefetched_schedule
@@ -347,8 +422,18 @@ class EngineLifecycleMixin:
                             with self._scheduler_lock:
                                 scheduler_output = self.scheduler.schedule()
                         self._update_scheduler_heartbeat()
-                        future = self.runner.execute_model_async(scheduler_output)
-                        pending_future = (future, scheduler_output)
+
+                        if scheduler_output.total_num_scheduled_tokens == 0:
+                            model_output = self.runner.execute_model(scheduler_output)
+                            with self._scheduler_lock:
+                                engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
+                            if engine_outputs:
+                                self._process_engine_outputs(engine_outputs)
+                            self._handle_profiling_step()
+                        else:
+                            future = self.runner.execute_model_async(scheduler_output)
+                            pending_execution = (future, scheduler_output)
+
                         # Reset error counter on success
                         consecutive_errors = 0
                         self._update_scheduler_heartbeat()
@@ -356,6 +441,8 @@ class EngineLifecycleMixin:
                         self._info("Scheduler loop interrupted by user")
                         break
                     except Exception as e:
+                        pending_execution = None
+                        prefetched_schedule = None
                         consecutive_errors += 1
                         traceback.print_exc()
                         logger.error(
@@ -381,9 +468,9 @@ class EngineLifecycleMixin:
                             break
                         time.sleep(0.01)
 
-                if pending_future is not None:
+                if pending_execution is not None:
                     try:
-                        self._drain_runner_future(*pending_future)
+                        self._drain_runner_future(*pending_execution)
                     except Exception as e:
                         traceback.print_exc()
                         logger.error("Error processing pending batch: %s", e)
@@ -501,7 +588,7 @@ class EngineLifecycleMixin:
         """
         if self.num_running_requests > 0 or self.num_pending_requests > 0:
             logger.warning(
-                "Skipping model-state release because requests are active or pending " "(running=%d, pending=%d).",
+                "Skipping model-state release because requests are active or pending (running=%d, pending=%d).",
                 self.num_running_requests,
                 self.num_pending_requests,
             )
@@ -542,7 +629,6 @@ class EngineLifecycleMixin:
             RuntimeError: If there are active or pending requests.
             ValueError: If no model/graph data is provided.
         """
-
         if self.num_running_requests > 0 or self.num_pending_requests > 0:
             raise RuntimeError("Cannot update model weights while requests are active or pending")
 
@@ -555,13 +641,30 @@ class EngineLifecycleMixin:
 
         self._drain_pipeline_workers("update_model_weights")
 
+        split_graphdef = None
+        split_graphstate = None
+        split_graphother = None
+        using_compatible_split = False
+        if model is not None and (graphdef is None or graphstate is None or graphother is None):
+            using_compatible_split = self._model_overrides_esurge_graphdef(model)
+            _split_model, split_graphdef, split_graphstate, split_graphother = (
+                self._split_graph_components_for_weight_update(model)
+            )
+
         if model is None:
             model = flax.nnx.merge(graphdef, graphstate, graphother)
-        if graphstate is None:
-            graphstate = model.graphstate
-        if graphother is None:
-            graphother = model.graphother
-        graphdef = model.esurge_graphdef
+        if using_compatible_split and graphdef is None:
+            if graphstate is None:
+                graphstate = split_graphstate
+            if graphother is None:
+                graphother = split_graphother
+        else:
+            if graphstate is None:
+                graphstate = split_graphstate
+            if graphother is None:
+                graphother = split_graphother
+        if graphdef is None:
+            graphdef = self._resolve_graphdef_for_weight_update(model, split_graphdef)
 
         self.runner.update_model_weights(
             graphdef=graphdef,

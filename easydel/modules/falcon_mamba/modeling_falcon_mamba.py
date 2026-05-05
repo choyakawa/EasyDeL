@@ -561,7 +561,9 @@ class FalconMambaMixer(nn.Module):
 
                 # Write back
                 conv_states_c = jax.lax.dynamic_update_slice_in_dim(conv_states_c, conv_state_i, slot, axis=0)
-                ssm_states_c = jax.lax.dynamic_update_slice_in_dim(ssm_states_c, new_ssm_state_i.astype(ssm_states_c.dtype), slot, axis=0)
+                ssm_states_c = jax.lax.dynamic_update_slice_in_dim(
+                    ssm_states_c, new_ssm_state_i.astype(ssm_states_c.dtype), slot, axis=0
+                )
                 token_outputs_c = token_outputs_c.at[idx].set(y_gated)
                 return conv_states_c, ssm_states_c, token_outputs_c
 
@@ -1115,7 +1117,7 @@ class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaCon
 
         logits = None
         if apply_lm_head:
-            logits = self.apply_lm_head(outputs.last_hidden_state)
+            logits = self.compute_lm_logits(outputs.last_hidden_state)
 
         return FalconMambaCausalLMOutput(
             last_hidden_state=outputs.last_hidden_state,

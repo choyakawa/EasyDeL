@@ -30,7 +30,7 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import ModelOutput
-from easydel.infra.utils import ArrayParam
+from easydel.infra.utils import ArrayParam, auto_remat
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseCausalLMModule
@@ -348,6 +348,24 @@ class RwkvSelfAttention(nn.Module):
         value_states = checkpoint_name(self.value(value_x), "attn_value")
 
         def step(in_state, kv):
+            """Perform one recurrent WKV (Weighted Key-Value) step.
+
+            Computes the time-mixed output for a single timestep using
+            exponential gating with numerically stable log-sum-exp.
+            Designed to be scanned over the sequence dimension via
+            ``jax.lax.scan``.
+
+            Args:
+                in_state: Tuple ``(aa, bb, p)`` representing the accumulated
+                    numerator, denominator, and log-normalizer of the running
+                    WKV state.
+                kv: Tuple ``(key, value)`` for the current timestep.
+
+            Returns:
+                Tuple of ``(next_state, output)`` where *next_state* has the
+                same structure as *in_state* and *output* is the context
+                vector for this timestep.
+            """
             (inner_aa, inner_bb, inner_p), (kk, vv) = in_state, kv
             ww = self.time_first.reshape(-1) + kk
             p = jnp.maximum(inner_p, ww)
@@ -732,9 +750,15 @@ class RwkvModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            RwkvBlock,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.blocks = nn.List(
             [
-                RwkvBlock(
+                remat_layer_block(
                     config=config,
                     dtype=dtype,
                     param_dtype=param_dtype,
@@ -915,6 +939,13 @@ class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):  # type: ignor
 
     @property
     def transform_fn(self):
+        """Get the state dict transformation function for HuggingFace weight conversion.
+
+        Returns:
+            Callable: A partial function configured with StateDictConverter.huggingface_to_easydel
+                that handles embedding, layernorm, and RWKV-specific parameter conversions
+                (e.g., keeping time_decay and time_first in float32).
+        """
         from easydel.layers import BaseMoeModule, ParallelMoELinear
         from easydel.utils import traversals
         from easydel.utils.parameters_transformation import StateDictConverter
@@ -1065,7 +1096,7 @@ class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):  # type: ignor
         )
         hidden_states = rwkv_outputs[0]
 
-        logits = self.apply_lm_head(hidden_states)
+        logits = self.compute_lm_logits(hidden_states)
 
         return RwkvCausalLMOutput(
             logits=logits,

@@ -96,9 +96,8 @@ class OnPolicyDistillationTrainer(Trainer):
             tokenizer = processing_class.tokenizer
         if getattr(tokenizer, "pad_token", None) is None and hasattr(tokenizer, "eos_token"):
             tokenizer.pad_token = tokenizer.eos_token
-        assert isinstance(
-            arguments, OnPolicyDistillationConfig
-        ), "passed argument must be an `OnPolicyDistillationConfig`."
+        if not isinstance(arguments, OnPolicyDistillationConfig):
+            raise TypeError("passed argument must be an `OnPolicyDistillationConfig`.")
 
         self.arguments = arguments
 
@@ -114,18 +113,6 @@ class OnPolicyDistillationTrainer(Trainer):
         if pad_token_id is None and hasattr(processing_class, "tokenizer"):
             pad_token_id = getattr(processing_class.tokenizer, "pad_token_id", None)
         self.padding_value = 0 if pad_token_id is None else int(pad_token_id)
-
-        # Wire generation config into arguments for generate_unified
-        if getattr(self.arguments, "generation_num_return_sequences", None) is None:
-            self.arguments.generation_num_return_sequences = arguments.num_generations_per_prompt
-        if getattr(self.arguments, "generation_top_p", None) is None:
-            self.arguments.generation_top_p = arguments.top_p
-        if getattr(self.arguments, "generation_top_k", None) is None:
-            self.arguments.generation_top_k = arguments.top_k
-        if getattr(self.arguments, "generation_temperature", None) is None:
-            self.arguments.generation_temperature = arguments.temperature_sampling
-        if getattr(self.arguments, "generation_extra_kwargs", None) is None:
-            self.arguments.generation_extra_kwargs = {}
 
         super().__init__(
             arguments=arguments,
@@ -208,7 +195,7 @@ class OnPolicyDistillationTrainer(Trainer):
             self.arguments.temperature,
             self.arguments.alpha,
             straight_through_emulator,
-            int(self.arguments.logits_chunk_size),
+            self.arguments.logits_chunk_size,
         )
 
         static_argnames = tuple(range(3, 12))
@@ -230,7 +217,7 @@ class OnPolicyDistillationTrainer(Trainer):
             self.arguments.temperature,
             self.arguments.alpha,
             None,  # straight_through_emulator
-            int(self.arguments.logits_chunk_size),
+            self.arguments.logits_chunk_size,
         )
 
         sharded_evaluation_step_function = ejit(
@@ -322,6 +309,23 @@ class OnPolicyDistillationTrainer(Trainer):
             "generation_time": generation_time,
             "preprocessing_time": preprocessing_time,
         }
+        self._log_training_generations_to_wandb(
+            state=state,
+            prompts=expanded_prompt_ids,
+            prompt_mask=expanded_prompt_mask,
+            completion_ids=completion_ids,
+            completion_mask=completion_mask,
+            generation_time=generation_time,
+            reasoning=self._coerce_optional_generation_texts(
+                results.reasoning,
+                target_len=int(completion_ids.shape[0]),
+            ),
+            tool_calls=self._coerce_generation_metadata_list(
+                results.tool_calls,
+                target_len=int(completion_ids.shape[0]),
+            ),
+            source="teacher" if self.arguments.generate_with_teacher else "policy",
+        )
 
         return (
             {

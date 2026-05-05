@@ -30,7 +30,9 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.caching import (
     HybridCache,
+    MLARaggedPagesCacheView,
     OperationsMetadata,
+    ParallelHybridCacheView,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -121,6 +123,14 @@ class GlmMoeDsaMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
+        """Applies the gated MLP transformation.
+
+        Args:
+            hidden_states: Input tensor of shape ``(batch, seq_len, hidden_dim)``.
+
+        Returns:
+            Transformed hidden states with the same shape as input.
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -271,6 +281,16 @@ class GlmMoeDsaMLPStack(nn.Module):
         group_sizes: Array,
         sorted_experts: Array | None = None,
     ) -> Array:
+        """Applies the gated MLP across all experts in a fused manner.
+
+        Args:
+            hidden_states: Token representations, pre-sorted by expert assignment.
+            group_sizes: Number of tokens assigned to each expert.
+            sorted_experts: Expert indices for sorted token ordering.
+
+        Returns:
+            Transformed hidden states after expert-parallel MLP.
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -335,6 +355,14 @@ class GlmMoeDsaTopKRouter(nn.Module):
         return {"kernel": kernel_spec, "e_score_correction_bias": Replicated}
 
     def __call__(self, hidden_states: Float[Array, "tokens hidden_dim"]) -> Array:
+        """Computes per-expert routing logits for all tokens.
+
+        Args:
+            hidden_states: Flattened token representations.
+
+        Returns:
+            Router logits of shape ``(tokens, n_routed_experts)``.
+        """
         hidden_states = hidden_states.reshape(-1, self.config.hidden_size)
         return checkpoint_name(
             jnp.matmul(hidden_states.astype(jnp.float32), self.kernel.value.astype(jnp.float32)),
@@ -461,6 +489,14 @@ class GlmMoeDsaMoE(BaseMoeModule):
         return topk_weights, topk_indices
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
+        """Routes tokens through selected experts and combines outputs.
+
+        Args:
+            hidden_states: Input tensor of shape ``(batch, seq_len, hidden_dim)``.
+
+        Returns:
+            Tuple of (combined expert output, router logits).
+        """
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
@@ -668,6 +704,18 @@ class GlmMoeDsaAttention(UnifiedAttention):
         precision: jax.lax.Precision,
         rngs: nn.Rngs,
     ):
+        """Creates all projection layers, rotary embeddings, attention performer, and DSA indexer.
+
+        Builds query/key/value projections with optional LoRA decomposition for
+        queries and compressed KV projections for Multi-head Latent Attention.
+
+        Args:
+            config: Model configuration.
+            dtype: Computation dtype.
+            param_dtype: Parameter storage dtype.
+            precision: JAX matmul precision.
+            rngs: PRNG key container.
+        """
         if not self.use_mla_lora:
             setattr(
                 self,
@@ -825,6 +873,10 @@ class GlmMoeDsaAttention(UnifiedAttention):
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
     ):
         bsz, q_len, _ = hidden_states.shape
+        _use_mla_ragged = isinstance(cache_view, MLARaggedPagesCacheView) or (
+            isinstance(cache_view, ParallelHybridCacheView)
+            and isinstance(getattr(cache_view, "transformer", None), MLARaggedPagesCacheView)
+        )
 
         q_resid = None
         if not self.use_mla_lora:
@@ -842,16 +894,22 @@ class GlmMoeDsaAttention(UnifiedAttention):
         compressed_kv = self.mla_kv_a_proj_with_mqa(hidden_states)
         k_pe = compressed_kv[..., self.kv_lora_rank :]
         compressed_kv = compressed_kv[..., : self.kv_lora_rank]
+        compressed_kv = self.mla_kv_a_layernorm(compressed_kv)
 
         k_pe = k_pe.reshape(bsz, q_len, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
 
-        kv = (
-            self.mla_kv_b_proj(self.mla_kv_a_layernorm(compressed_kv))
-            .reshape(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-            .transpose(0, 2, 1, 3)
-        )
-        k_nope = kv[..., : self.qk_nope_head_dim]
-        value_states = kv[..., self.qk_nope_head_dim : self.qk_nope_head_dim + self.v_head_dim]
+        absorbed_w_v = None
+        if _use_mla_ragged:
+            k_nope = None
+            value_states = None
+        else:
+            kv = (
+                self.mla_kv_b_proj(compressed_kv)
+                .reshape(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+                .transpose(0, 2, 1, 3)
+            )
+            k_nope = kv[..., : self.qk_nope_head_dim]
+            value_states = kv[..., self.qk_nope_head_dim : self.qk_nope_head_dim + self.v_head_dim]
 
         freq_array = None
         if frequencies is not None:
@@ -869,17 +927,44 @@ class GlmMoeDsaAttention(UnifiedAttention):
                 q_pe = jnp.concatenate([q1 * cos - q2 * sin, q2 * cos + q1 * sin], axis=-1)
                 k_pe = jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
 
-        query_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), q_pe.dtype)
-        query_states = query_states.at[..., : self.qk_nope_head_dim].set(q_nope)
-        query_states = query_states.at[..., self.qk_nope_head_dim :].set(q_pe)
+        mla_kwargs: dict = {}
+        if _use_mla_ragged:
+            w = self.mla_kv_b_proj.kernel.value
+            local_heads = w.shape[1] // (self.qk_nope_head_dim + self.v_head_dim)
+            w = w.reshape(self.kv_lora_rank, local_heads, self.qk_nope_head_dim + self.v_head_dim)
+            w_nope = w[:, :, : self.qk_nope_head_dim]
+            absorbed_w_v = w[:, :, self.qk_nope_head_dim :]
 
-        key_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), k_pe.dtype)
-        key_states = key_states.at[..., : self.qk_nope_head_dim].set(k_nope)
-        key_states = key_states.at[..., self.qk_nope_head_dim :].set(k_pe)
+            q_absorbed = jnp.einsum(
+                "bhsd,khd->bhsk",
+                q_nope.astype(jnp.float32),
+                w_nope.astype(jnp.float32),
+            ).astype(q_nope.dtype)
 
-        query_states = query_states.transpose(0, 2, 1, 3)
-        key_states = key_states.transpose(0, 2, 1, 3)
-        value_states = value_states.transpose(0, 2, 1, 3)
+            query_states = q_absorbed.transpose(0, 2, 1, 3)
+            key_states = jnp.concatenate(
+                [compressed_kv[:, :, None, :], k_pe.transpose(0, 2, 1, 3)],
+                axis=-1,
+            )
+            value_states = key_states
+
+            mla_kwargs["queries_nope"] = query_states
+            mla_kwargs["queries_pe"] = q_pe.transpose(0, 2, 1, 3)
+            mla_kwargs["keys_values"] = compressed_kv
+            mla_kwargs["keys_pe"] = k_pe[:, 0, :, :]
+            mla_kwargs["softmax_scale"] = (self.qk_nope_head_dim + self.qk_rope_head_dim) ** -0.5
+        else:
+            query_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), q_pe.dtype)
+            query_states = query_states.at[..., : self.qk_nope_head_dim].set(q_nope)
+            query_states = query_states.at[..., self.qk_nope_head_dim :].set(q_pe)
+
+            key_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), k_pe.dtype)
+            key_states = key_states.at[..., : self.qk_nope_head_dim].set(k_nope)
+            key_states = key_states.at[..., self.qk_nope_head_dim :].set(k_pe)
+
+            query_states = query_states.transpose(0, 2, 1, 3)
+            key_states = key_states.transpose(0, 2, 1, 3)
+            value_states = value_states.transpose(0, 2, 1, 3)
 
         causal_for_kernel = self.causal
         if mask_info is not None and getattr(mask_info, "_causal_baked", False):
@@ -981,9 +1066,46 @@ class GlmMoeDsaAttention(UnifiedAttention):
             causal=causal_for_kernel,
             sliding_window=sliding_window_for_kernel,
             softmax_aux=softmax_aux,
+            **mla_kwargs,
         )
 
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
+        attn_out = attentions.attention_outputs
+        if absorbed_w_v is not None and attn_out.ndim == 3:
+            attn_out = jnp.einsum(
+                "thk,khv->thv",
+                attn_out.astype(jnp.float32),
+                absorbed_w_v.astype(jnp.float32),
+            ).astype(attn_out.dtype)
+            batch_size = hidden_states.shape[0]
+            seq_len = hidden_states.shape[1]
+            attn_output = attn_out.reshape(batch_size, seq_len, -1)
+        elif _use_mla_ragged and attn_out.ndim == 3:
+            batch_size = hidden_states.shape[0]
+            seq_len = hidden_states.shape[1]
+            attn_output = attn_out.reshape(batch_size, seq_len, -1)
+        else:
+            attn_output = self._merge_heads(attn_out)
+        expected_attn_dim = self.num_heads * self.v_head_dim
+        if attn_output.shape[-1] != expected_attn_dim:
+            actual_attn_dim = int(attn_output.shape[-1])
+            if actual_attn_dim % self.num_heads == 0 and expected_attn_dim % self.num_heads == 0:
+                actual_head_dim = actual_attn_dim // self.num_heads
+                expected_head_dim = expected_attn_dim // self.num_heads
+                attn_output = attn_output.reshape(*attn_output.shape[:-1], self.num_heads, actual_head_dim)
+                if actual_head_dim > expected_head_dim:
+                    attn_output = attn_output[..., :expected_head_dim]
+                elif actual_head_dim < expected_head_dim:
+                    pad_width = [(0, 0)] * attn_output.ndim
+                    pad_width[-1] = (0, expected_head_dim - actual_head_dim)
+                    attn_output = jnp.pad(attn_output, pad_width)
+                attn_output = attn_output.reshape(*attn_output.shape[:-2], expected_attn_dim)
+            elif actual_attn_dim > expected_attn_dim:
+                attn_output = attn_output[..., :expected_attn_dim]
+            else:
+                pad_width = [(0, 0)] * attn_output.ndim
+                pad_width[-1] = (0, expected_attn_dim - actual_attn_dim)
+                attn_output = jnp.pad(attn_output, pad_width)
+        attn_output = self.shard_attention_prod(attn_output)
         attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
 
         return AttentionLayerOutput(
@@ -1027,20 +1149,7 @@ class GlmMoeDsaDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
 
-        attn_block = GlmMoeDsaAttention
-        mlp_block = GlmMoeDsaMLP
-        mlp_moe_block = GlmMoeDsaMoE
-
-        attn_block, mlp_block, mlp_moe_block = auto_remat(
-            attn_block,
-            mlp_block,
-            mlp_moe_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
-        self.self_attn = attn_block(
+        self.self_attn = GlmMoeDsaAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1055,7 +1164,7 @@ class GlmMoeDsaDecoderLayer(nn.Module):
             and config.n_routed_experts is not None
             and config.num_experts_per_tok is not None
         ):
-            self.mlp = mlp_moe_block(
+            self.mlp = GlmMoeDsaMoE(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -1063,7 +1172,7 @@ class GlmMoeDsaDecoderLayer(nn.Module):
                 rngs=rngs,
             )
         else:
-            self.mlp = mlp_block(
+            self.mlp = GlmMoeDsaMLP(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -1185,9 +1294,15 @@ class GlmMoeDsaModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            GlmMoeDsaDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                GlmMoeDsaDecoderLayer(
+                remat_layer_block(
                     config=config,
                     dtype=dtype,
                     param_dtype=param_dtype,
@@ -1208,6 +1323,7 @@ class GlmMoeDsaModel(EasyDeLBaseModule):
 
     @functools.cached_property
     def frequencies(self):
+        """Computes and caches RoPE frequency tensor for the model's rope head dimension."""
         return self.config.get_basic_frequencies(
             head_size=self.config.qk_rope_head_dim,
             rotary_dim=self.config.qk_rope_head_dim,
@@ -1379,6 +1495,21 @@ class GlmMoeDsaForCausalLM(BaseCausalLMModule[GlmMoeDsaModel, GlmMoeDsaConfig]):
                 version = "v2"
             case _:
                 version = "v3"
+
+        attn_mechanism = getattr(text_config, "attn_mechanism", None)
+        if hasattr(attn_mechanism, "value"):
+            attn_mechanism = attn_mechanism.value
+        is_mla_ragged = str(attn_mechanism) in (
+            "multi_latent_ragged_page_attention_v1",
+            "multi_latent_ragged_page_attention_v2",
+        )
+        if is_mla_ragged:
+            return self._create_mla_ragged_page_cache_config(
+                max_length=max_length,
+                page_size=page_size,
+                hbm_utilization=hbm_utilization,
+                dtype=dtype,
+            )
 
         return RaggedPagesCacheConfig.create(
             mesh=self.mesh,

@@ -192,6 +192,15 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Qwen3.5 text causal LM with MoE support.
+
+        Args:
+            config: Qwen3.5 text configuration.
+            dtype: Computation data type.
+            param_dtype: Parameter storage data type.
+            precision: JAX matmul precision.
+            rngs: PRNG key container.
+        """
         BaseCausalLMModule.__init__(
             self,
             config=config,
@@ -233,6 +242,15 @@ class Qwen3_5Model(Qwen3VLModel):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Qwen3.5 multimodal model with vision encoder and text decoder.
+
+        Args:
+            config: Qwen3.5 multimodal configuration.
+            dtype: Computation data type.
+            param_dtype: Parameter storage data type.
+            precision: JAX matmul precision.
+            rngs: PRNG key container.
+        """
         bootstrap_text_config = Qwen3VLTextConfig(
             vocab_size=config.text_config.vocab_size,
             hidden_size=config.text_config.hidden_size,
@@ -290,6 +308,7 @@ class Qwen3_5Model(Qwen3VLModel):
             precision=precision,
             rngs=rngs,
         )
+
     def __call__(
         self,
         input_ids: jax.Array | None = None,
@@ -311,8 +330,19 @@ class Qwen3_5Model(Qwen3VLModel):
         image_max_grid_size: int | None = None,
         video_max_grid_size: int | None = None,
         cache_position: jax.Array | None = None,  # compatibility no-op
+        rope_deltas: jax.Array | None = None,  # compatibility no-op
         mm_token_type_ids: jax.Array | None = None,
+        **kwargs,
     ) -> Qwen3VLModelOutputWithPast:
+        """Forward pass through the Qwen3.5 multimodal model.
+
+        Encodes image/video inputs via the vision tower, merges them into
+        the text embedding stream, and runs the language model decoder.
+
+        Returns:
+            Qwen3VLModelOutputWithPast: Model outputs including logits and hidden states.
+        """
+        del rope_deltas, kwargs
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
         if inputs_embeds is None:
@@ -423,6 +453,15 @@ class Qwen3_5ForConditionalGeneration(BaseVisionLanguageModule[Qwen3_5Model, Qwe
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Qwen3.5 for conditional generation with vision-language support.
+
+        Args:
+            config: Qwen3.5 multimodal configuration.
+            dtype: Computation data type.
+            param_dtype: Parameter storage data type.
+            precision: JAX matmul precision.
+            rngs: PRNG key container.
+        """
         super().__init__(
             config=config,
             base_model_class=Qwen3_5Model,

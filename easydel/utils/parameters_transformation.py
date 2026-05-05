@@ -20,6 +20,7 @@ import functools
 import gc
 import inspect
 import os
+import re
 import typing as tp
 import warnings
 from collections.abc import Mapping
@@ -47,9 +48,13 @@ if tp.TYPE_CHECKING:
 
 mem_ops = SMPMemoryMonitor(5)
 logger = get_logger(__name__)
-EASYDEL_PERFRED_HOST_COPY_INDEX = int(os.getenv("EASYDEL_PERFRED_HOST_COPY_INDEX", "0"))
-_perfred_host_copy_raw = str(os.getenv("EASYDEL_PERFRED_HOST_COPY", "cpu")).lower()
-EASYDEL_PERFRED_HOST_COPY: str | None = None if _perfred_host_copy_raw == "none" else _perfred_host_copy_raw
+EASYDEL_PREFERRED_HOST_COPY_INDEX = int(
+    os.getenv("EASYDEL_PREFERRED_HOST_COPY_INDEX", os.getenv("EASYDEL_PERFRED_HOST_COPY_INDEX", "0"))
+)
+_preferred_host_copy_raw = str(
+    os.getenv("EASYDEL_PREFERRED_HOST_COPY", os.getenv("EASYDEL_PERFRED_HOST_COPY", "cpu"))
+).lower()
+EASYDEL_PREFERRED_HOST_COPY: str | None = None if _preferred_host_copy_raw == "none" else _preferred_host_copy_raw
 
 
 class DtypeHandler:
@@ -243,7 +248,7 @@ class TensorConverter:
             else:
                 y = jax.device_put(
                     jax.device_get(_get_local_array(x)),
-                    jax.devices(EASYDEL_PERFRED_HOST_COPY)[EASYDEL_PERFRED_HOST_COPY_INDEX],
+                    jax.devices(EASYDEL_PREFERRED_HOST_COPY or "cpu")[EASYDEL_PREFERRED_HOST_COPY_INDEX],
                 )
                 capsule = _to_dlpack_capsule(y)
             return dlpack_pt.from_dlpack(capsule)
@@ -348,7 +353,22 @@ class StateDictConverter:
 
     @staticmethod
     def process_tensor(key: str, tensor: tp.Any, config: dict[str, tp.Any]) -> list[tuple[tuple, jnp.ndarray]] | None:
-        """Process a single tensor and return its processed key and value."""
+        """Process a single PyTorch tensor into EasyDeL format.
+
+        Applies key renaming (e.g., ``.weight`` -> ``.kernel``), axis
+        transposition for dense layers, embedding/layernorm detection,
+        and optional ``reform_param`` splitting rules.
+
+        Args:
+            key: Dot-separated PyTorch parameter name.
+            tensor: PyTorch tensor to convert.
+            config: Conversion configuration containing ``embedding_layer_names``,
+                ``layernorm_names``, ``dtype``, ``reform_param``, etc.
+
+        Returns:
+            List of ``(key_tuple, jax_array)`` pairs, or ``None`` if the
+            parameter should be skipped.
+        """
         new_key = key
 
         reform_param = config.get("reform_param", None)
@@ -446,7 +466,33 @@ class StateDictConverter:
         reform_param: dict | None = None,
         **kwargs,
     ) -> dict[str, tp.Any]:
-        """Base conversion function from PyTorch state dict to EasyDeL format."""
+        """Base conversion from a PyTorch state dict to EasyDeL nested dict format.
+
+        Iterates over all keys in ``state_dict``, applies per-tensor
+        processing (key renaming, axis transposition, dtype casting),
+        optional shard functions, and a user callback.
+
+        Args:
+            state_dict: PyTorch model ``state_dict()``.
+            device: Target JAX device for parameter placement.
+            embedding_layer_names: Parameter name substrings identifying embeddings.
+            layernorm_names: Parameter name substrings identifying layer norms.
+            moe_block_names: Names of MoE block modules.
+            moe_names: Names of individual MoE expert sub-modules.
+            shard_fns: Optional mapping of key tuples to sharding functions.
+            dtype: Target JAX dtype for converted parameters.
+            verbose: Whether to display a progress bar.
+            callback: Optional function called on each converted array.
+            remove_state_dict: Whether to delete the input dict after conversion.
+            lm_head_name: Name of the language model head parameter.
+            uses_tie_word_embedding: Whether embeddings are tied with lm_head.
+            consolidated_moe_keys: Set of keys that were consolidated from
+                per-expert weights.
+            reform_param: Optional parameter splitting/merging rules.
+
+        Returns:
+            Nested EasyDeL parameter dictionary.
+        """
         try:
             import torch
 
@@ -512,6 +558,7 @@ class StateDictConverter:
         moe_block_path: list[str] | None = None,
         moe_path: list[str] | None = None,
         tensor_transform: tp.Callable | None = None,
+        reform_param: dict | None = None,
     ) -> tuple[dict[str, tp.Any], set[str]]:
         """
         Transform MoE weights from HuggingFace format (separate experts) to EasyDel format (stacked experts).
@@ -527,17 +574,25 @@ class StateDictConverter:
 
         import torch
 
-        assert moe_path is not None
-        assert moe_names is not None
-        assert moe_block_path is not None
+        if moe_path is None:
+            raise ValueError("moe_path cannot be None")
+        if moe_names is None:
+            raise ValueError("moe_names cannot be None")
+        if moe_block_path is None:
+            raise ValueError("moe_block_path cannot be None")
 
-        excepted_expert_name = moe_path[0].split(".")[-2]
-        expert_prefix = f".{excepted_expert_name}."
+        expected_expert_name = moe_path[0].split(".")[-2]
+        expert_prefix = f".{expected_expert_name}."
 
         moe_names_set = set(moe_names)
         moe_stacked_paths = {
-            f"{block_path}.{excepted_expert_name}.{moe_name}" for block_path in moe_block_path for moe_name in moe_names
+            f"{block_path}.{expected_expert_name}.{moe_name}" for block_path in moe_block_path for moe_name in moe_names
         }
+        reform_param = reform_param or {}
+        fallback_reform_keys = {
+            key[:-1] if key.endswith("$") else key for key in reform_param if f".{expected_expert_name}." in key
+        }
+        sibling_expert_parents = {path.rsplit(".", 1)[0] for path in moe_path if f".{expected_expert_name}." in path}
 
         new_state_dict = {}
         moe_groups = {path: {} for path in moe_stacked_paths}
@@ -568,10 +623,21 @@ class StateDictConverter:
                     moe_name = moe_name_part[:-7] if moe_name_part.endswith(".weight") else moe_name_part
 
                     if moe_name in moe_names_set:
-                        target_path = f"{block_path}.{excepted_expert_name}.{moe_name}"
+                        target_path = f"{block_path}.{expected_expert_name}.{moe_name}"
                         moe_groups[target_path][expert_idx] = value
                         is_moe_expert = True
                         break
+
+            if not is_moe_expert:
+                match = re.match(rf"^(.*\.{expected_expert_name})\.(\d+)\.([^.]+)\.weight$", key)
+                if match:
+                    expert_parent, expert_idx_str, moe_name = match.groups()
+                    target_path = f"{expert_parent}.{moe_name}"
+                    if expert_parent in sibling_expert_parents and (
+                        moe_name in moe_names_set or target_path in fallback_reform_keys
+                    ):
+                        moe_groups.setdefault(target_path, {})[int(expert_idx_str)] = value
+                        is_moe_expert = True
 
             if not is_moe_expert:
                 new_state_dict[key] = value
@@ -615,7 +681,7 @@ class StateDictConverter:
                 logger.error(f"Failed to stack MoE tensors for {target_path}: {e}")
                 for idx, tensor in expert_dict.items():
                     fallback_key = (
-                        f"{target_path.replace(f'.{excepted_expert_name}.', f'.{excepted_expert_name}.{idx}.')}.weight"
+                        f"{target_path.replace(f'.{expected_expert_name}.', f'.{expected_expert_name}.{idx}.')}.weight"
                     )
                     new_state_dict[fallback_key] = tensor
 
@@ -642,7 +708,33 @@ class StateDictConverter:
         reform_param: dict | None = None,
         **kwargs,
     ) -> dict[str, tp.Any]:
-        """Convert PyTorch state dict to EasyDeL format with MoE transformations."""
+        """Convert a PyTorch state dict to EasyDeL format with MoE support.
+
+        If MoE parameters are present, first stacks per-expert weights into
+        consolidated tensors, then delegates to ``_base_huggingface_to_easydel``
+        for the standard conversion pipeline.
+
+        Args:
+            state_dict: PyTorch model ``state_dict()``.
+            device: Target JAX device.
+            embedding_layer_names: Substrings identifying embedding layers.
+            layernorm_names: Substrings identifying layer norm layers.
+            moe_block_names: Names of MoE block modules.
+            moe_names: Names of individual expert sub-modules.
+            moe_block_path: Full dot-paths to MoE blocks in the model.
+            moe_path: Full dot-paths to expert modules.
+            shard_fns: Optional sharding functions per key tuple.
+            dtype: Target JAX dtype.
+            verbose: Whether to show progress.
+            callback: Optional per-array callback.
+            remove_state_dict: Whether to delete input dict after conversion.
+            lm_head_name: Language model head parameter name.
+            uses_tie_word_embedding: Whether embeddings are tied.
+            reform_param: Optional splitting/merging rules.
+
+        Returns:
+            Nested EasyDeL parameter dictionary.
+        """
         consolidated_moe_keys = set()
         if moe_block_names is not None and moe_names is not None:
             state_dict, consolidated_moe_keys = StateDictConverter.apply_moe_transformations(
@@ -651,6 +743,7 @@ class StateDictConverter:
                 moe_path=moe_path,
                 moe_block_names=moe_block_names,
                 moe_block_path=moe_block_path,
+                reform_param=reform_param,
             )
 
         return StateDictConverter._base_huggingface_to_easydel(
@@ -696,12 +789,17 @@ class StateDictConverter:
         if not all([moe_block_names, moe_names, moe_block_path]):
             return state_dict
 
-        assert moe_names is not None
-        assert moe_block_path is not None
+        if moe_names is None:
+            raise ValueError("moe_names cannot be None")
+        if moe_block_path is None:
+            raise ValueError("moe_block_path cannot be None")
 
         new_state_dict = {}
         processed_keys = set()
-        excepted_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
+        expected_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
+        sibling_expert_parents = {
+            path.rsplit(".", 1)[0] for path in moe_path or [] if f".{expected_expert_name}." in path
+        }
 
         for key, value in state_dict.items():
             is_stacked_moe = False
@@ -711,7 +809,7 @@ class StateDictConverter:
                     parts = remainder.split(".")
                     if (
                         len(parts) == 3
-                        and parts[0] == excepted_expert_name
+                        and parts[0] == expected_expert_name
                         and parts[1] in moe_names
                         and parts[2] == "weight"
                     ):
@@ -724,11 +822,26 @@ class StateDictConverter:
                                 expert_tensor = value[expert_idx]
                                 if tensor_transform is not None:
                                     expert_tensor = tensor_transform(expert_tensor)
-                                new_key = f"{block_path}.{excepted_expert_name}.{expert_idx}.{moe_name}.weight"
+                                new_key = f"{block_path}.{expected_expert_name}.{expert_idx}.{moe_name}.weight"
                                 new_state_dict[new_key] = expert_tensor
 
                             processed_keys.add(key)
                             break
+
+            if not is_stacked_moe:
+                match = re.match(rf"^(.*\.{expected_expert_name})\.([^.]+)\.weight$", key)
+                if match:
+                    expert_parent, moe_name = match.groups()
+                    if expert_parent in sibling_expert_parents and hasattr(value, "shape") and len(value.shape) >= 3:
+                        num_experts = value.shape[0]
+                        for expert_idx in range(num_experts):
+                            expert_tensor = value[expert_idx]
+                            if tensor_transform is not None:
+                                expert_tensor = tensor_transform(expert_tensor)
+                            new_key = f"{expert_parent}.{expert_idx}.{moe_name}.weight"
+                            new_state_dict[new_key] = expert_tensor
+                        processed_keys.add(key)
+                        is_stacked_moe = True
 
             if not is_stacked_moe:
                 new_state_dict[key] = value
@@ -738,7 +851,20 @@ class StateDictConverter:
     def easydel_to_torch(
         module: EasyDeLBaseModule, dtype: jnp.dtype | None = jnp.float16, **kwargs
     ) -> dict[str, tp.Any]:
-        """Convert EasyDeL module to PyTorch state dict."""
+        """Convert an EasyDeL module's parameters to a PyTorch state dict.
+
+        Flattens the module's parameter tree, transposes weight axes back
+        to PyTorch conventions, renames keys (``.kernel`` -> ``.weight``,
+        ``.embedding`` -> ``.weight``, ``.scale`` -> ``.weight``), and
+        un-stacks MoE expert weights if present.
+
+        Args:
+            module: EasyDeL module whose parameters will be exported.
+            dtype: Target dtype for the exported tensors.
+
+        Returns:
+            Dictionary mapping PyTorch-style parameter names to tensors.
+        """
         if dtype is None:
             dtype = module.param_dtype
 
@@ -897,7 +1023,26 @@ class ModelConverter:
         reform_param: dict | None = None,
         **kw,
     ) -> tp.Any:
-        """Convert EasyDeL module to HuggingFace model."""
+        """Convert an EasyDeL module to a HuggingFace ``PreTrainedModel``.
+
+        Creates a HuggingFace model instance, converts the EasyDeL
+        parameters to a PyTorch state dict via ``easydel_to_torch``,
+        and loads the weights into the HuggingFace model.
+
+        Args:
+            module: Source EasyDeL module.
+            config: EasyDeL configuration to derive the HuggingFace config.
+            base_huggingface_module: HuggingFace model class to instantiate.
+            base_huggingface_module_kwarguments: Extra kwargs for the HF
+                model constructor.
+            dtype: Target dtype for the conversion.
+            use_meta_torch: Whether to use ``torch.device("meta")`` for
+                memory-efficient model construction.
+            reform_param: Optional parameter splitting/merging rules.
+
+        Returns:
+            Instantiated HuggingFace model with loaded weights.
+        """
 
         import torch
 

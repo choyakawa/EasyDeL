@@ -67,7 +67,7 @@ def on_policy_distillation_step(
     temperature: float = 4.0,
     alpha: float = 0.9,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
-    logits_chunk_size: int = 0,
+    logits_chunk_size: int | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Training/evaluation step for on-policy distillation.
 
@@ -92,7 +92,7 @@ def on_policy_distillation_step(
         temperature: Temperature for softening distributions in KL loss.
         alpha: Weight for distillation loss (1.0 = pure distillation).
         straight_through_emulator: Optional quantization emulator.
-        logits_chunk_size: If > 0, compute loss in chunks to save memory.
+        logits_chunk_size: If set, compute loss in chunks to save memory.
 
     Returns:
         If training: (updated_state, metrics)
@@ -105,7 +105,7 @@ def on_policy_distillation_step(
     )
     batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
 
-    use_chunked = logits_chunk_size > 0
+    use_chunked = logits_chunk_size is not None and logits_chunk_size > 0
 
     def loss_fn(tree, minibatch):
         if is_training and straight_through_emulator is not None:
@@ -122,7 +122,9 @@ def on_policy_distillation_step(
         teacher_kwargs = filter_kwargs_for_callable(teacher_state.model.__call__, teacher_kwargs)
         teacher_kwargs = sanitize_model_call_kwargs(teacher_kwargs)
 
-        _teacher_static_kw = {k: teacher_kwargs.pop(k) for k in list(teacher_kwargs) if not hasattr(teacher_kwargs[k], "shape")}
+        _teacher_static_kw = {
+            k: teacher_kwargs.pop(k) for k in list(teacher_kwargs) if not hasattr(teacher_kwargs[k], "shape")
+        }
 
         # prevent_cse=True prevents XLA from merging common subexpressions
         # (e.g. shared embedding lookups on the same input_ids) across the
@@ -168,15 +170,15 @@ def on_policy_distillation_step(
             total_loss, loss_components = chunked_distillation_loss(
                 student_hidden=student_outputs.last_hidden_state,
                 teacher_hidden=teacher_hidden_for_kl,
-                student_lm_head_fn=module.apply_lm_head,
-                teacher_lm_head_fn=teacher_state.model.apply_lm_head,
+                student_lm_head_fn=module.make_lm_head_fn(),
+                teacher_lm_head_fn=teacher_state.model.make_lm_head_fn(),
                 attention_mask=attention_mask,
                 loss_mask=completion_mask,
                 labels=None,
                 use_hard_labels=False,
                 temperature=temperature,
                 alpha=alpha,
-                chunk_size=logits_chunk_size,
+                chunk_size=int(logits_chunk_size),
             )
         else:
             total_loss, loss_components = distillation_loss(

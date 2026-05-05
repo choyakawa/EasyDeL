@@ -29,7 +29,7 @@ class BCOConfig(TrainingArguments):
     """Configuration container for Binary Classifier Optimisation (BCO) training."""
 
     trainer_prefix: str | None = field(
-        default="bcotrainer",
+        default="BCO",
         metadata={"help": "Default prefix used when generating checkpoints or logging artifacts."},
     )
     beta: float = field(
@@ -58,6 +58,15 @@ class BCOConfig(TrainingArguments):
         default=None,
         metadata={
             "help": "Maximum number of completion tokens. Defaults to `max_length - max_prompt_length` if omitted."
+        },
+    )
+    logprob_vocab_chunk_size: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Vocabulary chunk size used when computing selected-token log probabilities. "
+                "Set to `None` to disable chunking."
+            )
         },
     )
     truncation_mode: tp.Literal["keep_end", "keep_start"] = field(
@@ -109,13 +118,23 @@ class BCOConfig(TrainingArguments):
         metadata={"help": "Maximum clamp applied to the estimated density ratio when UDM is enabled."},
     )
 
-    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
+    def __post_init__(
+        self,
+        max_sequence_length: int | None,
+        quantization_block: int | None,
+    ):
         self._handle_deprecated_max_sequence_length(max_sequence_length)
         if self.max_length is not None and self.max_prompt_length is not None:
             if self.max_completion_length is None:
                 self.max_completion_length = max(self.max_length - self.max_prompt_length, 0)
+        if self.logprob_vocab_chunk_size is not None:
+            normalized_chunk_size = int(self.logprob_vocab_chunk_size)
+            self.logprob_vocab_chunk_size = normalized_chunk_size if normalized_chunk_size > 0 else None
 
         if hasattr(super(), "__post_init__"):
-            super().__post_init__(max_sequence_length=None, quantization_block=quantization_block)
+            super().__post_init__(
+                max_sequence_length=None,
+                quantization_block=quantization_block,
+            )
 
     __hash__ = hash_fn

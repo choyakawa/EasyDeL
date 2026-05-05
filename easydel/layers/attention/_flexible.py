@@ -75,9 +75,9 @@ from easydel.caching import (
 )
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
-from easydel.operations import AttentionOutput, OperationMetadata, OperationRegistry
+from easydel.operations import AttentionOutput, OperationMetadata, OperationRegistry, ScaledDotProductAttn
 
-from ..quantization._quants import EasyQuantizer
+from ..quantization import EasyQuantizer, TurboQuantConfig
 
 logger = get_logger(__name__)
 
@@ -131,6 +131,8 @@ class AttentionMechanisms(StrEnum):
         CUDA_FLASH_ATTN2: CUDA-specific FlashAttention-2.
         RAGGED_PAGE_ATTENTION_V3: Paged attention for efficient inference.
         RAGGED_PAGE_ATTENTION_V2: Paged attention for efficient inference.
+        MULTI_LATENT_RAGGED_PAGE_ATTENTION_V1: MLA ragged page attention for
+            compressed-KV inference.
         UNIFIED_ATTENTION: vLLM-style unified paged attention (Triton).
         PAGED_FLASH_ATTENTION: FlashAttention with paged KV cache (CUDA).
         REGRESSIVE_DECODE: Optimized autoregressive decoding.
@@ -148,6 +150,8 @@ class AttentionMechanisms(StrEnum):
     CUDA_FLASH_ATTN2: str = "cuda_flash_attn2"
     RAGGED_PAGE_ATTENTION_V3: str = "ragged_page_attention_v3"
     RAGGED_PAGE_ATTENTION_V2: str = "ragged_page_attention_v2"
+    MULTI_LATENT_RAGGED_PAGE_ATTENTION_V1: str = "multi_latent_ragged_page_attention_v1"
+    MULTI_LATENT_RAGGED_PAGE_ATTENTION_V2: str = "multi_latent_ragged_page_attention_v2"
     PAGED_ATTENTION: str = "page_attention"
     UNIFIED_ATTENTION: str = "unified_attention"
     PAGED_FLASH_ATTENTION: str = "paged_flash_attention"
@@ -208,7 +212,15 @@ def get_optimal_config() -> tuple[AttentionMechanisms, jnp.dtype]:
         case "tpu":
             is_tpu_v3: bool = tpu_version_check("v3")
             if is_tpu_v3:
-                result_mechanism: AttentionMechanisms = AttentionMechanisms.FLASH_ATTN2
+                if jax.process_count() > 1:
+                    logger.warning_once(
+                        "FLASH_ATTN2 on multi-host TPU v3 may compile non-identical XLA programs "
+                        "across hosts and can fail at runtime; falling back to VANILLA attention."
+                    )
+                    result_mechanism: AttentionMechanisms = AttentionMechanisms.VANILLA
+                    result_dtype: jnp.dtype = jnp.bfloat16
+                    return result_mechanism, result_dtype
+                result_mechanism = AttentionMechanisms.FLASH_ATTN2
                 result_dtype: jnp.dtype = jnp.float32
                 return result_mechanism, result_dtype
             result_mechanism_v4: AttentionMechanisms = AttentionMechanisms.BLOCKSPARSE
@@ -374,6 +386,7 @@ class FlexibleAttentionModule(nn.Module):
         mask_value: float | None = None,
         vmem_limit_bytes: int | None = None,
         policy: tp.Any | None = None,
+        **extra_op_kwargs: tp.Any,
     ) -> AttentionOutput:
         """
         Performs the attention computation using the selected backend implementation.
@@ -419,15 +432,34 @@ class FlexibleAttentionModule(nn.Module):
                              attention weights (depending on the backend).
         """
         if isinstance(cache_view, RaggedPagesCacheView):
-            assert self.config.attn_mechanism in [
-                AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2,
-                AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3,
-            ]
+            # Check the actual impl name rather than the global config.attn_mechanism
+            # to support per-layer mechanism routing (e.g., mixed MLA / non-MLA models).
+            _impl_name = getattr(self.impl, "get_impl_name", lambda: None)()
+            if isinstance(_impl_name, tuple):
+                _impl_names = set(_impl_name)
+            elif _impl_name is not None:
+                _impl_names = {_impl_name}
+            else:
+                _impl_names = set()
+            _ragged_impls = {
+                "ragged_page_attention_v2",
+                "ragged_page_attention_v3",
+                "multi_latent_ragged_page_attention_v1",
+                "multi_latent_ragged_page_attention_v2",
+            }
+            if _impl_names and not (_impl_names & _ragged_impls):
+                raise ValueError(f"RaggedPagesCacheView requires a ragged-page impl but got {_impl_names}")
         elif isinstance(cache_view, UnifiedAttentionCacheView):
-            assert self.config.attn_mechanism in [
-                AttentionMechanisms.UNIFIED_ATTENTION,
-                AttentionMechanisms.PAGED_FLASH_ATTENTION,
-            ]
+            _impl_name = getattr(self.impl, "get_impl_name", lambda: None)()
+            if isinstance(_impl_name, tuple):
+                _impl_names = set(_impl_name)
+            elif _impl_name is not None:
+                _impl_names = {_impl_name}
+            else:
+                _impl_names = set()
+            _unified_impls = {"unified_attention", "paged_flash_attention"}
+            if _impl_names and not (_impl_names & _unified_impls):
+                raise ValueError(f"UnifiedAttentionCacheView requires a unified impl but got {_impl_names}")
 
         if deterministic is None:
             deterministic_computed = self.deterministic
@@ -454,6 +486,42 @@ class FlexibleAttentionModule(nn.Module):
             policy_computed = jax.checkpoint_policies.nothing_saveable
         else:
             policy_computed = policy
+
+        def _get_impl_names(impl: tp.Any) -> set[str]:
+            impl_name = getattr(impl, "get_impl_name", lambda: None)()
+            if isinstance(impl_name, tuple):
+                return {str(name) for name in impl_name}
+            if impl_name is None:
+                return set()
+            return {str(impl_name)}
+
+        def _maybe_route_varlen_multihost_tpu_attention(callable_attn: tp.Any) -> tp.Any:
+            if jax.default_backend() != "tpu" or jax.process_count() <= 1:
+                return callable_attn
+            if cum_seqlens_q is None and cum_seqlens_k is None:
+                return callable_attn
+            impl_names = _get_impl_names(callable_attn)
+            if AttentionMechanisms.VANILLA not in impl_names:
+                return callable_attn
+            if not (query_states.shape[-1] == key_states.shape[-1] == value_states.shape[-1]):
+                raise ValueError(
+                    "Cannot preserve cumulative-sequence attention on multi-host TPU with VANILLA "
+                    "attention when query/key/value head dimensions differ."
+                )
+            unsupported_sdpa_features = ScaledDotProductAttn.get_unsupported_fallback_features(
+                softmax_aux=softmax_aux,
+                logits_soft_cap=logits_soft_cap,
+            )
+            if unsupported_sdpa_features:
+                raise ValueError(
+                    "Cannot route cumulative-sequence attention through SDPA on multi-host TPU "
+                    f"because {', '.join(unsupported_sdpa_features)} are not supported by the SDPA fallback."
+                )
+            logger.warning_once(
+                "Routing cumulative-sequence attention through SDPA on multi-host TPU "
+                "because VANILLA attention does not support cum_seqlens_*."
+            )
+            return ScaledDotProductAttn(metadata=self.metadata)
 
         with self.config.mesh:  # pyright: ignore[reportOptionalContextManager]
             input_dict: dict[str, tp.Any] = dict(
@@ -484,24 +552,35 @@ class FlexibleAttentionModule(nn.Module):
                 mask_value=mask_value,
                 vmem_limit_bytes=vmem_limit_bytes,
                 policy=policy_computed,
+                **extra_op_kwargs,
             )
             is_decode_mode: bool = mode == common_types.MODE_DECODE
             output: AttentionOutput
             if is_decode_mode:
-                cache_view_is_none: bool = cache_view is None
-                assert not cache_view_is_none
+                if cache_view is None:
+                    raise ValueError("Decode mode requires a cache_view, but None was provided.")
                 has_decode_impl: bool = self.impl_decode is not None
                 callable_attn: tp.Any = self.impl_decode if has_decode_impl else self.impl
+                callable_attn = _maybe_route_varlen_multihost_tpu_attention(callable_attn)
                 output = callable_attn(**input_dict)
             else:
-                output = self.impl(**input_dict)
+                callable_attn = _maybe_route_varlen_multihost_tpu_attention(self.impl)
+                output = callable_attn(**input_dict)
 
         target_dtype: jnp.dtype = self.impl.metadata.runtime_dtype
 
         def cast_to_dtype(x: tp.Any) -> tp.Any:
             return x.astype(target_dtype)
 
-        result: AttentionOutput = jtu.tree_map(cast_to_dtype, output)
+        # Only cast attention_outputs and attention_weights — leave cache_view
+        # untouched to preserve original dtypes (e.g. uint8 for TurboQuant pages).
+        result = AttentionOutput(
+            attention_outputs=jtu.tree_map(cast_to_dtype, output.attention_outputs),
+            attention_weights=(
+                jtu.tree_map(cast_to_dtype, output.attention_weights) if output.attention_weights is not None else None
+            ),
+            cache_view=output.cache_view,
+        )
         return result
 
     __call__ = forward
@@ -751,12 +830,19 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         Provides an EasyQuantizer instance based on the module's configuration.
 
         Used for quantizing KV cache entries if enabled in the config.
+        For TurboQuant configs, returns a no-op quantizer since TurboQuant
+        handles compression inside the kernel.
 
         Returns:
             EasyQuantizer: The quantizer instance.
         """
+        kv_quant_cfg = self.config.kv_cache_quantization_config
+
+        if isinstance(kv_quant_cfg, TurboQuantConfig):
+            return EasyQuantizer(quantization_config=None)
+
         quantizer_instance: EasyQuantizer = EasyQuantizer(
-            quantization_config=self.config.kv_cache_quantization_config,
+            quantization_config=kv_quant_cfg,
         )
         return quantizer_instance
 
@@ -952,7 +1038,13 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
 
         @partial(jax.vmap, in_axes=(0, 0, 0, 0, 0, None), out_axes=(0, 0, 0))
         def _select_slices(ikey, ival, imsk, offset, index, mode_):
-            row = offset + jax.lax.broadcasted_iota(jnp.int32, (Q, 1), 0)  # (Q,1)
+            base_row = offset + jax.lax.broadcasted_iota(jnp.int32, (Q, 1), 0)  # (Q,1)
+            if mode_ == common_types.MODE_DECODE:
+                # `index` is the post-update cache length, so the active query rows
+                # correspond to the trailing `[index - Q, ..., index - 1]` range.
+                row = (index - Q) + base_row
+            else:
+                row = base_row
 
             col = jax.lax.broadcasted_iota(jnp.int32, (1, K), 1)  # (1,K)
             win = (col >= (row - left_window)) & (col <= (row + right_window))  # (Q,K)
@@ -960,10 +1052,10 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
             imsk = imsk & win[None, :, :]  # (H=1, Q, K)
 
             if mode_ == common_types.MODE_DECODE:
-                # Slice to a centered (as possible) window at 'index'
-                start_k = jnp.clip(index - left_window, 0, jnp.maximum(K - width, 0))
-                # Reduce Q to the current row (Q->1)
-                imsk = jax.lax.dynamic_slice_in_dim(imsk, index, 1, axis=1)  # (H,1,K)
+                # The active query rows are already local to the current decode step
+                # (typically Q=1), so only the KV axis needs window slicing.
+                current_row = index - 1
+                start_k = jnp.clip(current_row - left_window, 0, jnp.maximum(K - width, 0))
                 imsk = jax.lax.dynamic_slice_in_dim(imsk, start_k, width, axis=2)  # (H,1,width)
                 # Slice KV tensors along K
                 ikey = jax.lax.dynamic_slice_in_dim(ikey, start_k, width, axis=0)  # (width, ...)
@@ -983,7 +1075,7 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
 
         key, value, attn = _select_slices(key, value, attn, offsets, indexs, mode)
 
-        mask_info = mask_info.replace(attention_mask=attn)
+        mask_info = mask_info.replace(attention_mask=attn, sliding_window_baked_in=True)
 
         if cache_metadata is not None and mode == common_types.MODE_DECODE:
             passed = cache_metadata.indexs - cache_metadata.starts
@@ -1081,7 +1173,14 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
                 )
                 return bias
 
-            return key, value, mask_info, init_attention_bias, cache_view, cache_metadata  # pyright: ignore[reportReturnType]
+            return (
+                key,
+                value,
+                mask_info,
+                init_attention_bias,
+                cache_view,
+                cache_metadata,
+            )  # pyright: ignore[reportReturnType]
 
         if cache_view is not None and cache_view.key is not None:
             query_batch: int = query.shape[0]
@@ -1147,7 +1246,14 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
             bias: Array = mask_info.create_bias(dtype_self)
             return bias
 
-        return key, value, mask_info, init_attention_bias, cache_view, cache_metadata  # pyright: ignore[reportReturnType]
+        return (
+            key,
+            value,
+            mask_info,
+            init_attention_bias,
+            cache_view,
+            cache_metadata,
+        )  # pyright: ignore[reportReturnType]
 
     def shard_attention_prod(
         self, attn_output: Float[JArray, "batch seq heads dim"]

@@ -20,7 +20,7 @@ from easydel.utils.compiling_utils import hash_fn
 
 from ..training_configurations import TrainingArguments
 
-LOSS_FN_VARIENTS = tp.Literal[
+LOSS_FN_VARIANTS = tp.Literal[
     "sigmoid",
     "hinge",
     "ipo",
@@ -51,7 +51,7 @@ class DPOConfig(TrainingArguments):
             Higher values make training focus more on preference matching. Default: 0.1
         label_smoothing (float): Smoothing factor for labels in loss calculation.
             Helps prevent overconfidence. 0.0 means no smoothing. Default: 0.0
-        loss_type (LOSS_FN_VARIENTS): Type of contrastive loss function to use.
+        loss_type (LOSS_FN_VARIANTS): Type of contrastive loss function to use.
             Valid options: 'sigmoid', 'hinge', 'ipo', 'exo_pair', 'nca_pair', 'robust',
             'bco_pair', 'sppo_hard', 'aot', 'aot_pair', 'apo_zero', 'apo_down'.
             Default: 'sigmoid'
@@ -87,6 +87,9 @@ class DPOConfig(TrainingArguments):
             Default: 64
         rpo_alpha (float | None): Alpha parameter for Relative Preference Optimization.
             None disables RPO. Default: None
+        logprob_vocab_chunk_size (int): Vocabulary chunk size used when computing
+            selected-token log probabilities for DPO. Set to 0 to disable
+            chunking and use the full vocab in one pass. Default: 4096
         tools (list[dict | Callable] | None): Additional tools for training process
 
     Example:
@@ -96,28 +99,33 @@ class DPOConfig(TrainingArguments):
     """
 
     trainer_prefix: str | None = field(
-        default="dpotrainer",
+        default="DPO",
         metadata={"help": "default prefix name for trainer."},
     )
     beta: float = field(
         default=0.1,
         metadata={
-            "help": "Temperature parameter (β) controlling deviation from reference model. Higher values make training"
-            " focus more on preference matching."
+            "help": (
+                "Temperature parameter (β) controlling deviation from reference model. Higher values make training"
+                " focus more on preference matching."
+            )
         },
     )
     label_smoothing: float = field(
         default=0.0,
         metadata={
-            "help": "Smoothing factor for labels in loss calculation. Helps prevent overconfidence. "
-            "0.0 means no smoothing."
+            "help": (
+                "Smoothing factor for labels in loss calculation. Helps prevent overconfidence. 0.0 means no smoothing."
+            )
         },
     )
-    loss_type: LOSS_FN_VARIENTS = field(
+    loss_type: LOSS_FN_VARIANTS = field(
         default="sigmoid",
         metadata={
-            "help": "Type of contrastive loss function to use. Valid options: 'sigmoid', 'hinge', 'ipo', 'exo_pair', "
-            "'nca_pair', 'robust', 'bco_pair', 'sppo_hard', 'aot', 'aot_pair', 'apo_zero', 'apo_down'."
+            "help": (
+                "Type of contrastive loss function to use. Valid options: 'sigmoid', 'hinge', 'ipo', 'exo_pair', "
+                "'nca_pair', 'robust', 'bco_pair', 'sppo_hard', 'aot', 'aot_pair', 'apo_zero', 'apo_down'."
+            )
         },
     )
     use_weighting: bool = field(
@@ -190,18 +198,37 @@ class DPOConfig(TrainingArguments):
         default=None,
         metadata={"help": "Alpha parameter for Relative Preference Optimization. None disables RPO."},
     )
+    logprob_vocab_chunk_size: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Vocabulary chunk size used when computing selected-token log probabilities for DPO. "
+                "Set to `None` to disable chunking."
+            )
+        },
+    )
     tools: list[dict | tp.Callable] | None = field(
         default=None,
         metadata={"help": "Additional tools for training process."},
     )
 
-    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
+    def __post_init__(
+        self,
+        max_sequence_length: int | None,
+        quantization_block: int | None,
+    ):
         """Post-initialization processing to derive dependent parameters."""
         self._handle_deprecated_max_sequence_length(max_sequence_length)
         if self.max_completion_length is None:
             self.max_completion_length = self.max_length - self.max_prompt_length
+        if self.logprob_vocab_chunk_size is not None:
+            normalized_chunk_size = int(self.logprob_vocab_chunk_size)
+            self.logprob_vocab_chunk_size = normalized_chunk_size if normalized_chunk_size > 0 else None
         # Call the post_init of the parent class if it exists. Important for inheritance
         if hasattr(super(), "__post_init__"):
-            super().__post_init__(max_sequence_length=None, quantization_block=quantization_block)
+            super().__post_init__(
+                max_sequence_length=None,
+                quantization_block=quantization_block,
+            )
 
     __hash__ = hash_fn

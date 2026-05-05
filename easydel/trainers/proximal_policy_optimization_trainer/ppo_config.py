@@ -46,7 +46,7 @@ class PPOConfig(TrainingArguments):
     """
 
     trainer_prefix: str | None = field(
-        default="ppotrainer",
+        default="PPO",
         metadata={"help": "Default prefix name for trainer outputs/checkpoints."},
     )
     remove_unused_columns: bool | None = field(
@@ -109,9 +109,11 @@ class PPOConfig(TrainingArguments):
         default=True,
         metadata={"help": "Whether to normalize advantages to zero mean / unit variance."},
     )
-    entropy_coef: float = field(
-        default=0.0,
-        metadata={"help": "Optional entropy bonus coefficient (0 disables)."},
+    entropy_coef: float | None = field(
+        default=None,
+        metadata={
+            "help": "Optional entropy bonus coefficient. Set to `None` to disable; `0` is accepted for backward compatibility."
+        },
     )
     missing_eos_penalty: float | None = field(
         default=None,
@@ -151,6 +153,14 @@ class PPOConfig(TrainingArguments):
         default=None,
         metadata={"help": "Top-k sampling parameter. None disables top-k."},
     )
+    presence_penalty: float = field(
+        default=0.0,
+        metadata={"help": "Presence penalty applied during generation."},
+    )
+    frequency_penalty: float = field(
+        default=0.0,
+        metadata={"help": "Frequency penalty applied during generation."},
+    )
     min_p: float | None = field(
         default=None,
         metadata={"help": "Minimum token probability threshold (see HF top-p-min sampling)."},
@@ -171,8 +181,21 @@ class PPOConfig(TrainingArguments):
         default=False,
         metadata={"help": "If True, drop completions that do not terminate with EOS from loss calculation."},
     )
+    logprob_vocab_chunk_size: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Vocabulary chunk size used when computing per-token log probabilities and entropies. "
+                "Set to `None` to disable chunking."
+            )
+        },
+    )
 
-    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
+    def __post_init__(
+        self,
+        max_sequence_length: int | None,
+        quantization_block: int | None,
+    ):
         self._handle_deprecated_max_sequence_length(max_sequence_length)
 
         if self.max_length is not None:
@@ -188,8 +211,19 @@ class PPOConfig(TrainingArguments):
             self.num_generations = self.num_return_sequences
         else:
             self.num_return_sequences = self.num_generations
+        if self.generation_temperature is None:
+            self.generation_temperature = self.temperature
+        if self.entropy_coef is not None:
+            normalized_entropy_coef = float(self.entropy_coef)
+            self.entropy_coef = normalized_entropy_coef if normalized_entropy_coef > 0.0 else None
+        if self.logprob_vocab_chunk_size is not None:
+            normalized_chunk_size = int(self.logprob_vocab_chunk_size)
+            self.logprob_vocab_chunk_size = normalized_chunk_size if normalized_chunk_size > 0 else None
 
         if hasattr(super(), "__post_init__"):
-            super().__post_init__(max_sequence_length=None, quantization_block=quantization_block)
+            super().__post_init__(
+                max_sequence_length=None,
+                quantization_block=quantization_block,
+            )
 
     __hash__ = hash_fn

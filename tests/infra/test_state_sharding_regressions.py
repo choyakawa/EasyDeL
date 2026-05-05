@@ -1,3 +1,17 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import re
 
 import jax
@@ -97,9 +111,9 @@ def test_partition_rules_match_optimizer_value_paths(tiny_sharded_llama):
         spec for spec in jax.tree_util.tree_leaves(partition_specs) if isinstance(spec, jax.sharding.PartitionSpec)
     ]
     assert spec_leaves, "Expected optimizer partition-spec leaves."
-    assert any(
-        _has_sharded_axis(spec) for spec in spec_leaves
-    ), "Optimizer partition specs unexpectedly collapsed to replicated-only specs."
+    assert any(_has_sharded_axis(spec) for spec in spec_leaves), (
+        "Optimizer partition specs unexpectedly collapsed to replicated-only specs."
+    )
 
 
 def test_partition_rules_are_open_ended_for_state_suffixes(tiny_sharded_llama):

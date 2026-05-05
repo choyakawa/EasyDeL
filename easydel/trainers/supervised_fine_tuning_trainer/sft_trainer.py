@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import typing as tp
 
+import numpy as np
 from eformer.loggings import get_logger
 
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -148,7 +149,7 @@ class SFTTrainer(Trainer):
         mask_prompt = bool(getattr(self.arguments, "assistant_only_loss", False))
         completion_only_loss = getattr(self.arguments, "completion_only_loss", None)
         if completion_only_loss is not None:
-            mask_prompt = mask_prompt or bool(completion_only_loss)
+            mask_prompt = bool(completion_only_loss)
 
         return SFTPreprocessTransform(
             tokenizer=self.processing_class,
@@ -223,3 +224,45 @@ class SFTTrainer(Trainer):
                 strategy=strategy,
                 include_segment_ids=True,
             )
+
+    def _preprocess_batch_input(
+        self,
+        state: EasyDeLState,
+        batch: dict[str, tp.Any],
+        is_train: bool,
+    ) -> tuple[dict[str, tp.Any], dict[str, float | int | str]]:
+        batch, infos = super()._preprocess_batch_input(state=state, batch=batch, is_train=is_train)
+
+        if "assistant_masks" in batch:
+            if "completion_mask" not in batch:
+                batch["completion_mask"] = batch["assistant_masks"]
+            batch.pop("assistant_masks", None)
+
+        attention_mask = batch.get("attention_mask")
+        completion_mask = batch.get("completion_mask")
+
+        if completion_mask is not None:
+            completion_mask_np = np.asarray(completion_mask)
+            if attention_mask is not None:
+                completion_mask_np = completion_mask_np * np.asarray(attention_mask)
+            completion_dtype = (
+                np.asarray(attention_mask).dtype if attention_mask is not None else completion_mask_np.dtype
+            )
+            batch["completion_mask"] = completion_mask_np.astype(completion_dtype, copy=False)
+
+            if "labels" not in batch and "input_ids" in batch:
+                labels = np.asarray(batch["input_ids"]).astype(np.int32, copy=True)
+                labels[completion_mask_np == 0] = -100
+                if attention_mask is not None:
+                    labels[np.asarray(attention_mask) == 0] = -100
+                batch["labels"] = labels
+
+        if "labels" in batch and "completion_mask" not in batch:
+            labels_np = np.asarray(batch["labels"])
+            if (labels_np == -100).any():
+                completion_mask_np = (labels_np != -100).astype(np.int32)
+                if attention_mask is not None:
+                    completion_mask_np = completion_mask_np * np.asarray(attention_mask)
+                batch["completion_mask"] = completion_mask_np
+
+        return batch, infos

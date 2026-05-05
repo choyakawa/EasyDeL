@@ -64,7 +64,6 @@ from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax import numpy as jnp
-from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
 from easydel.caching import (
@@ -76,7 +75,7 @@ from easydel.caching import (
     TransformerMetadata,
 )
 from easydel.infra.modeling_outputs import CausalLMOutput, MoeCausalLMOutput
-from easydel.infra.utils import auto_remat
+from easydel.infra.utils import auto_remat as auto_remat
 from easydel.layers import ColumnParallelLinear
 
 from ._base_task_module import BaseTaskModule, ConfigT, ModelT
@@ -251,7 +250,17 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         # Store LM head name for dynamic access
         self._lm_head_name = lm_head_name
 
-        # Create LM head with optional gradient checkpointing
+        # Create LM head with optional gradient checkpointing.
+        #
+        # NOTE: nn.remat on the lm_head is important for large-vocab models
+        # (e.g. [B, 8192, 260k] → ~34 GB in bf16).  However, nn.remat's
+        # split/merge protocol mutates NNX Variables (update_from_state),
+        # which triggers flax.errors.TraceContextError when trainer chunked
+        # paths call lm_head.__call__ from inside jax.lax.scan / fori_loop.
+        #
+        # The model's make_lm_head_fn() provides a trace-safe bypass that
+        # calls native_forward directly (reads-only, no nn.remat wrapper),
+        # so trainers should use that contract inside traced loops.
 
         if self._gradient_checkpointing_feature.should_checkpoint():
             lm_head_class = auto_remat(
@@ -259,7 +268,6 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
                 **self._gradient_checkpointing_feature.get_config(),
             )
 
-        # Create LM head with custom attribute name
         lm_head = lm_head_class(
             config.hidden_size,
             config.vocab_size,
@@ -384,20 +392,9 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
 
         outputs = self.base_model(**base_model_kwargs)
 
-        hidden_states = outputs.last_hidden_state
-
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-
         lm_logits = None
         if apply_lm_head:
-            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
-
-            # Apply logit capping if configured
-            lm_logits = self.apply_logit_cap(lm_logits)
+            lm_logits = self.compute_lm_logits(self.prepare_lm_head_inputs(outputs.last_hidden_state))
 
         # Compute router auxiliary loss if configured
         aux_loss = self.compute_router_aux_loss(outputs)
@@ -522,8 +519,7 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
 
         logits = None
         if apply_lm_head:
-            logits = checkpoint_name(self.apply_lm_head(outputs.last_hidden_state), "lm_head_output")
-            logits = self.apply_logit_cap(logits)
+            logits = self.compute_lm_logits(self.prepare_lm_head_inputs(outputs.last_hidden_state))
 
         aux_loss = None
         if aux_loss_fn is not None and mode not in [
@@ -583,6 +579,19 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         w = self.get_embedding().embedding.value.T if tie_embeddings else None
         lm_head = getattr(self, self._lm_head_name)
         return lm_head(hidden_states, w=w)
+
+    def prepare_lm_head_inputs(self, hidden_states: Array) -> Array:
+        """Apply the shared pre-LM-head hidden-state transform."""
+        return apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
+
+    def compute_lm_logits(self, hidden_states: Array) -> Array:
+        """Project hidden states to logits using the shared LM-head path."""
+
+        return super().compute_lm_logits(hidden_states)
 
     def get_task_head(self):
         """Returns the language modeling head module.

@@ -49,11 +49,14 @@ class SparseDistillationConfig(DistillationConfig):
         temperature_sampling: Sampling temperature for generation.
         top_k: Top-k sampling parameter for generation.
         top_p: Top-p (nucleus) sampling parameter for generation.
+        presence_penalty: Presence penalty for generation.
+        frequency_penalty: Frequency penalty for generation.
+        repetition_penalty: Repetition penalty for generation.
         skip_apply_chat_template: Whether to skip chat template application.
     """
 
     trainer_prefix: str | None = field(
-        default="sparsedistillationtrainer",
+        default="SparseDistillation",
         metadata={"help": "Prefix used for trainer logs, checkpoints, and wandb runs."},
     )
     remove_unused_columns: bool | None = field(
@@ -95,12 +98,28 @@ class SparseDistillationConfig(DistillationConfig):
         default=0.95,
         metadata={"help": "Top-p (nucleus) sampling parameter for generation."},
     )
+    presence_penalty: float = field(
+        default=0.0,
+        metadata={"help": "Presence penalty applied during generation."},
+    )
+    frequency_penalty: float = field(
+        default=0.0,
+        metadata={"help": "Frequency penalty applied during generation."},
+    )
+    repetition_penalty: float = field(
+        default=1.0,
+        metadata={"help": "Repetition penalty applied during generation."},
+    )
     skip_apply_chat_template: bool = field(
         default=False,
         metadata={"help": "Whether to skip chat template application on prompts."},
     )
 
-    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
+    def __post_init__(
+        self,
+        max_sequence_length: int | None,
+        quantization_block: int | None,
+    ):
         if self.top_k_teacher < 1:
             raise ValueError(f"`top_k_teacher` must be >= 1, got {self.top_k_teacher}.")
 
@@ -123,6 +142,9 @@ class SparseDistillationConfig(DistillationConfig):
         self.max_length = self.max_prompt_length + self.max_completion_length
 
         if hasattr(super(), "__post_init__"):
-            super().__post_init__(max_sequence_length=None, quantization_block=quantization_block)
+            super().__post_init__(
+                max_sequence_length=None,
+                quantization_block=quantization_block,
+            )
 
     __hash__ = hash_fn

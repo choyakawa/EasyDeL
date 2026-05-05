@@ -46,11 +46,14 @@ class SeqKDConfig(TrainingArguments):
         temperature_sampling: Sampling temperature for generation.
         top_k: Top-k sampling parameter for generation.
         top_p: Top-p (nucleus) sampling parameter for generation.
+        presence_penalty: Presence penalty for generation.
+        frequency_penalty: Frequency penalty for generation.
+        repetition_penalty: Repetition penalty for generation.
         skip_apply_chat_template: Whether to skip chat template application.
     """
 
     trainer_prefix: str | None = field(
-        default="seqkdtrainer",
+        default="SeqKD",
         metadata={"help": "Prefix used for trainer logs, checkpoints, and wandb runs."},
     )
     remove_unused_columns: bool | None = field(
@@ -81,12 +84,28 @@ class SeqKDConfig(TrainingArguments):
         default=0.95,
         metadata={"help": "Top-p (nucleus) sampling parameter for generation."},
     )
+    presence_penalty: float = field(
+        default=0.0,
+        metadata={"help": "Presence penalty applied during generation."},
+    )
+    frequency_penalty: float = field(
+        default=0.0,
+        metadata={"help": "Frequency penalty applied during generation."},
+    )
+    repetition_penalty: float = field(
+        default=1.0,
+        metadata={"help": "Repetition penalty applied during generation."},
+    )
     skip_apply_chat_template: bool = field(
         default=False,
         metadata={"help": "Whether to skip chat template application on prompts."},
     )
 
-    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
+    def __post_init__(
+        self,
+        max_sequence_length: int | None,
+        quantization_block: int | None,
+    ):
         default_completion = type(self).__dataclass_fields__["max_completion_length"].default
         if self.max_length is not None:
             if self.max_length < self.max_prompt_length:
@@ -106,6 +125,9 @@ class SeqKDConfig(TrainingArguments):
         self.max_length = self.max_prompt_length + self.max_completion_length
 
         if hasattr(super(), "__post_init__"):
-            super().__post_init__(max_sequence_length=None, quantization_block=quantization_block)
+            super().__post_init__(
+                max_sequence_length=None,
+                quantization_block=quantization_block,
+            )
 
     __hash__ = hash_fn

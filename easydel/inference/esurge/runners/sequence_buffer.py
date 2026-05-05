@@ -112,6 +112,15 @@ def build_sampling_arrays(temperature, min_p, top_p, top_k, num_reqs, padded_num
     """
 
     def fill(arr, fill_val):
+        """Create a padded array filled with a default value and active entries copied in.
+
+        Args:
+            arr: Source array containing active sampling parameter values.
+            fill_val: Default value used for padding slots beyond num_reqs.
+
+        Returns:
+            Padded array of shape (padded_num_reqs,) with active values at the front.
+        """
         out = jnp.full((padded_num_reqs,), fill_val, dtype=arr.dtype)
         return out.at[:num_reqs].set(arr[:num_reqs])
 
@@ -324,6 +333,7 @@ class SequenceBuffer:
         self.logit_bias: list[dict[int, float] | None] = [None] * max_num_reqs
         self.bad_words_token_ids: dict[int, list[list[int]]] = {}
         self.allowed_token_ids_mask: jax.Array | None = None
+        self._layout_version = 0
 
     def _update_request_distribution(self) -> None:
         """Update the request distribution triple [decode_only, chunked_prefill, total]."""
@@ -332,10 +342,12 @@ class SequenceBuffer:
 
     @property
     def req_ids(self) -> list[str | None]:
+        """List of request IDs indexed by row slot, with None for empty slots."""
         return self._req_ids
 
     @property
     def num_reqs(self) -> int:
+        """Number of active requests currently in the buffer."""
         return len(self.req_id_to_index)
 
     @property
@@ -344,27 +356,38 @@ class SequenceBuffer:
         return len(self._req_ids)
 
     @property
+    def layout_version(self) -> int:
+        """Monotonic version for row-layout or membership changes."""
+        return self._layout_version
+
+    @property
     def all_greedy(self) -> bool:
+        """Whether all active requests use greedy (deterministic) sampling."""
         return len(self.random_reqs) == 0
 
     @property
     def all_random(self) -> bool:
+        """Whether all active requests use random (stochastic) sampling."""
         return len(self.greedy_reqs) == 0
 
     @property
     def no_top_p(self) -> bool:
+        """Whether no active requests use top-p (nucleus) sampling."""
         return len(self.top_p_reqs) == 0
 
     @property
     def no_top_k(self) -> bool:
+        """Whether no active requests use top-k sampling."""
         return len(self.top_k_reqs) == 0
 
     @property
     def no_min_p(self) -> bool:
+        """Whether no active requests use min-p sampling."""
         return len(self.min_p_reqs) == 0
 
     @property
     def no_penalties(self) -> bool:
+        """Whether no active requests use any penalty (presence, frequency, or repetition)."""
         return (
             len(self.presence_penalties_reqs) == 0
             and len(self.frequency_penalties_reqs) == 0
@@ -373,14 +396,17 @@ class SequenceBuffer:
 
     @property
     def max_num_logprobs(self) -> int | None:
+        """Maximum number of log probabilities requested across all active requests, or None if none."""
         return max(self.num_logprobs.values()) if self.num_logprobs else None
 
     @property
     def no_prompt_logprob(self) -> bool:
+        """Whether no active requests need prompt log probabilities."""
         return not self.num_prompt_logprobs
 
     @property
     def no_allowed_token_ids(self) -> bool:
+        """Whether no active requests have constrained token ID sets."""
         return len(self.has_allowed_token_ids) == 0
 
     def _ensure_logit_bias_capacity(self, upto_idx: int) -> None:
@@ -458,10 +484,12 @@ class SequenceBuffer:
 
         # Sampling params
         sampling_params = request.sampling_params
-        assert sampling_params is not None, "pooling requests not supported yet"
+        if sampling_params is None:
+            raise ValueError("pooling requests not supported yet")
         self._process_sampling_params(sampling_params, req_id, req_index)
         self._process_optional_params(request, sampling_params, req_id, req_index)
         self._update_request_distribution()
+        self._layout_version += 1
 
     def remove_request(self, req_id: str) -> int | None:
         """Remove a request from the buffer.
@@ -503,7 +531,7 @@ class SequenceBuffer:
         self.num_tokens_no_spec[req_index] = 0
         self.num_prompt_tokens[req_index] = 0
         self.num_computed_tokens[req_index] = 0
-        self.page_table.add_row([[] for _ in self.page_table.page_tables], req_index)
+        self.page_table.clear_row(req_index)
 
         for req_set in [
             self.greedy_reqs,
@@ -541,6 +569,7 @@ class SequenceBuffer:
             self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[req_index].set(False)
 
         self._update_request_distribution()
+        self._layout_version += 1
         return req_index
 
     def compact_holes_in_range(self, lo: int, hi: int) -> None:
@@ -557,55 +586,9 @@ class SequenceBuffer:
         """
         write = lo
         for read in range(lo, hi):
-            req_id = self._req_ids[read]
-            if req_id is not None:
+            if self._req_ids[read] is not None:
                 if read != write:
-                    # Move request from 'read' to 'write' (write is a hole)
-                    self._req_ids[write] = req_id
-                    self._req_ids[read] = None
-                    self.req_id_to_index[req_id] = write
-                    self.req_output_token_ids[write] = self.req_output_token_ids[read]
-                    self.req_output_token_ids[read] = None
-                    # NumPy array rows: copy then clear source
-                    self.token_ids[write] = self.token_ids[read]
-                    self.token_ids[read] = 0
-                    self.num_tokens[write] = self.num_tokens[read]
-                    self.num_tokens[read] = 0
-                    self.num_tokens_no_spec[write] = self.num_tokens_no_spec[read]
-                    self.num_tokens_no_spec[read] = 0
-                    self.num_prompt_tokens[write] = self.num_prompt_tokens[read]
-                    self.num_prompt_tokens[read] = 0
-                    self.num_computed_tokens[write] = self.num_computed_tokens[read]
-                    self.num_computed_tokens[read] = 0
-                    self.temperature[write] = self.temperature[read]
-                    self.temperature[read] = -1.0
-                    self.top_p[write] = self.top_p[read]
-                    self.top_p[read] = 1.0
-                    self.top_k[write] = self.top_k[read]
-                    self.top_k[read] = 0
-                    self.min_p[write] = self.min_p[read]
-                    self.min_p[read] = 0.0
-                    self.frequency_penalties[write] = self.frequency_penalties[read]
-                    self.frequency_penalties[read] = 0.0
-                    self.presence_penalties[write] = self.presence_penalties[read]
-                    self.presence_penalties[read] = 0.0
-                    self.repetition_penalties[write] = self.repetition_penalties[read]
-                    self.repetition_penalties[read] = 1.0
-                    # Page table
-                    self.page_table.swap_row(write, read)
-                    # Dict-based fields
-                    for d in (self.generator_seeds, self.min_tokens, self.bad_words_token_ids):
-                        if read in d:
-                            d[write] = d.pop(read)
-                        else:
-                            d.pop(write, None)
-                    self.logit_bias[write] = self.logit_bias[read]
-                    self.logit_bias[read] = None
-                    if self.allowed_token_ids_mask is not None:
-                        self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[write].set(
-                            self.allowed_token_ids_mask[read]
-                        )
-                        self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[read].set(False)
+                    self._move_request(read, write)
                 write += 1
         if write < hi:
             self._update_request_distribution()
@@ -621,14 +604,17 @@ class SequenceBuffer:
             i2: Index of the second request.
 
         Raises:
-            AssertionError: If either index doesn't contain a valid request.
+            RuntimeError: If either index doesn't contain a valid request.
 
         Note:
             This method modifies the buffer in-place.
             Useful for buffer reorganization and optimization.
         """
         old_id_i1, old_id_i2 = self._req_ids[i1], self._req_ids[i2]
-        assert old_id_i1 is not None and old_id_i2 is not None
+        if old_id_i1 is None or old_id_i2 is None:
+            raise RuntimeError(
+                f"both indices must contain valid requests, but got req_id at i1={old_id_i1}, req_id at i2={old_id_i2}"
+            )
         self._req_ids[i1], self._req_ids[i2] = old_id_i2, old_id_i1
         self.req_output_token_ids[i1], self.req_output_token_ids[i2] = (
             self.req_output_token_ids[i2],
@@ -663,6 +649,7 @@ class SequenceBuffer:
         self.page_table.swap_row(i1, i2)
 
         self._update_request_distribution()
+        self._layout_version += 1
 
     def condense(self, empty_req_indices: list[int]) -> None:
         """Condense the buffer by removing gaps.
@@ -684,15 +671,10 @@ class SequenceBuffer:
             self.req_output_token_ids.clear()
             return
 
-        last_req_index = num_reqs + len(empty_req_indices) - 1
+        if not empty_req_indices:
+            return
 
-        for empty_index in reversed(empty_req_indices):
-            while last_req_index in empty_req_indices and last_req_index > empty_index:
-                last_req_index -= 1
-            if empty_index >= last_req_index:
-                continue
-            self._move_request(last_req_index, empty_index)
-            last_req_index -= 1
+        self.compact_holes_in_range(0, len(self._req_ids))
 
         del self._req_ids[self.num_reqs :]
         del self.req_output_token_ids[self.num_reqs :]
@@ -702,20 +684,23 @@ class SequenceBuffer:
         """Move a request from one index to another.
 
         Internal method for relocating a request within the buffer.
+        Gracefully skips empty slots (None req_id) to avoid crashes
+        during dynamic batching when prompt count < max_num_seqs.
 
         Args:
             from_idx: Source index of the request.
             to_idx: Destination index for the request.
 
-        Raises:
-            AssertionError: If from_idx doesn't contain a valid request.
-
         Note:
             This is an internal method used by condense() and other
             buffer reorganization operations. Modifies the buffer in-place.
+            If from_idx contains an empty slot (None req_id), the call
+            is a no-op to prevent desync between bookkeeping and arrays.
         """
         req_id = self._req_ids[from_idx]
-        assert req_id is not None
+        if req_id is None:
+            logger.debug("_move_request called on empty slot from_idx=%s", from_idx)
+            return
 
         # Static bookkeeping
         self._req_ids[to_idx] = req_id
@@ -724,25 +709,40 @@ class SequenceBuffer:
         self.req_output_token_ids[from_idx] = None
         self.req_id_to_index[req_id] = to_idx
 
-        # Arrays - update in-place
+        # Arrays - copy to destination then zero source to keep
+        # JAX array pointers and internal bookkeeping in sync.
         self.token_ids = move_row(self.token_ids, from_idx, to_idx)
+        self.token_ids[from_idx] = 0
         self.num_tokens = move_row(self.num_tokens, from_idx, to_idx)
+        self.num_tokens[from_idx] = 0
         self.num_tokens_no_spec = move_row(self.num_tokens_no_spec, from_idx, to_idx)
+        self.num_tokens_no_spec[from_idx] = 0
         self.num_prompt_tokens = move_row(self.num_prompt_tokens, from_idx, to_idx)
+        self.num_prompt_tokens[from_idx] = 0
         self.num_computed_tokens = move_row(self.num_computed_tokens, from_idx, to_idx)
+        self.num_computed_tokens[from_idx] = 0
         self.temperature = move_row(self.temperature, from_idx, to_idx)
+        self.temperature[from_idx] = -1.0
         self.top_p = move_row(self.top_p, from_idx, to_idx)
+        self.top_p[from_idx] = 1.0
         self.top_k = move_row(self.top_k, from_idx, to_idx)
+        self.top_k[from_idx] = 0
         self.frequency_penalties = move_row(self.frequency_penalties, from_idx, to_idx)
+        self.frequency_penalties[from_idx] = 0.0
         self.presence_penalties = move_row(self.presence_penalties, from_idx, to_idx)
+        self.presence_penalties[from_idx] = 0.0
         self.repetition_penalties = move_row(self.repetition_penalties, from_idx, to_idx)
+        self.repetition_penalties[from_idx] = 1.0
         self.min_p = move_row(self.min_p, from_idx, to_idx)
+        self.min_p[from_idx] = 0.0
 
-        # Page table - mutate in-place
+        # Page table - copy then clear source to prevent stale pointers.
         self.page_table.move_row(from_idx, to_idx)
+        self.page_table.clear_row(from_idx)
 
         # Sparse/optional data
         self._move_sparse_data(from_idx, to_idx)
+        self._layout_version += 1
 
     def _move_sparse_data(self, from_idx: int, to_idx: int) -> None:
         """Move sparse and optional data between indices.
@@ -974,7 +974,8 @@ class SequenceBuffer:
             max_prompt_len,
             self.vocab_size,
         )
-        assert isinstance(result, jax.Array)
+        if not isinstance(result, jax.Array):
+            raise RuntimeError(f"pack_prompts must return a jax.Array, but got {type(result)}")
         return result
 
     def get_request_indices_with_penalty(self) -> jax.Array:
@@ -1085,6 +1086,7 @@ class SequenceBuffer:
             self.allowed_token_ids_mask = jnp.zeros_like(self.allowed_token_ids_mask, dtype=bool)
 
         self._update_request_distribution()
+        self._layout_version += 1
 
 
 @auto_pytree
