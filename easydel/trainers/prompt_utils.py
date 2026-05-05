@@ -1298,9 +1298,17 @@ def pad_and_truncate_dataset(
             if pad < 0 and truncate:
                 v = v[..., -max_length:] if side == "left" else v[..., :max_length]
             elif padding and pad > 0:
-                pad_width = [(0, 0)] * v.ndim
-                pad_width[-1] = (pad, 0) if side == "left" else (0, pad)
-                v = jnp.pad(v, tuple(pad_width), mode="constant", constant_values=pad_val)
+                if pad_val is None:
+                    if side == "right":
+                        pad_arr = jnp.arange(1, pad + 1, dtype=v.dtype) + v[..., -1:]
+                        v = jnp.concatenate([v, pad_arr], axis=-1)
+                    else:
+                        pad_arr = jnp.zeros((*v.shape[:-1], pad), dtype=v.dtype)
+                        v = jnp.concatenate([pad_arr, v], axis=-1)
+                else:
+                    pad_width = [(0, 0)] * v.ndim
+                    pad_width[-1] = (pad, 0) if side == "left" else (0, pad)
+                    v = jnp.pad(v, tuple(pad_width), mode="constant", constant_values=pad_val)
             if make_it_1d:
                 v = v.reshape(-1)
             processed[k] = v
