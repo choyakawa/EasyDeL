@@ -1280,6 +1280,8 @@ def ForCausalLMLoss(
     logits: jax.Array,
     labels: jax.Array,
     attention_mask: jax.Array | None = None,
+    assistant_masks: jax.Array | None = None,
+    completion_mask: jax.Array | None = None,
     config: LossConfig | None = None,
     paxis: PartitionAxis | None = None,
     num_items_in_batch: int | None = None,
@@ -1317,20 +1319,26 @@ def ForCausalLMLoss(
                 paxis.sequence_axis,
             ),
         )
-    shift_attn_m = attention_mask
+    loss_mask = attention_mask
+    if completion_mask is not None:
+        loss_mask = completion_mask if loss_mask is None else (loss_mask * completion_mask)
+    if assistant_masks is not None:
+        loss_mask = assistant_masks if loss_mask is None else (loss_mask * assistant_masks)
+
+    shift_attn_m = loss_mask
     if config is None:
         config = LossConfig()
     if config.shift_tokens:
         shift_logits = logits[:, :-1, :]
         shift_labels = labels[:, 1:]
-        if attention_mask is not None:
-            shift_attn_m = attention_mask[:, 1:]
+        if loss_mask is not None:
+            shift_attn_m = loss_mask[:, 1:]
     else:
         shift_logits = logits
         shift_labels = labels
 
-        if attention_mask is not None:
-            shift_attn_m = attention_mask
+        if loss_mask is not None:
+            shift_attn_m = loss_mask
 
     loss = fixed_cross_entropy(
         source=shift_logits,
