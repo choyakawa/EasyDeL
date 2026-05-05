@@ -1,69 +1,64 @@
-# Local Divergence From Upstream: Reconstruction Guide
+# Local Divergence From `upstream/main`
 
-This document explains the current branch's intentional divergence from upstream in a form that is meant to be actionable.
+This document describes the branch's real code-level divergence from `upstream/main` as it exists now.
 
-It is written for a maintainer who starts from upstream and wants to recreate the local behavior without reading local commit history.
+It is meant for a maintainer who wants to reconstruct the local behavior starting from upstream without replaying local history.
 
-The structure is:
+This guide intentionally focuses on behavioral and structural differences. It does not try to document merge commits, and it ignores low-signal metadata-only differences such as the executable-bit change on `scripts/mount_gcsfuse.sh`.
 
-1. Motivation: why this divergence exists.
-2. Behavioral target: what should be true after the change.
-3. Reconstruction steps: which files differ and what to change in each file.
-
-This document focuses on the actual code differences that exist today.
-
-## 1. Training must be controllable by raw sample consumption, not only by optimizer steps
+## 1. Training is controlled by raw example consumption, not only optimizer steps
 
 ### Motivation
 
-Upstream training control is step-centric. That works when one training example corresponds to one raw example, but it becomes inaccurate once sequence packing is enabled. In the local workflow, the real budget is "how many original examples were consumed", not "how many optimizer updates happened".
-
-The local branch therefore treats raw-item consumption as a first-class training control signal.
+The local workflow treats "how many original examples were consumed" as the real training budget. That matters once packing is enabled, because one optimizer step no longer maps cleanly to one raw sample.
 
 ### Behavioral target
 
-After reproducing this divergence, the trainer should be able to:
+Starting from upstream, reproduce these properties:
 
-- stop after consuming a configured number of original training examples, even when packing is enabled
-- resume that raw-item progress from checkpoints
-- show progress in terms of raw items when the dataset format makes that possible
-- continue to work with streaming / iterable Hugging Face datasets by using metadata-derived length estimates when exact length is unavailable
+- training can stop after a configured number of original, unpacked examples
+- that raw-item progress survives checkpoint save/load
+- source-backed or streaming datasets do not need to be fully scanned just to estimate total steps
+- when the raw-item budget is the only active bound, training can run with an open-ended epoch loop
 
 ### Reconstruction steps
 
 #### File: `easydel/trainers/training_configurations.py`
 
-Add a new training argument:
+Add:
 
 - `max_training_raw_items: int | None`
 
-Its meaning should be:
+Its meaning is:
 
-- maximum number of real, unpacked training examples to consume before stopping
+- maximum number of real training examples to consume
 - independent from `max_training_steps`
-- allowed to drive training even when the number of optimizer steps is not fixed upfront
+- allowed to drive training by itself when step count is not fixed in advance
 
-This file also differs in one additional way:
+This file also differs in one typing detail:
 
 - `track_memory` is narrowed from `bool | float` to `bool`
 
-That narrowing is part of the local divergence and should be reproduced if the goal is an exact mirror of the current branch.
+#### File: `easydel/infra/elarge/types/training.py`
+
+Mirror the same typing change in the typed config surface:
+
+- `track_memory: NotRequired[bool]`
 
 #### File: `easydel/trainers/base_trainer.py`
 
-Introduce raw-progress tracking and raw-progress persistence.
+Introduce raw-progress persistence and raw-progress-aware planning.
 
-Required behavior:
+Required pieces:
 
-- define a sidecar filename for checkpointed raw progress:
-  - `RAW_PROGRESS_JSON_NAME = "easydel-raw-progress.json"`
-- when resuming from checkpoint:
-  - load that sidecar if present
+- define `RAW_PROGRESS_JSON_NAME = "easydel-raw-progress.json"`
+- on checkpoint resume:
+  - load the sidecar JSON if present
   - restore `consumed_train_raw_items`
-- when saving checkpoints:
-  - write the current `consumed_train_raw_items` to that sidecar
+- on checkpoint save:
+  - write the current `consumed_train_raw_items` sidecar
 
-Add trainer state needed for raw progress:
+Trainer state added by the local branch:
 
 - `_raw_train_item_count`
 - `_raw_eval_item_count`
@@ -72,330 +67,334 @@ Add trainer state needed for raw progress:
 - `_pending_train_progress_update`
 - `_resumed_consumed_train_raw_items`
 
-Add helper methods for length and progress bookkeeping:
+Helper behavior added by the local branch:
 
-- `_safe_len(obj) -> int | None`
+- `_safe_len(obj)`
   - first try `len(obj)`
-  - if that fails, read `estimated_length` when available
-- `_load_raw_progress_state(checkpoint_dir)`
-- `_save_raw_progress_state(checkpoint_dir)`
+  - then fall back to `estimated_length` metadata when available
+- `_effective_train_epoch_limit()`
+  - when `max_training_raw_items` is active and `max_training_steps` is not set, allow the effective epoch limit to become `None` if the configured epoch count is still the default
 - `_raw_item_limit_active()`
+- `_load_raw_progress_state(...)`
+- `_save_raw_progress_state(...)`
+- `_estimate_training_steps_from_raw_item_limit(...)`
 - `_should_stop_training(current_step)`
   - stop when either `max_training_steps` or `max_training_raw_items` is reached
-- `_count_raw_progress_items_in_example(example)`
-  - use `segment_ids` to count how many original samples are represented by one packed example
-  - if `segment_ids` is missing, fall back to `1`
-- `_count_raw_progress_items_in_batch(batch)`
-  - aggregate the example-level logic above across a pre-collation batch
+- `_count_raw_progress_items_in_example(...)`
+  - derive raw-item count from `segment_ids`
+- `_count_raw_progress_items_in_batch(...)`
+  - aggregate the per-example logic across a pre-collation batch
 
-Add step-resolution helpers that do not pre-scan streaming data:
+Step planning differs too:
 
-- `_resolve_configured_step_fallback(is_train)`
-- `_calculate_steps_without_scanning(dataset, is_train=...)`
-  - use `len()` or `estimated_length` when available
-  - otherwise require `per_epoch_training_steps` / `per_epoch_evaluation_steps`
-- `_estimate_training_steps_from_raw_item_limit(raw_item_limit, effective_train_epochs)`
-  - derive an estimate from raw-item budget instead of pre-iterating the dataset
+- `_resolve_step_count(...)` uses `_effective_train_epoch_limit()` instead of blindly using `num_train_epochs`
+- when `max_training_raw_items` is active and `max_training_steps` is not forced:
+  - resolve train steps from the raw-item budget instead of only from dataset length
 
-Change dataloader configuration behavior:
+Source-backed iteration differs:
 
-- do not fully pre-iterate source-backed datasets to compute step counts
-- for train/eval step resolution:
-  - prefer forced steps if configured
-  - otherwise prefer exact length
-  - otherwise prefer metadata-derived estimated length
-  - otherwise require explicit per-epoch step configuration
-- when `max_training_raw_items` is active, estimate total training steps from that budget instead of consuming the source once just to count
+- `_create_dataloader_from_source(...)` accepts `num_epochs: int | None`
+- when `num_epochs is None`, it loops forever over the wrapped source
 
-Change source-backed iteration behavior:
+Checkpoint save behavior differs:
 
-- `_create_dataloader_from_source(...)` must accept `num_epochs: int | None`
-- if `num_epochs is None`, iterate indefinitely over the source
-- this supports the case where training should continue until raw-item budget is reached rather than until a predetermined number of epochs is exhausted
+- `_save_state(...)` also writes the raw-progress sidecar
 
-Change checkpoint save behavior:
+Progress-bar behavior differs:
 
-- after `state.save_state(...)`, also save the raw-progress sidecar
-
-Change progress-bar update behavior:
-
-- in `log_metrics(...)`, if train progress is raw-item based, update the progress bar using `_pending_train_progress_update`
-- otherwise keep the old step-based update behavior
+- `create_progress_bar(...)` accepts `total: int | None`
+- `log_metrics(...)` updates train progress by raw-item deltas when raw progress is active
 
 #### File: `easydel/trainers/trainer/trainer.py`
 
-Wire the raw-item logic into the actual training loop.
+Wire the raw-item bookkeeping into the actual trainer loop.
 
 Required behavior:
 
-- when creating the train progress bar:
-  - if `max_training_raw_items` is set, use that as the progress total
-  - else if raw item count is known and epoch count is known, use `raw_train_item_count * epochs`
-  - else allow progress total to remain unknown
-- when resuming:
+- import `itertools`
+- progress-bar total is chosen this way:
+  - `max_training_raw_items` if configured
+  - else `raw_train_item_count * effective_epoch_limit` when both are known
+  - else unknown total
+- on resume:
   - restore `_consumed_train_raw_items`
-  - if raw progress is active, initialize the progress bar from raw-item count instead of from step count
-- during training:
-  - call `_count_raw_progress_items_in_batch(batch)` before collation
-  - after a successful train step, accumulate:
+  - initialize the progress bar from raw items when raw progress is active
+- when there is no fixed effective epoch limit:
+  - iterate epochs with `itertools.count(start_epoch)`
+- inside `_train_epoch(...)`:
+  - count raw items before collation
+  - after each successful step, accumulate:
     - `_consumed_train_raw_items`
     - `_pending_train_progress_update`
-- stop conditions:
-  - call `_should_stop_training(current_step)` instead of checking only `current_step >= max_training_steps`
-- pass raw progress into step metrics:
+- stop by calling `_should_stop_training(current_step)`
+- feed raw progress into per-step metrics:
   - `raw_items=self._consumed_train_raw_items`
   - `raw_items_limit=getattr(self.arguments, "max_training_raw_items", None)`
 
-Also change epoch iteration behavior:
-
-- when there is no effective fixed epoch limit, iterate with `itertools.count(start_epoch)` instead of `range(...)`
-
 #### File: `easydel/data/sources/base.py`
 
-Extend `HuggingFaceShardedSource` with metadata-based length estimation.
+Extend `HuggingFaceShardedSource` with metadata-based size discovery.
 
 Required behavior:
 
 - add `_estimated_length`
-- populate it using `datasets.load_dataset_builder(...)`
-- look up `builder.info.splits[split].num_examples`
-- expose it via an `estimated_length` property
-
-This is needed so raw-progress and step planning can still work for streaming-style sources without materializing them.
+- resolve it with `datasets.load_dataset_builder(...)`
+- read `builder.info.splits[split].num_examples` when available
+- expose it through `estimated_length`
 
 #### File: `easydel/data/sources/hf_wrapper.py`
 
-Extend `HFDatasetShardedSource` similarly.
+Extend `HFDatasetShardedSource` similarly for iterable datasets.
 
 Required behavior:
 
 - for iterable datasets, attempt to derive `_length` from attached split metadata
-- expose that value through `estimated_length`
-- keep `__len__` raising when true length is unavailable, but allow `estimated_length` to exist independently
+- keep `__len__` behavior unchanged for truly unsized iterables
+- expose metadata-derived size separately through `estimated_length`
 
-## 2. Loss masking must survive packing
+## 2. SFT masking is converted into explicit labels before packing, and packed loss is segment-aware
 
 ### Motivation
 
-In local supervised fine-tuning, masking the prompt or non-assistant tokens is not optional. The branch depends on "assistant-only" or "completion-only" loss continuing to mean the same thing after tokenization and after packing.
-
-Upstream behavior is closer to "mask information exists during preprocessing". The local branch requires "explicit labels survive the whole preprocessing pipeline".
+The local branch depends on prompt/completion masking still being correct after tokenization, packing, and shifted causal loss computation. That requires more than upstream's preprocessing-only masks.
 
 ### Behavioral target
 
-After reproducing this divergence:
+After reproducing the local branch:
 
-- the preprocessing stage should emit `labels` with `-100` on ignored positions
-- packing should preserve those labels and keep them aligned with `input_ids`
-- assistant-only loss and completion-only loss should still behave correctly after packed training examples are formed
+- SFT preprocessing should emit ignore-indexed `labels`
+- packing should preserve `labels` and segment metadata
+- packed causal loss should not score token transitions that cross segment boundaries
+- model-side mask preparation should understand packed segment metadata even when only `segment_ids` are present
 
 ### Reconstruction steps
 
 #### File: `easydel/trainers/prompt_transforms.py`
 
-Add label construction at preprocessing time.
+`SFTPreprocessTransform` differs in two ways.
 
-Required behavior:
+First, it accepts:
 
-- add a helper like `_apply_completion_labels(result: dict) -> None`
-- it should:
-  - return early unless prompt masking is active
-  - look for `completion_mask`
-  - if absent, fall back to `assistant_masks`
-  - combine that mask with `attention_mask` when present
-  - create `labels` such that:
-    - kept positions get the token id
-    - ignored or padded positions get `-100`
+- `pad_to_max_length: bool = True`
+
+and uses `_padding_mode()` so packing can disable preprocessing-time padding.
+
+Second, when prompt masking is active, it materializes labels explicitly:
+
+- add `_apply_completion_labels(result)`
+- use `completion_mask` when present
+- otherwise fall back to `assistant_masks`
+- combine with `attention_mask` when present
+- create `labels` with:
+  - token id on kept positions
+  - `-100` on ignored or padded positions
+- raise if assistant/completion-only loss was requested but no mask was produced
 
 Call that helper:
 
-- after tokenizing conversational or prompt/completion examples
-- after any branch where completion masking is produced
-
-The local branch specifically converts masking into explicit labels before the packer sees the sample.
+- after conversational tokenization
+- after prompt/completion tokenization
 
 #### File: `easydel/trainers/supervised_fine_tuning_trainer/sft_trainer.py`
 
-Change the meaning of prompt masking for SFT.
+The local SFT trainer differs in two ways.
 
-Required behavior:
+Prompt masking behavior:
 
-- when building `SFTPreprocessTransform`, set `mask_prompt` true if either:
-  - `assistant_only_loss` is true
-  - `completion_only_loss` is true
+- initialize `mask_prompt` from `assistant_only_loss`
+- if `completion_only_loss` is explicitly set, let it override the final masking choice
 
-This differs from upstream because the local branch treats assistant-only loss as another path to the same masking semantics.
+Packing behavior:
 
-There is also a packing-related preprocessing difference:
-
-- `SFTPreprocessTransform` should accept `pad_to_max_length: bool = True`
-- when packing is enabled, the SFT trainer should pass `pad_to_max_length=False`
-- tokenization should then use a helper like `_padding_mode()` so examples are not pre-padded before packing
-
-This is part of the local divergence because the branch expects masked-label preprocessing and packing to work together on unpadded token sequences.
+- pass `pad_to_max_length=not packing` into `SFTPreprocessTransform`
 
 #### File: `easydel/data/transforms/pack.py`
 
-Teach all packers to preserve `labels` and emit packed-loss metadata.
+All packers are extended so packed training examples preserve supervised-loss metadata.
 
 Required behavior:
 
-- `PackedSequence` must gain:
-  - `labels: np.ndarray | None = None`
-- `PackedSequence` must also gain:
-  - `decoder_positions: np.ndarray | None = None`
-- `PackedSequence.to_dict()` must include `labels` when present
-- `PackedSequence.to_dict()` must also expose:
-  - `decoder_segment_ids`
-  - `decoder_positions`
-
-Update `GreedyPacker`:
-
-- maintain an internal `_labels` buffer alongside `_buffer`
-- change `add(...)` signature to accept `labels: list[int] | None`
-- require labels to match token length when provided
-- normalize each sample before packing:
+- add `_PADDING_SEGMENT_ID = -1`
+- add `_build_decoder_positions(...)`
+- add `_normalize_sample(...)`
   - clip to `seq_length`
-  - append EOS only if the sample is non-empty, does not already end with EOS, and still has room
-- if labels exist for the packer state, append `-100` for any EOS inserted during normalization
-- `_flush()` must return aligned `labels`
-- `flush_final()` must:
-  - truncate to `seq_length`
-  - pad labels with `-100`
-  - pad `segment_ids` with `-1`
-  - generate per-segment-reset `decoder_positions`
+  - keep labels aligned
+  - append EOS only when needed and only when there is space
+  - append `-100` to labels for inserted EOS
 
-Update `PoolPacker`:
+`PackedSequence` gains:
 
-- forward optional labels into the chosen inner packer
-- estimate fit using normalized sample length rather than assuming a fresh EOS is always appended
+- `labels`
+- `decoder_positions`
 
-Update `FirstFitPacker`:
+`PackedSequence.to_dict()` also emits:
 
-- store pending items as `(tokens, labels, source_id)`
-- normalize pending samples before sorting and bin-packing
-- when building bins, merge labels alongside tokens
-- preserve labels exactly as produced by normalization
-- pad labels with `-100`
-- pad `segment_ids` with `-1`
-- generate `decoder_positions`
+- `labels`
+- `decoder_segment_ids`
+- `decoder_positions`
 
-Update `PackedShardedSource`:
+`GreedyPacker` differs by:
 
-- read `labels = example.get("labels")`
-- pass labels into whichever packer is active
-- keep iterating the underlying source's real shard names; do not forward the synthetic `"packed_shard_0"` name into the wrapped source
+- tracking `_labels`
+- accepting `labels` in `add(...)`
+- preserving labels through flush/final flush
+- padding `labels` with `-100`
+- padding `segment_ids` with `-1`
+- emitting per-segment-reset `decoder_positions`
 
-The local branch depends on this exact propagation path: preprocess produces labels, pack preserves labels, trainer consumes labels.
+`PoolPacker` differs by:
 
-## 3. The local workflow needs a direct finetune entrypoint
+- forwarding optional `labels`
+- estimating fit from normalized sample length instead of assuming a fresh EOS every time
+
+`FirstFitPacker` differs by:
+
+- buffering `(tokens, labels, source_id)`
+- normalizing before sort/bin-pack
+- preserving labels inside each bin
+- padding labels with `-100`
+- padding `segment_ids` with `-1`
+- emitting `decoder_positions`
+
+`PackedShardedSource` differs by:
+
+- reading `labels = example.get("labels")`
+- forwarding labels into the active packer
+- validating the synthetic shard name before iteration
+- iterating the wrapped source's real shard names instead of forwarding `"packed_shard_0"` downstream
+
+#### File: `easydel/infra/base_module.py`
+
+Packed segment metadata also affects model-side input preparation and loss setup.
+
+Required behavior:
+
+- import `MaskInfo`
+- in `prepare_inputs_for_call(...)`:
+  - when `segment_ids` is present and `mask_info` is absent, derive `mask_info = MaskInfo.from_segments(...)`
+
+Before calling the loss strategy:
+
+- create `loss_batch = dict(batch)`
+- when `segment_ids` exists:
+  - synthesize `decoder_segment_ids` if missing
+  - synthesize `decoder_positions` if missing
+- those synthesized fields use `-1` as padding segment id and reset positions to `0` at segment boundaries
+
+#### File: `easydel/infra/loss_utils.py`
+
+Packed causal loss differs in three important ways.
+
+Loss weighting:
+
+- default loss weights use `decoder_target_tokens != -100` instead of `> 0`
+
+Packed-sequence normalization:
+
+- `_sum_weights_per_segment(...)` treats negative segment ids as padding
+
+Shifted causal loss:
+
+- add `_shifted_segment_continuation_mask(...)`
+- in `ForCausalLMLoss(...)`, when packed segment ids are present:
+  - only keep next-token targets that stay inside the same segment
+- build a `loss_batch` for `fixed_cross_entropy(...)` containing:
+  - shifted `decoder_target_tokens`
+  - shifted `decoder_loss_weights`
+  - shifted `decoder_positions`
+  - shifted `decoder_segment_ids`
+
+## 3. The repository includes a local finetune entrypoint
 
 ### Motivation
 
-Upstream provides reusable trainer infrastructure. The local branch also needs a single operational script that directly expresses the most common training workflow used in this repository.
-
-This is not a framework-level abstraction change. It is an explicit workflow entrypoint.
+The local branch wants a single operational script for the most common SFT workflow, instead of relying only on reusable trainer primitives.
 
 ### Behavioral target
 
-After reproducing this divergence, the repository should contain one script that:
+The branch should contain one script that:
 
-- initializes JAX distributed runtime
-- parses an SFT config plus runtime config
+- initializes distributed JAX
+- parses an `SFTConfig` plus runtime arguments
 - loads tokenizer and dataset
-- chooses model loader based on architecture
-- supports `full`, `lora`, and `lora_embed_head` training modes
-- runs training
-- merges LoRA if needed
-- exports an HF-compatible model in a multi-host-safe way
+- selects the proper EasyDeL auto-model
+- supports `full`, `lora`, and `lora_embed_head`
+- trains
+- merges LoRA when needed
+- exports an HF-compatible checkpoint in a multi-host-safe way
 
 ### Reconstruction steps
 
 #### File: `easydel/scripts/finetune/train.py`
 
-Create a new script with the following structure:
+Create a direct training script with this structure:
 
 - call `jax.distributed.initialize()`
-- define a runtime dataclass with fields for:
-  - `repo_id`
-  - `training_mode`
-  - `lora_rank`
-  - `lora_pattern`
-  - dataset name / split / subset / streaming / cache dir
+- define a runtime dataclass with fields covering:
+  - repo id
+  - training mode
+  - LoRA rank/pattern
+  - dataset name/split/subset/streaming/cache dir
   - processor repo id
   - sharding axis and optional DCN sharding axis
   - attention mechanism
   - gradient checkpointing
-  - dtype / param_dtype / attn_dtype / attn_softmax_dtype
-- parse `(ed.SFTConfig, RunTimeConfig)` using `DataClassArgumentParser`
-- load tokenizer and patch `pad_token_id` from `eos_token_id` when missing
-- build dataset with `HuggingFaceShardedSource`
-- inspect HF config and choose:
+  - dtype / param_dtype / attention dtypes
+- parse `(ed.SFTConfig, RunTimeConfig)` with `DataClassArgumentParser`
+- load tokenizer and backfill `pad_token_id` from `eos_token_id` when missing
+- build a `HuggingFaceShardedSource`
+- inspect the HF config and choose:
   - `AutoEasyDeLModelForImageTextToText`
   - or `AutoEasyDeLModelForCausalLM`
-- construct the model with local sharding/runtime settings
+- initialize the model with local sharding/runtime settings
 
-Training mode behavior:
+Training modes:
 
-- `full`: train normally
-- `lora`: call `apply_lora_to_layers(...)`
-- `lora_embed_head`:
-  - apply LoRA
-  - additionally convert embedding weights and lm_head weights into trainable `nn.LoRAParam`
+- `full`: no LoRA wrapping
+- `lora`: apply LoRA to matching layers
+- `lora_embed_head`: apply LoRA and additionally make embedding / lm_head params trainable via `nn.LoRAParam`
 
 Formatting behavior:
 
-- inspect a dataset sample
-- if the target text field contains message-style data, leave formatting as `None`
-- let `SFTPreprocessTransform` apply the tokenizer chat template directly
-- this preserves conversational structure so `assistant_only_loss` can request assistant masks from the tokenizer
-- if the target field is plain text, leave formatting function as `None`
+- do not inject a custom formatting function
+- let message-style data flow directly into SFT preprocessing so the tokenizer chat template can produce assistant masks
 
-Training behavior:
+Training/export behavior:
 
 - instantiate `ed.SFTTrainer`
 - run `trainer.train()`
-- recover final state from output or trainer state
-
-Export behavior:
-
+- recover final state
 - unwrap LoRA if used
-- restore embedding / lm_head params from `LoRAParam` back to plain `Param` when needed
-- set:
+- restore `LoRAParam` embedding / lm_head params back to plain `Param` when needed
+- export with:
   - `EASY_SAFE_TRANSFER=1`
   - `EASYDEL_CHUNK_BYTES=64 * 1024 * 1024`
-- synchronize devices before export
-- call `StateDictConverter.easydel_to_torch(...)` on all hosts
-- only on process 0:
-  - instantiate the target HF model on `torch.device("meta")`
-  - load the converted state dict with `assign=True`
+- synchronize hosts before and after save
+- on process 0:
+  - build the HF model on `torch.device("meta")`
+  - load converted weights with `assign=True`
   - save with `safe_serialization=True`
-- synchronize again after save
 
-This script is part of the local divergence because it codifies the preferred local workflow instead of leaving the workflow to external glue code.
-
-## 4. Weight export must be more robust on multi-host TPU systems
+## 4. Export and LoRA wrapping are customized for multi-host and sharded local workflows
 
 ### Motivation
 
-The local environment cares about successful export in distributed settings more than about keeping the conversion code minimal.
-
-The upstream conversion path is not sufficient for the local branch's export expectations on large sharded models.
+The local branch prioritizes successful export and sharding stability on large distributed runs over keeping the upstream conversion path minimal.
 
 ### Behavioral target
 
-After reproducing this divergence:
+After reproducing the local branch:
 
-- JAX arrays should be exportable even when only locally addressable shards are visible
-- multi-host TPU export should gather full arrays onto process 0
-- large arrays should be movable in chunks to reduce peak memory
-- state-dict conversion should attempt per-parameter gather logic before converting tensors
+- JAX-to-torch conversion should work even when only local shards are directly addressable
+- multi-host TPU export should gather complete arrays on process 0
+- large host transfers should happen in chunks
+- LoRA-wrapped linear layers should preserve EasyDeL-specific calling and sharding conventions
 
 ### Reconstruction steps
 
 #### File: `easydel/utils/parameters_transformation.py`
 
-Import:
+Add:
 
 - `from jax.experimental import multihost_utils as mhutils`
 
@@ -403,115 +402,55 @@ Inside `TensorConverter.jax_to_pytorch(...)`, add:
 
 - `_get_local_array(arr)`
   - prefer fully addressable arrays
-  - otherwise prefer first addressable shard's data
-- platform detection based on:
-  - `jax.devices()`
-  - `jax.default_backend()`
+  - otherwise fall back to the first addressable shard
+- more robust platform detection via `jax.devices()` and `jax.default_backend()`
 - `_cpu_chunked_transfer(arr)`
   - flatten to 1D
-  - move chunks sized by `EASYDEL_CHUNK_BYTES`
+  - host-copy in chunks sized by `EASYDEL_CHUNK_BYTES`
   - reassemble on CPU
-  - convert bfloat16 safely for torch
+  - convert bf16 safely for torch
+- TPU-specific path:
+  - gather the full array through `global_array_to_host_numpy(...)`
+- CPU/GPU safe-transfer path:
+  - prefer the chunked host-copy implementation
 
-Add a TPU-specialized path:
+Add `global_array_to_host_numpy(...)`:
 
-- if backend is TPU:
-  - call `global_array_to_host_numpy(...)`
-  - on process 0, return a real torch tensor
-  - on non-main processes, return a placeholder tensor
+- gather addressable shards per process
+- all-gather them across hosts with `mhutils.process_allgather(...)`
+- assemble the full host array on process 0
 
-Add a "safe transfer" path:
+`StateDictConverter.easydel_to_torch(...)` also differs:
 
-- if `EASY_SAFE_TRANSFER` is true:
-  - use chunked CPU transfer instead of naive `device_get(...).tolist()`
+- try per-parameter gather functions from `module._gather_fns` before conversion
+- that avoids converting only a local shard shape
 
-Keep a DLPack-based path for the non-safe case, using a helper like `_to_dlpack_capsule(arr)`.
+`ModelConverter` differs slightly too:
 
-Also add:
-
-- `global_array_to_host_numpy(x, target_dtype)`
-  - fast path for fully addressable arrays
-  - otherwise collect `addressable_shards`
-  - store shard index ranges plus host arrays
-  - `mhutils.process_allgather(...)`
-  - on process 0, reconstruct the full numpy array from gathered shard payloads
-  - on other processes, return `None`
-
-Update `StateDictConverter.easydel_to_torch(...)`:
-
-- attempt to read `module._gather_fns`
-- flatten that tree
-- if a gather function exists for a parameter key, apply it before conversion
-
-This is meant to avoid exporting only a local shard of a parameter when the local branch expects a full global parameter.
-
-Update `ModelConverter.to_torch(...)`:
-
-- if a key expected by the target HF model is missing from the converted state dict, warn instead of indexing blindly
-- keep the local branch's debug printing behavior:
-  - print `"state_dict:"`
-  - then print every key before loading
-
-That debug output is part of the current divergence and should be reproduced if exact parity is required.
-
-## 5. LoRA-wrapped layers must preserve sharding semantics
-
-### Motivation
-
-In the local branch, LoRA is not just an adapter mechanism. It must remain compatible with distributed partitioning decisions already encoded in `ParallelLinear`.
-
-### Behavioral target
-
-After reproducing this divergence:
-
-- applying LoRA to a `ParallelLinear` should still expose usable sharding metadata
-- LoRA A/B matrices should be assigned sharding specs based on whether the wrapped linear layer is row-parallel or column-parallel
-- the wrapped base module's own sharding information should still be available
-
-### Reconstruction steps
+- when checking the converted state dict, warn on missing keys
+- emit debug prints of the converted key set before `load_state_dict(...)`
 
 #### File: `easydel/infra/utils.py`
 
-Inside `apply_lora_to_layers(...)`:
+`apply_lora_to_layers(...)` differs like this:
 
-- instead of directly constructing and inserting `nn.LoRA(...)` inline, first build it into a variable, for example `lora_module`
-- dynamically attach a `craft_sharding(...)` method to that LoRA module
+- wrap matching `ParallelLinear` modules with `eLoRA`
+- attach a dynamic `craft_sharding(...)` method to each wrapper
+- choose LoRA sharding based on the wrapped module's direction:
+  - row-parallel base: `lora_a` row-wise, `lora_b` replicated
+  - column-parallel base: `lora_a` replicated, `lora_b` column-wise
+  - otherwise both replicated
+- include flattened base-module sharding specs under `base_module/...`
 
-That `craft_sharding(...)` must:
-
-- inspect `self.base_module`
-- read the wrapped module's `_direction`
-- choose LoRA sharding as:
-  - row-parallel base:
-    - `lora_a -> RowWise`
-    - `lora_b -> Replicated`
-  - column-parallel base:
-    - `lora_a -> Replicated`
-    - `lora_b -> ColumnWise`
-  - otherwise:
-    - both replicated
-- call `resolve_safe_sharding(...)` for `lora_a` and `lora_b`
-- if the base module also has `craft_sharding(...)`, include its entries in the returned spec map under a `base_module/...` prefix
-
-Then insert that `lora_module` into the model with `set_module_from_path(...)`.
-
-This is the local branch's way of ensuring that adapter insertion does not erase the distributed layout model.
-
-## 6. Trainer step functions must merge auxiliary graph state explicitly
+## 5. Trainer step functions explicitly merge auxiliary graph state
 
 ### Motivation
 
-The local branch needs train and eval steps to reconstruct the module with more than just the trainable graph state. Some auxiliary graph state must survive merge boundaries but should not receive gradients.
+The local branch expects the training and evaluation step functions to merge `graphother` explicitly instead of relying only on `state.merge(tree)`.
 
 ### Behavioral target
 
-After reproducing this divergence:
-
-- train and eval step functions should merge:
-  - `graphdef`
-  - the current trainable tree
-  - the auxiliary `graphother` tree
-- `graphother` must be wrapped in `stop_gradient`
+Trainer step execution should preserve the auxiliary graph state and stop gradients through it.
 
 ### Reconstruction steps
 
@@ -519,193 +458,74 @@ After reproducing this divergence:
 
 In both `training_step(...)` and `evaluation_step(...)`:
 
-- replace the local merge pattern `module = state.merge(tree)`
-- construct:
-  - `tree_other = tree_map(lambda x: stop_gradient(asarray(x)) if hasattr(x, "shape") else x, state.graphother)`
-- then call:
+- build `tree_other` from `state.graphother`
+- wrap tensor-like leaves with `jax.lax.stop_gradient(...)`
+- merge the module explicitly with:
   - `nn.merge(state.graphdef, tree, tree_other)`
 
-This change should be applied symmetrically in train and eval code paths.
-
-## 7. The local GLM implementation must match local expectations better than upstream does
+## 6. The local GLM implementation intentionally diverges from upstream
 
 ### Motivation
 
-The local branch carries a GLM-specific compatibility patch. The goal is not to create a more generic GLM implementation. The goal is to make the GLM module structure align with local training and weight expectations.
+The local branch expects GLM internals that better match the local checkpoints and training assumptions than the upstream implementation does.
 
 ### Behavioral target
 
-After reproducing this divergence:
-
-- GLM MLP structure should use separate gate and up projections rather than a fused gate-up projection
-- GLM attention projections should use local bias choices
-- GLM rotary embedding creation should follow the local configuration path
+The GLM MLP and attention projections should follow the local structure, not upstream's current one.
 
 ### Reconstruction steps
 
 #### File: `easydel/modules/glm/modeling_glm.py`
 
-Change the MLP structure:
+`GlmMLP` differs by:
 
-- replace a fused `gate_up_proj` projection with:
+- replacing `gate_up_proj` with separate:
   - `gate_proj`
   - `up_proj`
   - `down_proj`
-- in the forward pass:
-  - compute `gate = act_fn(gate_proj(hidden_states))`
-  - compute `up = up_proj(hidden_states)`
-  - multiply `gate * up`
-  - pass through `down_proj`
-- keep checkpoint labels around these operations
+- computing SwiGLU as:
+  - `down_proj(act(gate_proj(x)) * up_proj(x))`
 
-Change attention projection creation:
+`GlmAttention` differs by overriding projection builders:
 
-- override `_create_q_proj(...)` to use `use_bias=True`
-- override `_create_k_proj(...)` to use `use_bias=True`
-- override `_create_v_proj(...)` to use `use_bias=True`
-- override `_create_o_proj(...)` to use `use_bias=False`
-
-Change rotary construction:
-
-- override `_create_rotary(...)`
-- call `config.get_basic_rope(...)`
-- use:
-  - `head_size=self.head_dim`
-  - `rotary_dim=self.head_dim`
+- `q_proj`, `k_proj`, `v_proj` use `use_bias=True`
+- `o_proj` uses `use_bias=False`
+- rotary embedding creation uses:
   - `base=getattr(config, "rope_theta", 100000000.0)`
   - `is_neox_style=False`
 
-This file represents a local model-compatibility patch, not a general upstream design preference.
-
-## 8. Local attention kernels should not force `logits_dtype`
+## 7. Local attention kernels do not force `logits_dtype`
 
 ### Motivation
 
-The local branch carries a narrow kernel-level compatibility tweak: do not force `logits_dtype` at the flash-attention call site.
+The local branch avoids hard-coding `logits_dtype=jnp.bfloat16` in these flash-attention call sites.
 
 ### Behavioral target
 
-After reproducing this divergence:
-
-- the flash-attention call path should no longer explicitly pass `logits_dtype=jnp.bfloat16`
+The kernels should inherit the upstream/default dtype behavior instead of forcing bf16 logits.
 
 ### Reconstruction steps
 
 #### File: `easydel/operations/kernels/flash_attention.py`
 
-At the flash attention invocation site:
-
-- remove or comment out the explicit `logits_dtype=jnp.bfloat16` argument
+- remove the forced `logits_dtype=jnp.bfloat16` argument from the flash-attention invocation
 
 #### File: `easydel/operations/kernels/paged_flash_attention.py`
 
-Do the same for paged flash attention:
+- remove the forced `logits_dtype=jnp.bfloat16` argument from the paged flash-attention invocation
 
-- remove or comment out the explicit `logits_dtype=jnp.bfloat16` argument
+## 8. Summary
 
-The local branch leaves the rest of the attention call structure unchanged.
+If the local divergence has been reproduced correctly, these statements should all be true:
 
-## 9. Configuration typing is locally tightened
-
-### Motivation
-
-The local branch slightly narrows configuration shapes to match the local calling convention more closely.
-
-### Behavioral target
-
-After reproducing this divergence:
-
-- the typed trainer config should treat `track_memory` as `bool`, not `bool | float`
-
-### Reconstruction steps
-
-#### File: `easydel/infra/elarge_model/trainer_types.py`
-
-Change:
-
-- `track_memory: NotRequired[bool | float]`
-
-to:
-
-- `track_memory: NotRequired[bool]`
-
-This is a local typing-level divergence, separate from the training logic changes described earlier.
-
-## 10. A low-impact repository-level script mode difference remains
-
-### Motivation
-
-One tracked difference is not semantic. It is a file mode difference on a helper shell script.
-
-### Behavioral target
-
-After reproducing this divergence:
-
-- the file mode of the script should match the local branch rather than upstream
-
-### Reconstruction steps
-
-#### File: `scripts/mount_gcsfuse.sh`
-
-Reproduce the mode change:
-
-- upstream mode: executable
-- local mode: non-executable
-
-No content change is required for this file.
-
-## 11. Packed segment metadata must also drive model-side mask preparation
-
-### Motivation
-
-The local branch expects packed examples to remain usable after they leave the data pipeline. Carrying `segment_ids` alone is not sufficient if model input preparation does not convert them into the attention-mask metadata expected by downstream kernels.
-
-This divergence is therefore not just about data packing. It also ensures packed segment boundaries are converted into model-consumable mask structure automatically.
-
-### Behavioral target
-
-After reproducing this divergence:
-
-- model input preparation should notice `segment_ids`
-- if `mask_info` is missing, it should be derived from `segment_ids`
-- callers that pass packed samples with segment ids should not need to build `mask_info` manually
-
-### Reconstruction steps
-
-#### File: `easydel/infra/base_module.py`
-
-Update `EasyDeLBaseModule.prepare_inputs_for_call(...)`.
-
-Required behavior:
-
-- import `MaskInfo` from `ejkernel.types`
-- read `segment_ids` from `kwargs`
-- if `segment_ids` is present and `mask_info` is not already provided:
-  - build `MaskInfo.from_segments(jnp.asarray(segment_ids, dtype=jnp.int32))`
-  - assign it to `kwargs["mask_info"]`
-
-This is a small patch, but it is part of the actual upstream divergence because it connects packed sample metadata to the model-side attention path.
-
-## 12. Summary of what must be true if the divergence is reproduced correctly
-
-A correct reconstruction of the current local branch should produce all of the following outcomes:
-
-- training can be limited by raw consumed examples
+- training may be bounded by raw-example consumption rather than only by optimizer steps
 - raw-item progress survives checkpoint save/load
-- progress bars and metrics can reflect raw-item progress
-- iterable Hugging Face datasets can contribute metadata-derived length information
-- preprocessing emits explicit `labels` for masked SFT loss
-- packing preserves those labels and keeps them aligned
-- packed padding uses `segment_ids=-1`
-- packed sequences also expose `decoder_segment_ids` and `decoder_positions` for packed-aware loss handling
-- packed `segment_ids` can automatically become model-side `mask_info`
-- a local end-to-end finetune script exists and supports LoRA-oriented workflows
-- JAX-to-PyTorch export is adapted for multi-host TPU usage
-- LoRA insertion preserves usable sharding semantics
-- trainer step functions explicitly merge auxiliary graph state
-- GLM modeling differs from upstream in a local compatibility-oriented way
-- flash attention call sites no longer force `logits_dtype`
-- local typing narrows `track_memory`
-- the repository preserves the local shell-script mode difference
-
-If any of those outcomes are missing, the local divergence has only been partially reproduced.
+- source-backed and streaming datasets can contribute estimated lengths without pre-scanning
+- SFT prompt/completion masking becomes explicit `labels` before packing
+- packed training examples carry `labels`, `decoder_segment_ids`, and `decoder_positions`
+- packed causal loss never crosses segment boundaries when computing next-token loss
+- the repository contains a direct SFT entrypoint script for the local workflow
+- JAX-to-torch export is multi-host-safe and chunked for large arrays
+- LoRA wrappers preserve EasyDeL calling conventions and sharding metadata
+- trainer step functions merge `graphother` explicitly
+- the local GLM implementation and flash-attention call sites intentionally differ from upstream
