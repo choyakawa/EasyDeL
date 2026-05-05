@@ -1136,6 +1136,45 @@ def pack_dataset(
     return dataset
 
 
+def add_packed_sequence_metadata(example: dict[str, tp.Any]) -> dict[str, tp.Any]:
+    """Build segment-aware metadata for packed sequences.
+
+    Expects a packed example produced by the `"bfd"` packing strategy, where
+    `seq_lengths` stores the lengths of the original samples concatenated into
+    the packed row.
+
+    The returned metadata enables block-diagonal causal attention by:
+    - resetting `position_ids` within each packed sample
+    - assigning non-zero `segment_ids` per packed sample
+    - synthesizing `attention_mask` when it is absent
+    """
+    seq_lengths = example.get("seq_lengths")
+    if seq_lengths is None:
+        raise ValueError("Packed sequence metadata requires `seq_lengths` from BFD packing.")
+
+    input_ids = example["input_ids"]
+    total_length = len(input_ids)
+    packed_length = int(sum(seq_lengths))
+    if packed_length != total_length:
+        raise ValueError(
+            f"Packed metadata mismatch: sum(seq_lengths)={packed_length} but len(input_ids)={total_length}."
+        )
+
+    position_ids: list[int] = []
+    segment_ids: list[int] = []
+    for segment_idx, segment_length in enumerate(seq_lengths, start=1):
+        segment_length = int(segment_length)
+        position_ids.extend(range(segment_length))
+        segment_ids.extend([segment_idx] * segment_length)
+
+    if "attention_mask" not in example:
+        example["attention_mask"] = [1] * total_length
+
+    example["position_ids"] = position_ids
+    example["segment_ids"] = segment_ids
+    return example
+
+
 def truncate_dataset(dataset: DatasetType, max_length: int, map_kwargs: dict[str, tp.Any] | None = None) -> DatasetType:
     r"""
     Truncate sequences in a dataset to a specified `max_length`.

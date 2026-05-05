@@ -24,6 +24,7 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
 from easydel.trainers.prompt_utils import (
+    add_packed_sequence_metadata,
     is_conversational,
     is_conversational_from_value,
     keep_arrays_map,
@@ -446,6 +447,11 @@ class SFTTrainer(Trainer):
             columns_names = next(iter(dataset)).keys()
             if self.arguments.max_sequence_length is None:
                 raise ValueError("When packing is enabled, `max_sequence_length` can't be `None`.")
+            if self.arguments.packing_strategy != "bfd":
+                raise ValueError(
+                    "Only `packing_strategy='bfd'` is supported for leakage-safe SFT packing. "
+                    "`wrapped` cuts through sequence boundaries and cannot preserve attention isolation."
+                )
             if isinstance(dataset, Dataset):
                 map_kwargs["desc"] = "Packing dataset"
 
@@ -465,13 +471,23 @@ class SFTTrainer(Trainer):
                 self.arguments.packing_strategy,
                 map_kwargs,
             )
+            if isinstance(dataset, Dataset):
+                map_kwargs["desc"] = "Building packed sequence metadata"
+            dataset = dataset.map(add_packed_sequence_metadata, **map_kwargs)
         if isinstance(dataset, Dataset):
             map_kwargs["desc"] = "Truncating dataset"
         columns_names = next(iter(dataset)).keys()
         dataset = dataset.map(
             partial(
                 keep_arrays_map,
-                array_fields=["input_ids", "attention_mask", "position_ids", "assistant_masks", "completion_mask"],
+                array_fields=[
+                    "input_ids",
+                    "attention_mask",
+                    "position_ids",
+                    "segment_ids",
+                    "assistant_masks",
+                    "completion_mask",
+                ],
             ),
             remove_columns=columns_names,
         )
@@ -479,6 +495,7 @@ class SFTTrainer(Trainer):
             dataset,
             max_length=self.arguments.max_sequence_length,
             padding_token_id=self.tokenizer.pad_token_id,
+            padding_values={"segment_ids": 0},
             padding=True,
             truncate=True,
             map_kwargs=map_kwargs,
