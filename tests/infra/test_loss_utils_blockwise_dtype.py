@@ -272,6 +272,56 @@ def test_causal_lm_loss_chunked_lm_head_preserves_decoder_loss_weights():
     assert jnp.allclose(actual.accuracy, expected.accuracy, atol=1e-5)
 
 
+def test_causal_lm_loss_strategy_dense_preserves_decoder_loss_weights():
+    logits = jnp.arange(2 * 5 * 8, dtype=jnp.float32).reshape(2, 5, 8) / 19
+    labels = jnp.array(
+        [
+            [0, -100, 2, 3, -100],
+            [4, 3, -100, 1, -100],
+        ],
+        dtype=jnp.int32,
+    )
+    attention_mask = jnp.ones((2, 5), dtype=jnp.int32)
+    decoder_loss_weights = jnp.array(
+        [
+            [0.0, 0.0, 1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0, 1.0, 0.0],
+        ],
+        dtype=jnp.float32,
+    )
+    config = LossConfig(chunk_block_size=4)
+    strategy = resolve_loss_strategy(ForCausalLMLoss)
+
+    expected = fixed_cross_entropy(
+        source=logits[:, :-1, :],
+        target=labels[:, 1:],
+        attention_mask=attention_mask[:, 1:],
+        config=config,
+        batch={
+            "decoder_target_tokens": labels[:, 1:],
+            "decoder_loss_weights": decoder_loss_weights[:, 1:],
+        },
+    )
+    actual = strategy.compute(
+        module=_DummyCausalLMModule(),
+        outputs={"logits": logits},
+        labels=labels,
+        loss_config=config,
+        batch={
+            "attention_mask": attention_mask,
+            "decoder_loss_weights": decoder_loss_weights,
+        },
+        loss_kwargs={},
+        paxis=None,
+        forward_plan=LossForwardPlan(),
+    )
+
+    assert jnp.allclose(actual.loss, expected.loss, atol=1e-5)
+    assert jnp.allclose(actual.z_loss, expected.z_loss, atol=1e-5)
+    assert jnp.allclose(actual.weight_sum, expected.weight_sum, atol=1e-5)
+    assert jnp.allclose(actual.accuracy, expected.accuracy, atol=1e-5)
+
+
 def test_causal_lm_loss_chunked_lm_head_disables_inner_ce_chunking(monkeypatch: pytest.MonkeyPatch):
     hidden_states = jnp.arange(2 * 5 * 4, dtype=jnp.float32).reshape(2, 5, 4) / 17
     labels = jnp.array([[0, 1, 2, 3, 4], [4, 3, 2, 1, 0]], dtype=jnp.int32)

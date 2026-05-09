@@ -10,13 +10,20 @@ tree.
 
 - `easydel/trainers/training_configurations.py`
 - `easydel/infra/elarge/types/training.py`
+- `easydel/data/transforms/pack.py`
 - `easydel/scripts/finetune/__init__.py`
 - `easydel/scripts/finetune/train.py`
 - `easydel/utils/parameters_transformation.py`
 - `easydel/infra/utils.py`
+- `easydel/modules/_base/causal_lm_module.py`
 - `easydel/trainers/trainer/_fn.py`
+- `easydel/trainers/prompt_transforms.py`
+- `easydel/trainers/supervised_fine_tuning_trainer/sft_trainer.py`
 - `easydel/modules/glm/modeling_glm.py`
 - `easydel/operations/kernels/paged_flash_attention.py`
+- `scripts/mount_gcsfuse.sh`
+- `tests/data/test_pack_assistant_masks.py`
+- `tests/trainers/test_trainer_forward_kwargs_safety.py`
 
 ## 1. Trainer Memory Tracking Typing
 
@@ -170,3 +177,80 @@ Change:
 Operational intent:
 
 - let the kernel/default attention path choose logits dtype instead of hard-coding bf16
+
+## 8. Leakage-Safe Packed SFT Masks
+
+Packed SFT behavior diverges from upstream to preserve assistant-only loss masks
+and packed-sequence attention isolation.
+
+Files:
+
+- `easydel/data/transforms/pack.py`
+- `easydel/modules/_base/causal_lm_module.py`
+- `easydel/trainers/prompt_transforms.py`
+- `easydel/trainers/supervised_fine_tuning_trainer/sft_trainer.py`
+- `tests/data/test_pack_assistant_masks.py`
+- `tests/trainers/test_trainer_forward_kwargs_safety.py`
+
+Packing changes:
+
+- `PackedSequence` carries `position_ids` and arbitrary token-aligned fields.
+- `PackedShardedSource` can preserve aligned fields such as:
+  - `attention_mask`
+  - `completion_mask`
+  - `assistant_masks`
+  - `labels`
+- existing source padding is stripped before packing by using the incoming
+  `attention_mask`
+- synthetic EOS separator tokens receive:
+  - `attention_mask=1`
+  - assistant/completion masks set to `0`
+  - label fields set to `-100`
+- packed padding receives mask value `0` and label value `-100`
+- `segment_ids` now follow the stable-branch packed metadata convention:
+  non-padding segments start at `1`, padding is `0`
+- `position_ids` reset within each packed segment
+
+SFT preprocessing changes:
+
+- `SFTPreprocessTransform` accepts a `padding` flag.
+- `SFTTrainer` disables tokenizer `max_length` padding before packing, so the
+  packer receives real sequence lengths instead of fully padded rows.
+- SFT packing explicitly preserves `attention_mask`, `completion_mask`,
+  `assistant_masks`, and `labels`.
+- `packing_strategy='wrapped'` is rejected for SFT because it can cut through
+  sequence boundaries and cannot preserve packed attention isolation.
+- `packing_strategy='bfd'` maps to the lazy `first_fit` packer.
+
+Model-call changes:
+
+- `BaseCausalLMModule.__call__` accepts `segment_ids`.
+- when `segment_ids` are provided and no explicit `mask_info` is passed, the
+  model builds `MaskInfo.from_segments(...)` using `segment_ids` and
+  `position_ids`
+- this lets packed SFT batches produce block-diagonal causal attention instead
+  of relying only on a flat padding mask
+
+Test coverage:
+
+- packed assistant/completion masks stay aligned across packed segments
+- existing source padding is stripped before packing
+- packed metadata has stable-style `segment_ids` and per-segment `position_ids`
+- SFT packing disables pre-padding
+- wrapped packing is rejected for leakage-safe SFT
+
+Operational intent:
+
+- keep `assistant_only_loss=True` accurate when `packing=True`
+- prevent attention leakage across packed examples
+- preserve stable-branch packed sequence semantics in the newer lazy data path
+
+## 9. GCS Fuse Script Mode
+
+File:
+
+- `scripts/mount_gcsfuse.sh`
+
+Change:
+
+- file mode differs from upstream: executable bit removed (`100755` to `100644`)

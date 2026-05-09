@@ -2748,15 +2748,49 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         if labels is None:
             raise ValueError("`labels` can not be `None` for computing loss.")
         loss_kwargs = loss_kwargs or {}
+        if self.loss_strategy.__name__ == ForCausalLMLoss.__name__:
+            batch = dict(batch)
+            completion_mask = batch.get("completion_mask", None)
+            if completion_mask is not None and "decoder_loss_weights" not in batch:
+                batch["decoder_loss_weights"] = completion_mask
+
+            segment_ids = batch.get("segment_ids", None)
+            if segment_ids is not None and batch.get("mask_info", None) is None:
+                from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
+
+                position_ids = batch.get("position_ids", None)
+                batch["mask_info"] = MaskInfo.from_segments(
+                    q_segment_ids=segment_ids,
+                    kv_segment_ids=segment_ids,
+                    q_positions=position_ids,
+                    kv_positions=position_ids,
+                )
+
+            if "decoder_segment_ids" not in batch and "segment_ids" in batch:
+                batch["decoder_segment_ids"] = batch["segment_ids"]
+            if "decoder_positions" not in batch and "position_ids" in batch:
+                batch["decoder_positions"] = batch["position_ids"]
+
         forward_batch = batch
         try:
             call_signature = inspect.signature(self.__call__)
         except (TypeError, ValueError):
             call_signature = None
 
+        loss_only_batch_keys = {
+            "assistant_masks",
+            "completion_mask",
+            "decoder_loss_weights",
+            "decoder_positions",
+            "decoder_segment_ids",
+            "decoder_target_tokens",
+            "num_items_in_batch",
+        }
         if call_signature is not None:
             call_parameters = call_signature.parameters
-            if not any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in call_parameters.values()):
+            if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in call_parameters.values()):
+                forward_batch = {key: value for key, value in batch.items() if key not in loss_only_batch_keys}
+            else:
                 accepted_keys = set(call_parameters.keys())
                 forward_batch = {key: value for key, value in batch.items() if key in accepted_keys}
 

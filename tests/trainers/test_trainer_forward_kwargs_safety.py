@@ -590,6 +590,34 @@ def test_distillation_preprocess_converts_and_drops_assistant_masks(monkeypatch)
     assert jnp.array_equal(processed["completion_mask"], batch["assistant_masks"])
 
 
+def test_sft_preprocess_exposes_packed_loss_and_segment_metadata(monkeypatch):
+    trainer = SFTTrainer.__new__(SFTTrainer)
+
+    def _fake_base_preprocess(self, state, batch, is_train):
+        del self, state, is_train
+        return dict(batch), {}
+
+    monkeypatch.setattr(Trainer, "_preprocess_batch_input", _fake_base_preprocess)
+
+    batch = {
+        "input_ids": jnp.array([[10, 11, 12, 99, 20, 21, 99, 0]], dtype=jnp.int32),
+        "attention_mask": jnp.array([[1, 1, 1, 1, 1, 1, 1, 0]], dtype=jnp.int32),
+        "completion_mask": jnp.array([[0, 1, 1, 0, 0, 1, 0, 0]], dtype=jnp.int32),
+        "segment_ids": jnp.array([[1, 1, 1, 1, 2, 2, 2, 0]], dtype=jnp.int32),
+        "position_ids": jnp.array([[0, 1, 2, 3, 0, 1, 2, 0]], dtype=jnp.int32),
+    }
+    processed, _ = SFTTrainer._preprocess_batch_input(
+        trainer,
+        state=None,
+        batch=batch,
+        is_train=True,
+    )
+
+    assert jnp.array_equal(processed["decoder_loss_weights"], batch["completion_mask"])
+    assert jnp.array_equal(processed["decoder_segment_ids"], batch["segment_ids"])
+    assert jnp.array_equal(processed["decoder_positions"], batch["position_ids"])
+
+
 def test_sft_preprocess_converts_and_drops_assistant_masks(monkeypatch):
     trainer = SFTTrainer.__new__(SFTTrainer)
 
@@ -614,6 +642,8 @@ def test_sft_preprocess_converts_and_drops_assistant_masks(monkeypatch):
     assert "assistant_masks" not in processed
     assert "completion_mask" in processed
     assert jnp.array_equal(processed["completion_mask"], batch["assistant_masks"])
+    assert "decoder_loss_weights" in processed
+    assert jnp.array_equal(processed["decoder_loss_weights"], batch["assistant_masks"])
 
 
 def test_sft_transform_uses_assistant_only_loss():

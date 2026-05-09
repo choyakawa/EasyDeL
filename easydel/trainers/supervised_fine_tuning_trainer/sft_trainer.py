@@ -254,6 +254,7 @@ class SFTTrainer(Trainer):
                 np.asarray(attention_mask).dtype if attention_mask is not None else completion_mask_np.dtype
             )
             batch["completion_mask"] = completion_mask_np.astype(completion_dtype, copy=False)
+            batch.setdefault("decoder_loss_weights", batch["completion_mask"])
 
             if "labels" not in batch and "input_ids" in batch:
                 labels = np.asarray(batch["input_ids"]).astype(np.int32, copy=True)
@@ -269,5 +270,11 @@ class SFTTrainer(Trainer):
                 if attention_mask is not None:
                     completion_mask_np = completion_mask_np * np.asarray(attention_mask)
                 batch["completion_mask"] = completion_mask_np
+                batch.setdefault("decoder_loss_weights", batch["completion_mask"])
+
+        if "segment_ids" in batch and "decoder_segment_ids" not in batch:
+            batch["decoder_segment_ids"] = batch["segment_ids"]
+        if "position_ids" in batch and "decoder_positions" not in batch:
+            batch["decoder_positions"] = batch["position_ids"]
 
         return batch, infos

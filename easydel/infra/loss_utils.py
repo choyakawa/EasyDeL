@@ -2209,17 +2209,23 @@ def causal_lm_loss_chunked_lm_head(
         global_loss_batch["decoder_target_tokens"] = shift_labels
     else:
         global_loss_batch["decoder_target_tokens"] = jnp.asarray(global_loss_batch["decoder_target_tokens"])
-    if "decoder_loss_weights" in global_loss_batch:
-        shift_loss_weights = jnp.asarray(global_loss_batch["decoder_loss_weights"], compute_dtype)
-        if config.shift_tokens and shift_loss_weights.shape == labels.shape:
-            shift_loss_weights = shift_loss_weights[:, 1:]
-        elif shift_loss_weights.shape != shift_labels.shape:
+    for key in ("decoder_loss_weights", "decoder_segment_ids", "decoder_positions"):
+        if key not in global_loss_batch:
+            continue
+        if key == "decoder_loss_weights":
+            value = jnp.asarray(global_loss_batch[key], compute_dtype)
+        else:
+            value = jnp.asarray(global_loss_batch[key])
+        if config.shift_tokens and value.shape == labels.shape:
+            value = value[:, 1:]
+        elif value.shape != shift_labels.shape:
             raise ValueError(
-                "decoder_loss_weights must match labels or shifted labels, "
-                f"got {shift_loss_weights.shape}, labels {labels.shape}, shifted {shift_labels.shape}."
+                f"{key} must match labels or shifted labels, "
+                f"got {value.shape}, labels {labels.shape}, shifted {shift_labels.shape}."
             )
-        global_loss_batch["decoder_loss_weights"] = shift_loss_weights
-    else:
+        global_loss_batch[key] = value
+
+    if "decoder_loss_weights" not in global_loss_batch:
         if shift_attn_m is not None:
             global_loss_batch["decoder_loss_weights"] = shift_attn_m.astype(compute_dtype)
         else:
@@ -2272,6 +2278,15 @@ def causal_lm_loss_chunked_lm_head(
     loss_weights = global_loss_batch["decoder_loss_weights"]
     if pad_len:
         loss_weights = jnp.pad(loss_weights, ((0, 0), (0, pad_len)))
+        global_loss_batch["decoder_loss_weights"] = loss_weights
+        if "decoder_segment_ids" in global_loss_batch:
+            global_loss_batch["decoder_segment_ids"] = jnp.pad(
+                global_loss_batch["decoder_segment_ids"], ((0, 0), (0, pad_len))
+            )
+        if "decoder_positions" in global_loss_batch:
+            global_loss_batch["decoder_positions"] = jnp.pad(
+                global_loss_batch["decoder_positions"], ((0, 0), (0, pad_len))
+            )
 
     def _chunk_loss(chunk_hidden_states, chunk_labels, chunk_attention_mask, chunk_loss_weights):
         """Compute cross-entropy loss for a single chunk of the sequence.
@@ -2328,10 +2343,8 @@ def causal_lm_loss_chunked_lm_head(
         start = i * chunk_size
         chunk_hidden_states = lax.dynamic_slice_in_dim(shift_hidden_states, start, chunk_size, axis=1)
         chunk_labels = lax.dynamic_slice_in_dim(shift_labels, start, chunk_size, axis=1)
-        chunk_attention_mask = (
-            lax.dynamic_slice_in_dim(shift_attn_m, start, chunk_size, axis=1) if shift_attn_m is not None else None
-        )
         chunk_loss_weights = lax.dynamic_slice_in_dim(loss_weights, start, chunk_size, axis=1)
+        chunk_attention_mask = chunk_loss_weights
         chunk_loss, chunk_z_loss, chunk_weight_sum, chunk_correct = _chunk_loss(
             chunk_hidden_states,
             chunk_labels,
@@ -2534,6 +2547,7 @@ class CausalLMLossStrategy(BaseLossStrategy):
                 labels=labels,
                 config=loss_config,
                 paxis=module.config.partition_axis,
+                batch=batch,
                 **loss_kwargs,
                 **outputs,
                 **batch,
@@ -2687,10 +2701,25 @@ def ForCausalLMLoss(
         if attention_mask is not None:
             shift_attn_m = attention_mask
 
+    if batch is not None:
+        batch = dict(batch)
+        batch.setdefault("decoder_target_tokens", shift_labels)
+        for key in ("decoder_loss_weights", "decoder_segment_ids", "decoder_positions"):
+            if key not in batch:
+                continue
+            value = jnp.asarray(batch[key])
+            if config.shift_tokens and value.shape == labels.shape:
+                value = value[:, 1:]
+            batch[key] = value
+
+    loss_attention_mask = shift_attn_m
+    if batch is not None and "decoder_loss_weights" in batch:
+        loss_attention_mask = batch["decoder_loss_weights"]
+
     loss = fixed_cross_entropy(
         source=shift_logits,
         target=shift_labels,
-        attention_mask=shift_attn_m,
+        attention_mask=loss_attention_mask,
         config=config,
         num_items_in_batch=num_items_in_batch,
         batch=batch,
