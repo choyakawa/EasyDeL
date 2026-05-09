@@ -53,7 +53,9 @@ class Identity(nn.Module):
     when certain normalization or processing layers are conditionally disabled.
     """
 
-    def __init__(self): ...
+    def __init__(self):
+        """Initialize the Identity module (no parameters)."""
+        ...
 
     def __call__(self, x):
         """Pass through input unchanged.
@@ -74,7 +76,9 @@ class PostCross(nn.Module):
     while preserving gradient flow for most values.
     """
 
-    def __init__(self): ...
+    def __init__(self):
+        """Initialize the PostCross module (no parameters)."""
+        ...
 
     def __call__(self, x):
         """Apply bounded tanh transformation.
@@ -423,14 +427,6 @@ class XerxesDecoderLayer(nn.Module):
 
         mlp_block = XerxesSparseMoeBlock if self.config.xe_moe else XerxesMLP
         attn_block = XerxesAttention
-
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
         self.self_attn = attn_block(
             self.config,
             layer_idx=self.layer_idx,
@@ -595,9 +591,15 @@ class XerxesModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            XerxesDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                XerxesDecoderLayer(
+                remat_layer_block(
                     self.config,
                     layer_idx=i,
                     dtype=dtype,
@@ -618,6 +620,12 @@ class XerxesModel(EasyDeLBaseModule):
 
     @functools.cached_property
     def default_frequencies(self):
+        """Compute and cache RoPE frequency tensor for position encoding.
+
+        Returns:
+            ModuleCaches: Cached rotary position embedding frequencies computed
+                from the model's head dimension and base frequency configuration.
+        """
         from easydel.infra.utils import ModuleCaches
         from easydel.layers import get_frequencies
 
@@ -627,7 +635,7 @@ class XerxesModel(EasyDeLBaseModule):
             max_position=self.config.granted_freq_max_position_embedding,
             base=10000,
             rope_scaling=None,
-        ).astype(jnp.bfloat16)
+        )
 
         return ModuleCaches(frequencies)
 
@@ -905,7 +913,7 @@ class XerxesForCausalLM(BaseCausalLMModule[XerxesModel, XerxesConfig]):  # type:
         )
         lm_logits = None
         if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
+            lm_logits = self.compute_lm_logits(hidden_states)
         return CausalLMOutput(
             logits=self.post_pross(lm_logits),
             hidden_states=outputs.hidden_states,

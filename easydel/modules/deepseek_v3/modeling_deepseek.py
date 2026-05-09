@@ -207,6 +207,16 @@ class MoEGate(nn.Module):
             )
 
     def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specifications for MoEGate parameters.
+
+        When expert tensor mode is enabled, the gate kernel is replicated
+        across all devices. Otherwise, it is sharded column-wise for
+        distributed routing computation. The score correction bias (used
+        with noaux_tc routing) is always replicated.
+
+        Returns:
+            dict[str, object]: Mapping of parameter names to sharding specs.
+        """
         kernel_spec = Replicated if self.config.use_expert_tensor_mode else ColumnWise
         specs = {"kernel": kernel_spec}
         if hasattr(self, "e_score_correction_bias"):
@@ -754,19 +764,10 @@ class DeepseekV3DecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
 
-        attn_block = DeepseekV3Attention
         mlp_block = DeepseekV3MLP
         mlp_moe_block = DeepseekV3MoE
 
-        attn_block, mlp_block, mlp_moe_block = auto_remat(
-            attn_block,
-            mlp_block,
-            mlp_moe_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.self_attn = attn_block(
+        self.self_attn = DeepseekV3Attention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -939,9 +940,15 @@ class DeepseekV3Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = auto_remat(
+            DeepseekV3DecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                DeepseekV3DecoderLayer(
+                remat_layer_block(
                     config=config,
                     dtype=dtype,
                     param_dtype=param_dtype,
@@ -1269,7 +1276,7 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         )
         return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
 
-    def create_transformer_cache_config(self, batch_size: int, max_length: int):
+    def create_transformer_cache_config(self, batch_size: int, max_length: int, **kwargs):
         """Create cache configuration for MLA attention.
 
         MLA uses different dimensions for keys and values:
@@ -1326,7 +1333,7 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         Returns:
             RaggedPagesCacheConfig: Configuration object for MLA-compatible paged cache.
         """
-        from easydel.caching import RaggedPagesCacheConfig
+        from easydel.caching import MLARaggedPagesCacheConfig, RaggedPagesCacheConfig
         from easydel.layers.attention import AttentionMechanisms
 
         config = self.config
@@ -1343,6 +1350,27 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
                 version = "v2"
             case _:
                 version = "v3"
+
+        attn_mechanism = getattr(text_config, "attn_mechanism", None)
+        if hasattr(attn_mechanism, "value"):
+            attn_mechanism = attn_mechanism.value
+        is_mla_ragged = str(attn_mechanism) in (
+            "multi_latent_ragged_page_attention_v1",
+            "multi_latent_ragged_page_attention_v2",
+        )
+        if is_mla_ragged:
+            return MLARaggedPagesCacheConfig.create(
+                mesh=self.mesh,
+                partition_manager=text_config.partition_manager,
+                kvdtype=text_config.kvdtype,
+                max_model_length=max_length,
+                num_hidden_layers=config.num_hidden_layers,
+                num_kv_heads=config.num_attention_heads,
+                kv_lora_rank=config.kv_lora_rank,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                hbm_utilization=hbm_utilization,
+                page_size=page_size,
+            )
 
         return RaggedPagesCacheConfig.create(
             mesh=self.mesh,

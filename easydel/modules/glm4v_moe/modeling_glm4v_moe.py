@@ -19,7 +19,6 @@ from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
-from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
 from easydel.caching import (
@@ -195,14 +194,6 @@ class Glm4vMoeTextDecoderLayer(nn.Module):
         attn_block = Glm4vMoeTextAttention
         mlp_block = Glm4MoeMLP if layer_idx < config.first_k_dense_replace else Glm4MoeMoE
 
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
         self.self_attn = attn_block(
             config=config,
             dtype=dtype,
@@ -364,9 +355,15 @@ class Glm4vMoeTextModel(EasyDeLBaseModule):
             embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            Glm4vMoeTextDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Glm4vMoeTextDecoderLayer(
+                remat_layer_block(
                     config=config,
                     dtype=dtype,
                     param_dtype=param_dtype,
@@ -920,7 +917,7 @@ class Glm4vMoeForConditionalGeneration(BaseVisionLanguageModule[Glm4vMoeModel, G
 
         lm_logits = None
         if apply_lm_head:
-            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
+            lm_logits = self.compute_lm_logits(hidden_states)
             lm_logits = self.apply_logit_cap(lm_logits)
 
         return VLMCausalLMOutput(

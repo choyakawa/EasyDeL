@@ -1,3 +1,17 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import re
 
 import jax
@@ -44,3 +58,13 @@ def test_resolve_shardings_compacts_layer_indices():
 
     exact_rule = "^layers/5/kernel$"
     assert all(pat != exact_rule for pat, _ in rules), "Expected compacted regex, not an exact rule."
+
+
+def test_resolve_shardings_matches_optimizer_prefixed_paths():
+    model = _DummyModel(config=_DummyConfig(), rngs=nn.Rngs(0))
+    rules = model.resolve_shardings_automatically()
+
+    for path in ("mu/layers/5/kernel", "0/mu/layers/5/kernel"):
+        matching = [(pat, spec) for pat, spec in rules if re.match(pat, path)]
+        assert matching, "Expected a regex rule matching optimizer-prefixed parameter paths."
+        assert matching[0][1] == Replicated

@@ -76,11 +76,9 @@ from re import Pattern
 from typing import Self, Unpack
 
 import flax
-import flax.nnx
 import flax.struct
 import jax
 import jax.tree_util
-from eformer.common_types import Replicated
 from eformer.escale import make_shard_and_gather_fns, match_partition_rules
 from eformer.loggings import get_logger
 from flax import nnx as nn
@@ -96,17 +94,17 @@ from easydel.utils.traversals import flatten_dict, is_flatten, unflatten_dict
 
 from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
 from .etils import EasyDeLGradientCheckPointers
-from .utils import sanitize_partition_spec_for_shape, sanitize_partition_specs_for_shape_tree
-
-__all__ = (
-    "EasyDeLBaseConfig",
-    "EasyDeLBaseConfigDict",
-    "EasyDeLBaseModule",
-    "ParameterTransformRule",
+from .loss_utils import (
+    LOSS_MAPPING,
+    ForCausalLMLoss,
+    ForSequenceClassificationLoss,
+    LossConfig,
+    LossMetrics,
+    resolve_loss_strategy,
 )
-from .loss_utils import LOSS_MAPPING, ForCausalLMLoss, ForSequenceClassificationLoss, LossConfig, LossMetrics
 from .mixins import BaseModuleProtocol, EasyBridgeMixin, EasyGenerationMixin, OperationCacheMixin
 from .modeling_outputs import EmbeddingInfo
+from .utils import sanitize_partition_spec_for_shape, sanitize_partition_specs_for_shape_tree
 
 if tp.TYPE_CHECKING:
     from easydel.infra.base_state import EasyDeLState
@@ -184,7 +182,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
     EasyDeLBaseModule provides the foundational functionality for all EasyDeL models,
     including parameter management, distributed training support, quantization,
     LoRA adaptation, and integration with HuggingFace models. It inherits from
-    flax.nnx.Module and multiple mixins that provide additional capabilities.
+    nn.Module and multiple mixins that provide additional capabilities.
 
     This class should be subclassed to create specific model architectures. Subclasses
     must implement the __call__ method and may override various hooks for customization.
@@ -530,7 +528,8 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             ('dp', 'fsdp', 'tp', 'sp')
         """
         result = self.config.mesh
-        assert result is not None, "mesh is not configured"
+        if result is None:
+            raise ValueError("mesh is not configured")
         return result
 
     @property
@@ -545,7 +544,8 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                 self.config.explicit_mesh.
         """
         result = self.config.explicit_mesh
-        assert result is not None, "explicit_mesh is not configured"
+        if result is None:
+            raise ValueError("explicit_mesh is not configured")
         return result
 
     @property
@@ -560,7 +560,8 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                 self.config.manual_mesh.
         """
         result = self.config.manual_mesh
-        assert result is not None, "manual_mesh is not configured"
+        if result is None:
+            raise ValueError("manual_mesh is not configured")
         return result
 
     def mesh_call(self: Self, *args: tp.Any, **kwargs: tp.Any) -> tp.Any:
@@ -780,6 +781,12 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         """
 
         return LOSS_MAPPING[self.lossfn_type]
+
+    @cached_property
+    def loss_strategy(self: Self):
+        """Get the planning-aware loss strategy for the resolved loss function."""
+
+        return resolve_loss_strategy(self.loss_function)
 
     @property
     def module_dtype(self: Self) -> jnp.dtype:
@@ -1128,8 +1135,33 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             >>> custom_rules = [(".*kernel", ("fsdp", "tp"))]
             >>> rules = model._get_partition_rules(custom_rules)  # Uses provided
         """
+
+        def _normalize_rules_for_variable_leaves(rules: PartitionLike) -> PartitionLike:
+            normalized: list[tuple[str, tp.Any]] = []
+            for pattern, spec in rules:
+                if isinstance(pattern, str):
+                    # VariableState leaves in state/optimizer trees add a trailing
+                    # "/.../..." suffix after parameter names. Keep anchored
+                    # parameter regexes compatible with both raw parameter paths and
+                    # deeper state/optimizer value paths.
+                    if (
+                        pattern.endswith("(?:/.*)?$")
+                        or pattern.endswith("/.*$")
+                        or pattern.endswith("(?:/value)?$")
+                        or pattern.endswith("/value$")
+                    ):
+                        normalized_pattern = pattern
+                    elif pattern.endswith("$"):
+                        normalized_pattern = pattern[:-1] + r"(?:/.*)?$"
+                    else:
+                        normalized_pattern = pattern
+                else:
+                    normalized_pattern = pattern
+                normalized.append((normalized_pattern, spec))
+            return tuple(normalized)
+
         if partition_rules is not None:
-            return partition_rules
+            return _normalize_rules_for_variable_leaves(partition_rules)
 
         if not hasattr(self, "config"):
             raise ValueError("Partition rules must be provided either as an argument or through the model config.")
@@ -1142,9 +1174,9 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             rules = None
 
         if rules is None:
-            return self.resolve_shardings_automatically()
+            rules = self.resolve_shardings_automatically()
 
-        return rules
+        return _normalize_rules_for_variable_leaves(rules)
 
     def resolve_shardings_automatically(
         self,
@@ -1224,6 +1256,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                 _add_rule("", spec, prefix)
 
         def _generalize_numeric_path(pattern: str) -> str:
+            """Build a regex that matches both direct and optimizer-prefixed paths."""
             parts = pattern.split("/")
             regex_parts: list[str] = []
             for part in parts:
@@ -1231,7 +1264,10 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                     regex_parts.append(r"\d+")
                 else:
                     regex_parts.append(re.escape(part))
-            return "^" + "/".join(regex_parts) + "$"
+            # Optax state trees often prepend segments like "mu/", "nu/" or tuple-index
+            # wrappers before the original parameter path. Allow optional prefixes so
+            # auto-generated rules keep working for optimizer-state sharding.
+            return r"^(?:.*/)?" + "/".join(regex_parts) + r"$"
 
         seen: set[tuple[str, tp.Any]] = set()
         rules: list[tuple[str, tp.Any]] = []
@@ -1243,7 +1279,9 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             seen.add(key)
             rules.append((generalized, spec))
 
-        rules.append((".*", _resolve_spec(Replicated)))
+        # Explicit catch-all replication for any unmatched leaf path.
+        # Use empty PartitionSpec() to avoid rank-dependent ambiguity.
+        rules.append((".*", PartitionSpec()))
 
         return tuple(rules)
 
@@ -1397,57 +1435,33 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             gather_fns.update(overlay_fns)
         return self._apply_sharding_fns(gather_fns)
 
+    def _make_shard_fns(self: Self):
+        """Build sanitized shard functions from partition rules."""
+        mesh = self._get_mesh(None)
+        partition_specs = match_partition_rules(
+            rules=self._get_partition_rules(None),
+            tree=self.graphtree_params_shape,
+        )
+        partition_specs, _ = sanitize_partition_specs_for_shape_tree(
+            partition_specs=partition_specs,
+            shape_tree=self.graphtree_params_shape,
+            mesh=mesh,
+        )
+        shard_fns, _ = make_shard_and_gather_fns(
+            partition_specs=partition_specs,
+            mesh=mesh,
+        )
+        return shard_fns
+
     @property
     def _shard_fns(self: Self):
         """Generate sharding functions based on the module's configuration.
-
-        Creates a dictionary of sharding functions that can be used to
-        distribute parameters across devices according to the partition rules.
 
         Returns:
             Mapping: A mapping from flattened parameter paths to sharding
                 functions that transform arrays to their sharded form.
         """
-        mesh = self._get_mesh(None)
-        partition_specs = match_partition_rules(
-            rules=self._get_partition_rules(None),
-            tree=self.graphtree_params_shape,
-        )
-        partition_specs, _ = sanitize_partition_specs_for_shape_tree(
-            partition_specs=partition_specs,
-            shape_tree=self.graphtree_params_shape,
-            mesh=mesh,
-        )
-        return make_shard_and_gather_fns(
-            partition_specs=partition_specs,
-            mesh=mesh,
-        )[0]
-
-    @property
-    def _gather_fns(self: Self):
-        """Generate gathering functions based on the module's configuration.
-
-        Creates a dictionary of gathering functions that can be used to
-        collect distributed parameters back to a single device.
-
-        Returns:
-            Mapping: A mapping from flattened parameter paths to gathering
-                functions that collect sharded arrays.
-        """
-        mesh = self._get_mesh(None)
-        partition_specs = match_partition_rules(
-            rules=self._get_partition_rules(None),
-            tree=self.graphtree_params_shape,
-        )
-        partition_specs, _ = sanitize_partition_specs_for_shape_tree(
-            partition_specs=partition_specs,
-            shape_tree=self.graphtree_params_shape,
-            mesh=mesh,
-        )
-        return make_shard_and_gather_fns(
-            partition_specs=partition_specs,
-            mesh=mesh,
-        )[1]
+        return self._make_shard_fns()
 
     def apply_out_shardings(self, out_shardings):
         """Apply output sharding specifications to the module state.
@@ -1509,13 +1523,15 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         shape_tree = nn.eval_shape(lambda: mock)
         partition_specs = match_partition_rules(self._get_partition_rules(partition_rules), shape_tree)
         partition_specs = jax.tree_util.tree_map(
-            lambda spec, shape: sanitize_partition_spec_for_shape(
-                spec=spec,
-                shape=tuple(shape.shape),
-                mesh=self.mesh,
-            )
-            if isinstance(spec, PartitionSpec) and hasattr(shape, "shape")
-            else spec,
+            lambda spec, shape: (
+                sanitize_partition_spec_for_shape(
+                    spec=spec,
+                    shape=tuple(shape.shape),
+                    mesh=self.mesh,
+                )
+                if isinstance(spec, PartitionSpec) and hasattr(shape, "shape")
+                else spec
+            ),
             partition_specs,
             shape_tree,
         )
@@ -1922,12 +1938,10 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         def _shard(x):
             return x
 
-        rng = kwargs.get("rngs", flax.nnx.Rngs(44))
+        rng = kwargs.get("rngs", nn.Rngs(44))
         lazy_model = cls.lazy_init(**kwargs)
-        partition_rules = lazy_model.config.get_partition_rules()
-        if partition_rules is None:
-            partition_rules = lazy_model.resolve_shardings_automatically()
-        for path, module in iter_module_search(lazy_model, (flax.nnx.Module, ArrayParam)):
+        partition_rules = lazy_model._get_partition_rules(None)
+        for path, module in iter_module_search(lazy_model, (nn.Module, ArrayParam)):
             if not path:
                 continue
             joined_path = "/".join([str(p) for p in path])
@@ -1975,7 +1989,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                     dtype=module.kernel.value.dtype,
                 )
                 arr = jax.jit(_shard, out_shardings=shardings["kernel"])(arr)
-                if isinstance(module.kernel, flax.nnx.Param):
+                if isinstance(module.kernel, nn.Param):
                     module.kernel.value = arr
                 else:
                     module.kernel = arr
@@ -2315,6 +2329,39 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                     reform_param[full_key] = new_value
         return reform_param
 
+    def _build_transform_fn(self, shard_fns=None):
+        """Build a HuggingFace-to-EasyDeL transformation function.
+
+        Args:
+            shard_fns: Optional sharding functions. If None, no sharding is applied.
+
+        Returns:
+            Callable: A partial function (StateDictConverter.huggingface_to_easydel).
+        """
+        from easydel.layers import BaseMoeModule, Embed, ParallelMoELinear
+        from easydel.utils import traversals
+        from easydel.utils.parameters_transformation import StateDictConverter
+
+        embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.Embed)]
+        embedding_path.extend([".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, Embed)])
+        layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, LayerNorm)]
+        moe_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, ParallelMoELinear)]
+        moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, BaseMoeModule)]
+
+        kwargs = dict(
+            embedding_layer_names=embedding_path,
+            layernorm_names=layernorm_path,
+            moe_names=list(set([names.split(".")[-1] for names in moe_path])),
+            moe_block_names=list(set([names.split(".")[-1] for names in moe_block_path])),
+            moe_block_path=moe_block_path,
+            moe_path=moe_path,
+            dtype=self.param_dtype,
+            reform_param=self._get_reform_param(),
+        )
+        if shard_fns is not None:
+            kwargs["shard_fns"] = shard_fns
+        return partial(StateDictConverter.huggingface_to_easydel, **kwargs)
+
     @property
     def transform_fn(self):
         """Create a transformation function for HuggingFace to EasyDeL conversion.
@@ -2330,28 +2377,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             >>> transform_fn = model.transform_fn
             >>> easydel_params = transform_fn(hf_state_dict)
         """
-        from easydel.layers import BaseMoeModule, Embed, ParallelMoELinear
-        from easydel.utils import traversals
-        from easydel.utils.parameters_transformation import StateDictConverter
-
-        embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.Embed)]
-        embedding_path.extend([".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, Embed)])
-        layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, LayerNorm)]
-        moe_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, ParallelMoELinear)]
-        moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, BaseMoeModule)]
-
-        return partial(
-            StateDictConverter.huggingface_to_easydel,
-            embedding_layer_names=embedding_path,
-            layernorm_names=layernorm_path,
-            moe_names=list(set([names.split(".")[-1] for names in moe_path])),
-            moe_block_names=list(set([names.split(".")[-1] for names in moe_block_path])),
-            moe_block_path=moe_block_path,
-            moe_path=moe_path,
-            dtype=self.param_dtype,
-            shard_fns=self._shard_fns,
-            reform_param=self._get_reform_param(),
-        )
+        return self._build_transform_fn(shard_fns=self._shard_fns)
 
     @property
     def _generate_compatible_graphdef(self: Self):
@@ -2608,7 +2634,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             if include_backward:
                 flops *= 3
         except Exception:
-            warnings.warn("Calculating Flops Failed!", stacklevel=1)
+            logger.warning_once("Calculating Flops Failed!")
             flops = 1
         return flops
 
@@ -2649,27 +2675,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             >>> # Convert without sharding
             >>> easydel_params = transform_fn(hf_state_dict, shard_fns=None)
         """
-        from easydel.layers import BaseMoeModule, Embed, ParallelMoELinear
-        from easydel.utils import traversals
-        from easydel.utils.parameters_transformation import StateDictConverter
-
-        embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.Embed)]
-        embedding_path.extend([".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, Embed)])
-        layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, LayerNorm)]
-        moe_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, ParallelMoELinear)]
-        moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, BaseMoeModule)]
-
-        return partial(
-            StateDictConverter.huggingface_to_easydel,
-            embedding_layer_names=embedding_path,
-            layernorm_names=layernorm_path,
-            moe_names=list(set([names.split(".")[-1] for names in moe_path])),
-            moe_block_names=list(set([names.split(".")[-1] for names in moe_block_path])),
-            moe_block_path=moe_block_path,
-            moe_path=moe_path,
-            dtype=self.param_dtype,
-            reform_param=self._get_reform_param(),
-        )
+        return self._build_transform_fn(shard_fns=None)
 
     @property
     def _default_loss_config(self: Self) -> LossConfig | None:
@@ -2682,18 +2688,6 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             LossConfig | None: The default loss configuration, or None.
         """
         return None
-
-    @_default_loss_config.setter
-    def _default_loss_config(self, val):
-        """Setter for the default loss config (internal use).
-
-        Args:
-            val: The value to set (not actually stored, just for API compatibility).
-
-        Returns:
-            The input value.
-        """
-        return val
 
     def compute_loss(
         self,
@@ -2744,23 +2738,59 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
 
         if self.loss_function.__name__ == ForSequenceClassificationLoss.__name__:
             if loss_config is None:
-                assert hasattr(self.config, "num_labels"), (
-                    "in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach"
-                    " `num_labels` to model `config`"
-                )
+                if not hasattr(self.config, "num_labels"):
+                    raise ValueError(
+                        "in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach"
+                        " `num_labels` to model `config`"
+                    )
                 loss_config = LossConfig(num_labels=self.config.num_labels)
 
-        assert labels is not None, "`labels` can not be `None` for computing loss."
+        if labels is None:
+            raise ValueError("`labels` can not be `None` for computing loss.")
         loss_kwargs = loss_kwargs or {}
+        if self.loss_strategy.__name__ == ForCausalLMLoss.__name__:
+            batch = dict(batch)
+            completion_mask = batch.get("completion_mask", None)
+            if completion_mask is not None and "decoder_loss_weights" not in batch:
+                batch["decoder_loss_weights"] = completion_mask
+
+            segment_ids = batch.get("segment_ids", None)
+            if segment_ids is not None and batch.get("mask_info", None) is None:
+                from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
+
+                position_ids = batch.get("position_ids", None)
+                batch["mask_info"] = MaskInfo.from_segments(
+                    q_segment_ids=segment_ids,
+                    kv_segment_ids=segment_ids,
+                    q_positions=position_ids,
+                    kv_positions=position_ids,
+                )
+
+            if "decoder_segment_ids" not in batch and "segment_ids" in batch:
+                batch["decoder_segment_ids"] = batch["segment_ids"]
+            if "decoder_positions" not in batch and "position_ids" in batch:
+                batch["decoder_positions"] = batch["position_ids"]
+
         forward_batch = batch
         try:
             call_signature = inspect.signature(self.__call__)
         except (TypeError, ValueError):
             call_signature = None
 
+        loss_only_batch_keys = {
+            "assistant_masks",
+            "completion_mask",
+            "decoder_loss_weights",
+            "decoder_positions",
+            "decoder_segment_ids",
+            "decoder_target_tokens",
+            "num_items_in_batch",
+        }
         if call_signature is not None:
             call_parameters = call_signature.parameters
-            if not any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in call_parameters.values()):
+            if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in call_parameters.values()):
+                forward_batch = {key: value for key, value in batch.items() if key not in loss_only_batch_keys}
+            else:
                 accepted_keys = set(call_parameters.keys())
                 forward_batch = {key: value for key, value in batch.items() if key in accepted_keys}
 
@@ -2769,15 +2799,28 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             forward_batch = dict(forward_batch)
             forward_batch.pop("inputs_embeds", None)
 
+        forward_plan = self.loss_strategy.plan_forward(
+            module=self,
+            labels=labels,
+            loss_config=loss_config,
+            batch=batch,
+            loss_kwargs=loss_kwargs,
+        )
+        if forward_plan.forward_kwargs:
+            forward_batch = dict(forward_batch)
+            forward_batch.update(forward_plan.forward_kwargs)
+
         outputs = self(**forward_batch)
 
-        loss_output: LossMetrics = self.loss_function(
+        loss_output: LossMetrics = self.loss_strategy.compute(
+            module=self,
+            outputs=outputs,
             labels=labels,
-            config=loss_config,
+            loss_config=loss_config,
+            batch=batch,
+            loss_kwargs=loss_kwargs,
             paxis=self.config.partition_axis,
-            **loss_kwargs,
-            **outputs,
-            **batch,
+            forward_plan=forward_plan,
         )
         if hasattr(outputs, "aux_loss"):
             if outputs.aux_loss is not None:
@@ -2817,6 +2860,55 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         )
         w = self.get_embedding().embedding.value.T if tie_embeddings else None
         return self.get_lm_head()(hidden_states, w=w)
+
+    def make_lm_head_fn(self) -> "Callable[[Array], Array]":
+        """Return a trace-safe callable that projects hidden states to logits.
+
+        The returned function can safely be called from inside any JAX
+        traced region — ``jax.lax.scan``, ``jax.lax.fori_loop``,
+        ``jax.checkpoint``, and their compositions — without triggering
+        ``flax.errors.TraceContextError``.
+
+        **Why this is needed:**  When gradient checkpointing is enabled the
+        LM-head linear layer is wrapped with ``nn.remat``.  NNX's remat
+        uses a split/merge protocol that *mutates* Variables
+        (``update_from_state``) — which fails when the call site is inside
+        a different JAX trace level (e.g. ``lax.scan`` body under
+        ``jax.grad``).  This method bypasses the ``nn.remat`` wrapper by
+        calling the head's ``native_forward`` directly (reads-only on NNX
+        Variables — no mutation, no trace-context check).
+
+        The default implementation resolves tied-embedding weights and
+        calls ``native_forward`` on the LM head.  Model subclasses that
+        add post-processing (e.g. logit soft-capping or scaling) should
+        override this method so the returned function reproduces the same
+        semantics.
+
+        Trainers should call this method **once** before entering a
+        traced loop and use the returned function inside the loop body.
+
+        Returns:
+            A callable ``fn(hidden_states) -> logits`` that preserves
+            all model-specific projection semantics.
+        """
+        head = self.get_lm_head()
+
+        tie_embeddings = next(
+            (
+                getattr(self.config, key)
+                for key in ["tie_word_embeddings", "use_lm_head", "share_input_output_layers"]
+                if hasattr(self.config, key)
+            ),
+            False,
+        )
+        w = self.get_embedding().embedding.value.T if tie_embeddings else None
+
+        _native_forward = head.native_forward
+
+        def _project(hidden_states: "Array") -> "Array":
+            return _native_forward(hidden_states, w=w)
+
+        return _project
 
     @staticmethod
     def _recursive_config_children(config: EasyDeLBaseConfig) -> tuple[EasyDeLBaseConfig, ...]:
@@ -2858,15 +2950,42 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         for sub_cfg in EasyDeLBaseModule._recursive_config_children(config):
             sub_cfg_dict = getattr(sub_cfg, "__dict__", None)
             for key, value in updates.items():
-                if (
-                    (isinstance(sub_cfg_dict, dict) and key in sub_cfg_dict)
-                    or hasattr(type(sub_cfg), key)
-                ):
+                if (isinstance(sub_cfg_dict, dict) and key in sub_cfg_dict) or hasattr(type(sub_cfg), key):
                     try:
                         setattr(sub_cfg, key, value)
                     except AttributeError:
                         # Skip read-only attributes/properties while applying broad overrides.
                         continue
+
+    @staticmethod
+    def _normalize_rebuild_quantization_config(config: EasyDeLBaseConfig):
+        quantization_config = getattr(config, "quantization_config", None)
+        if quantization_config is None:
+            return None
+
+        from easydel.layers import QuantizationConfig
+
+        if isinstance(quantization_config, dict):
+            quantization_config = QuantizationConfig(**quantization_config)
+            config.quantization_config = quantization_config
+        return quantization_config
+
+    def _lazy_init_rebuilt_module(self, config: EasyDeLBaseConfig):
+        module = self.lazy_init(
+            config=config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+            rngs=self.rngs,
+        )
+
+        quantization_config = self._normalize_rebuild_quantization_config(config)
+        if quantization_config is None or not self.is_quantized:
+            return module
+
+        from easydel.layers import EasyQuantizer
+
+        return EasyQuantizer(quantization_config=quantization_config).apply_quantization(module, verbose=False)
 
     def update_module(
         self,
@@ -2907,13 +3026,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             setattr(config, k, v)
         if recursive_update:
             self._apply_recursive_config_updates(config, kwargs)
-        module = self.lazy_init(
-            config=config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
-            rngs=self.rngs,
-        )
+        module = self._lazy_init_rebuilt_module(config)
         self = self.merge_module(module.graphdef, self.graphstate, self.graphother)
         return self
 
@@ -2950,13 +3063,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             setattr(config, k, v)
         if recursive_update:
             self._apply_recursive_config_updates(config, kwargs)
-        module = self.lazy_init(
-            config=config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
-            rngs=self.rngs,
-        )
+        module = self._lazy_init_rebuilt_module(config)
         return module.graphdef
 
     def __hash__(self):
@@ -3008,3 +3115,11 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         tree_hash = _get_args_signature((self.graphstate, self.graphother), dict_config)
         bytes_in = hashlib.md5((tree_hash).encode("utf-8")).digest()
         return int.from_bytes(bytes_in, byteorder="big", signed=True)
+
+
+__all__ = (
+    "EasyDeLBaseConfig",
+    "EasyDeLBaseConfigDict",
+    "EasyDeLBaseModule",
+    "ParameterTransformRule",
+)

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import typing as tp
 
+import numpy as np
 from eformer.loggings import get_logger
 
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -145,11 +146,17 @@ class SFTTrainer(Trainer):
         if self._is_pretokenized():
             return None
 
+        mask_prompt = bool(getattr(self.arguments, "assistant_only_loss", False))
+        completion_only_loss = getattr(self.arguments, "completion_only_loss", None)
+        if completion_only_loss is not None:
+            mask_prompt = bool(completion_only_loss)
+
         return SFTPreprocessTransform(
             tokenizer=self.processing_class,
             max_length=self.arguments.max_length,
             text_field=self._dataset_text_field or "text",
-            mask_prompt=getattr(self.arguments, "completion_only_loss", False),
+            mask_prompt=mask_prompt,
+            padding=not bool(getattr(self.arguments, "packing", False)),
             formatting_func=self._formatting_func,
         )
 
@@ -188,9 +195,12 @@ class SFTTrainer(Trainer):
             logger.warning("No eos_token_id found, using pad_token_id for packing")
             eos_token_id = pad_token_id
 
-        # Map strategy names
-        strategy_map = {"bfd": "first_fit", "wrapped": "greedy"}
-        strategy = strategy_map.get(self.arguments.packing_strategy, "greedy")
+        if self.arguments.packing_strategy != "bfd":
+            raise ValueError(
+                "Only `packing_strategy='bfd'` is supported for leakage-safe SFT packing. "
+                "`wrapped` cuts through sequence boundaries and cannot preserve attention isolation."
+            )
+        strategy = "first_fit"
 
         # Apply packing to train source
         if self._train_source is not None:
@@ -201,6 +211,7 @@ class SFTTrainer(Trainer):
                 pad_token_id=pad_token_id,
                 strategy=strategy,
                 include_segment_ids=True,
+                aligned_fields=("attention_mask", "completion_mask", "assistant_masks", "labels"),
             )
 
         # Apply packing to eval source if eval_packing is enabled
@@ -216,4 +227,54 @@ class SFTTrainer(Trainer):
                 pad_token_id=pad_token_id,
                 strategy=strategy,
                 include_segment_ids=True,
+                aligned_fields=("attention_mask", "completion_mask", "assistant_masks", "labels"),
             )
+
+    def _preprocess_batch_input(
+        self,
+        state: EasyDeLState,
+        batch: dict[str, tp.Any],
+        is_train: bool,
+    ) -> tuple[dict[str, tp.Any], dict[str, float | int | str]]:
+        batch, infos = super()._preprocess_batch_input(state=state, batch=batch, is_train=is_train)
+
+        if "assistant_masks" in batch:
+            if "completion_mask" not in batch:
+                batch["completion_mask"] = batch["assistant_masks"]
+            batch.pop("assistant_masks", None)
+
+        attention_mask = batch.get("attention_mask")
+        completion_mask = batch.get("completion_mask")
+
+        if completion_mask is not None:
+            completion_mask_np = np.asarray(completion_mask)
+            if attention_mask is not None:
+                completion_mask_np = completion_mask_np * np.asarray(attention_mask)
+            completion_dtype = (
+                np.asarray(attention_mask).dtype if attention_mask is not None else completion_mask_np.dtype
+            )
+            batch["completion_mask"] = completion_mask_np.astype(completion_dtype, copy=False)
+            batch.setdefault("decoder_loss_weights", batch["completion_mask"])
+
+            if "labels" not in batch and "input_ids" in batch:
+                labels = np.asarray(batch["input_ids"]).astype(np.int32, copy=True)
+                labels[completion_mask_np == 0] = -100
+                if attention_mask is not None:
+                    labels[np.asarray(attention_mask) == 0] = -100
+                batch["labels"] = labels
+
+        if "labels" in batch and "completion_mask" not in batch:
+            labels_np = np.asarray(batch["labels"])
+            if (labels_np == -100).any():
+                completion_mask_np = (labels_np != -100).astype(np.int32)
+                if attention_mask is not None:
+                    completion_mask_np = completion_mask_np * np.asarray(attention_mask)
+                batch["completion_mask"] = completion_mask_np
+                batch.setdefault("decoder_loss_weights", batch["completion_mask"])
+
+        if "segment_ids" in batch and "decoder_segment_ids" not in batch:
+            batch["decoder_segment_ids"] = batch["segment_ids"]
+        if "position_ids" in batch and "decoder_positions" not in batch:
+            batch["decoder_positions"] = batch["position_ids"]
+
+        return batch, infos

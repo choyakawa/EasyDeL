@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 import random
 import typing as tp
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import jax.numpy as jnp
 import numpy as np
@@ -42,22 +42,82 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PackedSequence:
-    """A packed sequence with metadata."""
+    """A packed sequence combining multiple examples with metadata.
+
+    Attributes:
+        input_ids: Token IDs array of shape (seq_length,).
+        attention_mask: Optional attention mask of shape (seq_length,).
+        segment_ids: Optional segment IDs for tracking which tokens belong
+            to which original example, used for attention masking.
+        source_ids: Optional list of source identifiers for each segment.
+        num_segments: Number of original examples packed into this sequence.
+    """
 
     input_ids: np.ndarray
     attention_mask: np.ndarray | None = None
     segment_ids: np.ndarray | None = None
+    position_ids: np.ndarray | None = None
+    fields: dict[str, np.ndarray] = field(default_factory=dict)
     source_ids: list[str] | None = None
     num_segments: int = 0
+    source_count: int = 0
 
     def to_dict(self) -> dict[str, np.ndarray]:
-        """Convert to dictionary for training."""
+        """Convert to a dictionary suitable for training loops.
+
+        Returns:
+            Dictionary with "input_ids" and optionally "attention_mask"
+            and "segment_ids" as numpy arrays.
+        """
         result = {"input_ids": self.input_ids}
         if self.attention_mask is not None:
             result["attention_mask"] = self.attention_mask
         if self.segment_ids is not None:
             result["segment_ids"] = self.segment_ids
+        if self.position_ids is not None:
+            result["position_ids"] = self.position_ids
+        if self.source_count:
+            result["__num_source_examples"] = np.asarray(self.source_count, dtype=np.int32)
+        result.update(self.fields)
         return result
+
+
+def _separator_value_for_field(field_name: str) -> int:
+    """Return the value used for synthetic EOS tokens in aligned fields."""
+    if field_name == "attention_mask":
+        return 1
+    if field_name == "labels" or field_name.endswith("_labels"):
+        return -100
+    if field_name.endswith("_mask") or field_name in {"assistant_masks", "completion_mask"}:
+        return 0
+    return 0
+
+
+def _padding_value_for_field(field_name: str) -> int:
+    """Return the padding value used for aligned packed fields."""
+    if field_name == "labels" or field_name.endswith("_labels"):
+        return -100
+    return 0
+
+
+def _position_ids_from_segments(segment_ids: np.ndarray | None, attention_mask: np.ndarray | None) -> np.ndarray | None:
+    """Build per-segment position IDs for packed sequences."""
+    if segment_ids is None:
+        return None
+    position_ids = np.zeros_like(segment_ids, dtype=np.int32)
+    last_segment = None
+    position = 0
+    valid = np.ones_like(segment_ids, dtype=bool) if attention_mask is None else attention_mask.astype(bool)
+    for idx, (segment_id, is_valid) in enumerate(zip(segment_ids.tolist(), valid.tolist(), strict=True)):
+        if not is_valid:
+            position_ids[idx] = 0
+            continue
+        if segment_id != last_segment:
+            last_segment = segment_id
+            position = 0
+        position_ids[idx] = position
+        position += 1
+    return position_ids
 
 
 class GreedyPacker:
@@ -89,25 +149,44 @@ class GreedyPacker:
 
         # Current buffer
         self._buffer: list[int] = []
+        self._attention_mask: list[int] = []
+        self._fields: dict[str, list[int]] = {}
         self._segment_ids: list[int] = []
-        self._current_segment = 0
+        self._current_segment = 1
         self._source_ids: list[str] = []
+        self._source_count = 0
 
-    def add(self, tokens: list[int], source_id: str | None = None) -> PackedSequence | None:
+    def add(
+        self,
+        tokens: list[int],
+        source_id: str | None = None,
+        fields: dict[str, list[int]] | None = None,
+    ) -> PackedSequence | None:
         """Add tokens to the packer.
 
         Args:
             tokens: Token IDs to add.
             source_id: Optional source identifier.
+            fields: Optional token-aligned fields to pack with input_ids.
 
         Returns:
             PackedSequence if a full sequence is ready, None otherwise.
         """
         result = None
+        fields = fields or {}
+        self._source_count += 1
 
         # Add tokens to buffer
-        for tok in tokens:
+        for idx, tok in enumerate(tokens):
             self._buffer.append(tok)
+            self._attention_mask.append(1)
+            for field_name, values in list(self._fields.items()):
+                if field_name not in fields:
+                    values.append(_padding_value_for_field(field_name))
+            for field_name, values in fields.items():
+                if field_name not in self._fields:
+                    self._fields[field_name] = [_padding_value_for_field(field_name)] * (len(self._buffer) - 1)
+                self._fields.setdefault(field_name, []).append(int(values[idx]))
             if self.include_segment_ids:
                 self._segment_ids.append(self._current_segment)
 
@@ -116,8 +195,14 @@ class GreedyPacker:
                 result = self._flush()
 
         # Add EOS and update segment
-        if len(self._buffer) > 0:
+        if len(self._buffer) > 0 and len(self._buffer) < self.seq_length:
             self._buffer.append(self.eos_token_id)
+            self._attention_mask.append(1)
+            for field_name, values in list(self._fields.items()):
+                if field_name not in fields:
+                    values.append(_padding_value_for_field(field_name))
+            for field_name in fields:
+                self._fields.setdefault(field_name, []).append(_separator_value_for_field(field_name))
             if self.include_segment_ids:
                 self._segment_ids.append(self._current_segment)
             self._current_segment += 1
@@ -134,29 +219,50 @@ class GreedyPacker:
         """Create a packed sequence from the current buffer."""
         # Take exactly seq_length tokens
         input_ids = np.array(self._buffer[: self.seq_length], dtype=np.int32)
+        attention_mask = np.array(self._attention_mask[: self.seq_length], dtype=np.int32)
 
         segment_ids = None
         if self.include_segment_ids:
             segment_ids = np.array(self._segment_ids[: self.seq_length], dtype=np.int32)
+        position_ids = _position_ids_from_segments(segment_ids, attention_mask)
+        fields = {
+            key: np.array(values[: self.seq_length], dtype=np.int32)
+            for key, values in self._fields.items()
+            if key != "attention_mask"
+        }
 
         result = PackedSequence(
             input_ids=input_ids,
+            attention_mask=attention_mask,
             segment_ids=segment_ids,
+            position_ids=position_ids,
+            fields=fields,
             source_ids=self._source_ids.copy() if self._source_ids else None,
             num_segments=self._current_segment,
+            source_count=self._source_count,
         )
 
         # Keep remainder
         self._buffer = self._buffer[self.seq_length :]
+        self._attention_mask = self._attention_mask[self.seq_length :]
         if self.include_segment_ids:
             self._segment_ids = self._segment_ids[self.seq_length :]
+        self._fields = {key: values[self.seq_length :] for key, values in self._fields.items()}
         self._source_ids = []
-        self._current_segment = 0
+        self._source_count = 0
+        self._current_segment = 1
 
         return result
 
     def flush_final(self) -> PackedSequence | None:
-        """Flush any remaining tokens with padding."""
+        """Flush any remaining tokens in the buffer with padding.
+
+        Pads the remaining buffer to seq_length and returns the final
+        packed sequence with an attention mask indicating valid positions.
+
+        Returns:
+            PackedSequence with padding, or None if buffer is empty.
+        """
         if not self._buffer:
             return None
 
@@ -164,26 +270,37 @@ class GreedyPacker:
         pad_len = self.seq_length - len(self._buffer)
         input_ids = np.array(self._buffer + [self.pad_token_id] * pad_len, dtype=np.int32)
 
-        attention_mask = np.ones(self.seq_length, dtype=np.int32)
-        attention_mask[len(self._buffer) :] = 0
+        attention_mask = np.array(self._attention_mask + [0] * pad_len, dtype=np.int32)
 
         segment_ids = None
         if self.include_segment_ids:
-            padded_segments = self._segment_ids + [self._current_segment] * pad_len
+            padded_segments = self._segment_ids + [0] * pad_len
             segment_ids = np.array(padded_segments, dtype=np.int32)
+        position_ids = _position_ids_from_segments(segment_ids, attention_mask)
+        fields = {
+            key: np.array(values + [_padding_value_for_field(key)] * pad_len, dtype=np.int32)
+            for key, values in self._fields.items()
+            if key != "attention_mask"
+        }
 
         result = PackedSequence(
             input_ids=input_ids,
             attention_mask=attention_mask,
             segment_ids=segment_ids,
+            position_ids=position_ids,
+            fields=fields,
             source_ids=self._source_ids.copy() if self._source_ids else None,
-            num_segments=self._current_segment + 1,
+            num_segments=max(self._current_segment - 1, 0),
+            source_count=self._source_count,
         )
 
         self._buffer = []
+        self._attention_mask = []
         self._segment_ids = []
+        self._fields = {}
         self._source_ids = []
-        self._current_segment = 0
+        self._source_count = 0
+        self._current_segment = 1
 
         return result
 
@@ -218,12 +335,18 @@ class PoolPacker:
             GreedyPacker(seq_length, eos_token_id, pad_token_id, include_segment_ids) for _ in range(num_packers)
         ]
 
-    def add(self, tokens: list[int], source_id: str | None = None) -> list[PackedSequence]:
+    def add(
+        self,
+        tokens: list[int],
+        source_id: str | None = None,
+        fields: dict[str, list[int]] | None = None,
+    ) -> list[PackedSequence]:
         """Add tokens to the best-fit packer.
 
         Args:
             tokens: Token IDs to add.
             source_id: Optional source identifier.
+            fields: Optional token-aligned fields to pack with input_ids.
 
         Returns:
             List of completed PackedSequences (may be empty).
@@ -244,14 +367,18 @@ class PoolPacker:
                 best_idx = i
 
         # Add to best packer
-        result = self._packers[best_idx].add(tokens, source_id)
+        result = self._packers[best_idx].add(tokens, source_id, fields)
         if result is not None:
             results.append(result)
 
         return results
 
     def flush_all(self) -> list[PackedSequence]:
-        """Flush all packers."""
+        """Flush all packers in the pool, returning their remaining sequences.
+
+        Returns:
+            List of PackedSequences from all packers with remaining data.
+        """
         results = []
         for packer in self._packers:
             result = packer.flush_final()
@@ -290,19 +417,25 @@ class FirstFitPacker:
         self.include_segment_ids = include_segment_ids
         self.buffer_size = buffer_size
 
-        self._pending: list[tuple[list[int], str | None]] = []
+        self._pending: list[tuple[list[int], str | None, dict[str, list[int]], int]] = []
 
-    def add(self, tokens: list[int], source_id: str | None = None) -> list[PackedSequence]:
+    def add(
+        self,
+        tokens: list[int],
+        source_id: str | None = None,
+        fields: dict[str, list[int]] | None = None,
+    ) -> list[PackedSequence]:
         """Add tokens to the pending buffer.
 
         Args:
             tokens: Token IDs to add.
             source_id: Optional source identifier.
+            fields: Optional token-aligned fields to pack with input_ids.
 
         Returns:
             List of completed PackedSequences when buffer is full.
         """
-        self._pending.append((tokens, source_id))
+        self._pending.append((tokens, source_id, fields or {}, 1))
 
         if len(self._pending) >= self.buffer_size:
             return self._pack_buffer()
@@ -317,36 +450,72 @@ class FirstFitPacker:
         # Sort by length (decreasing)
         sorted_pending = sorted(self._pending, key=lambda x: len(x[0]), reverse=True)
 
-        # Bins: list of (tokens, segment_ids, source_ids)
-        bins: list[tuple[list[int], list[int], list[str]]] = []
+        # Bins: list of (tokens, segment_ids, fields, source_ids, source_count)
+        bins: list[tuple[list[int], list[int], dict[str, list[int]], list[str], int]] = []
 
-        for tokens, source_id in sorted_pending:
-            token_len = len(tokens) + 1  # +1 for EOS
+        for tokens, source_id, fields, source_count in sorted_pending:
+            if len(tokens) > self.seq_length:
+                tokens = tokens[: self.seq_length]
+                fields = {key: values[: self.seq_length] for key, values in fields.items()}
+            include_separator = len(tokens) < self.seq_length
+            token_len = len(tokens) + (1 if include_separator else 0)
             placed = False
 
             # Find first bin that fits
-            for _i, (bin_tokens, bin_segments, bin_sources) in enumerate(bins):
+            for bin_idx, (bin_tokens, bin_segments, bin_fields, bin_sources, bin_source_count) in enumerate(bins):
                 if len(bin_tokens) + token_len <= self.seq_length:
                     # Add to this bin
-                    segment_id = max(bin_segments) + 1 if bin_segments else 0
+                    segment_id = max(bin_segments) + 1 if bin_segments else 1
+                    existing_len = len(bin_tokens)
+                    for field_name, values in fields.items():
+                        if field_name not in bin_fields:
+                            bin_fields[field_name] = [_padding_value_for_field(field_name)] * existing_len
+                    for field_name, values in list(bin_fields.items()):
+                        if field_name not in fields:
+                            values.extend([_padding_value_for_field(field_name)] * len(tokens))
                     bin_tokens.extend(tokens)
-                    bin_tokens.append(self.eos_token_id)
-                    bin_segments.extend([segment_id] * (len(tokens) + 1))
+                    bin_segments.extend([segment_id] * len(tokens))
+                    for field_name, values in fields.items():
+                        bin_fields.setdefault(field_name, []).extend([int(value) for value in values])
+                    if include_separator:
+                        bin_tokens.append(self.eos_token_id)
+                        bin_segments.append(segment_id)
+                        for field_name, values in list(bin_fields.items()):
+                            if field_name not in fields:
+                                values.append(_padding_value_for_field(field_name))
+                        for field_name in fields:
+                            bin_fields.setdefault(field_name, []).append(_separator_value_for_field(field_name))
                     if source_id:
                         bin_sources.append(source_id)
+                    bins[bin_idx] = (
+                        bin_tokens,
+                        bin_segments,
+                        bin_fields,
+                        bin_sources,
+                        bin_source_count + source_count,
+                    )
                     placed = True
                     break
 
             if not placed:
                 # Create new bin
-                new_tokens = [*tokens, self.eos_token_id]
-                new_segments = [0] * len(new_tokens)
+                new_tokens = [*tokens]
+                new_segments = [1] * len(new_tokens)
+                new_fields = {
+                    field_name: [int(value) for value in values]
+                    for field_name, values in fields.items()
+                }
+                if include_separator:
+                    new_tokens.append(self.eos_token_id)
+                    new_segments.append(1)
+                    for field_name in fields:
+                        new_fields.setdefault(field_name, []).append(_separator_value_for_field(field_name))
                 new_sources = [source_id] if source_id else []
-                bins.append((new_tokens, new_segments, new_sources))
+                bins.append((new_tokens, new_segments, new_fields, new_sources, source_count))
 
         # Convert bins to PackedSequences
         results = []
-        for bin_tokens, bin_segments, bin_sources in bins:
+        for bin_tokens, bin_segments, bin_fields, bin_sources, bin_source_count in bins:
             # Pad if needed
             pad_len = self.seq_length - len(bin_tokens)
             input_ids = np.array(bin_tokens + [self.pad_token_id] * pad_len, dtype=np.int32)
@@ -356,17 +525,25 @@ class FirstFitPacker:
 
             segment_ids = None
             if self.include_segment_ids:
-                max_seg = max(bin_segments) if bin_segments else 0
-                padded_segments = bin_segments + [max_seg + 1] * pad_len
+                padded_segments = bin_segments + [0] * pad_len
                 segment_ids = np.array(padded_segments, dtype=np.int32)
+            position_ids = _position_ids_from_segments(segment_ids, attention_mask)
+            fields = {
+                key: np.array(values + [_padding_value_for_field(key)] * pad_len, dtype=np.int32)
+                for key, values in bin_fields.items()
+                if key != "attention_mask"
+            }
 
             results.append(
                 PackedSequence(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     segment_ids=segment_ids,
+                    position_ids=position_ids,
+                    fields=fields,
                     source_ids=bin_sources if bin_sources else None,
-                    num_segments=max(bin_segments) + 1 if bin_segments else 0,
+                    num_segments=max(bin_segments) if bin_segments else 0,
+                    source_count=bin_source_count,
                 )
             )
 
@@ -374,12 +551,22 @@ class FirstFitPacker:
         return results
 
     def flush_all(self) -> list[PackedSequence]:
-        """Flush remaining pending sequences."""
+        """Flush remaining pending sequences through first-fit packing.
+
+        Returns:
+            List of PackedSequences from all remaining buffered data.
+        """
         return self._pack_buffer()
 
 
 class PackedShardedSource(ShardedDataSource[dict]):
-    """Sharded source that packs sequences from another source."""
+    """Sharded source that packs sequences from another source.
+
+    Wraps an underlying ShardedDataSource and packs its tokenized examples
+    into fixed-length sequences using a configurable packing strategy
+    (greedy, pool, or first_fit). Optionally shuffles the output using
+    reservoir sampling.
+    """
 
     def __init__(
         self,
@@ -391,6 +578,7 @@ class PackedShardedSource(ShardedDataSource[dict]):
         num_packers: int = 4,
         include_segment_ids: bool = True,
         input_field: str = "input_ids",
+        aligned_fields: Sequence[str] | None = None,
         shuffle: bool = True,
         shuffle_buffer_factor: int = 10,
         seed: int | None = None,
@@ -406,6 +594,9 @@ class PackedShardedSource(ShardedDataSource[dict]):
             num_packers: Number of packers for pool strategy.
             include_segment_ids: Whether to include segment IDs.
             input_field: Field name containing input IDs.
+            aligned_fields: Optional names of token-aligned fields to preserve.
+                If None, all 1D numeric fields with the same length as input_ids
+                are packed alongside input_ids.
             shuffle: Whether to shuffle packed sequences.
             shuffle_buffer_factor: Buffer size multiplier for shuffling.
             seed: Random seed.
@@ -418,9 +609,47 @@ class PackedShardedSource(ShardedDataSource[dict]):
         self._num_packers = num_packers
         self._include_segment_ids = include_segment_ids
         self._input_field = input_field
+        self._aligned_fields = set(aligned_fields) if aligned_fields is not None else None
         self._shuffle = shuffle
         self._shuffle_buffer_factor = shuffle_buffer_factor
         self._seed = seed
+
+    def _extract_tokens_and_fields(self, example: dict) -> tuple[list[int], dict[str, list[int]]]:
+        """Extract valid tokens and token-aligned fields from a source example."""
+        raw_tokens = np.asarray(example.get(self._input_field, []), dtype=np.int32).reshape(-1)
+        if raw_tokens.size == 0:
+            return [], {}
+
+        attention = example.get("attention_mask")
+        if attention is not None:
+            attention_arr = np.asarray(attention).reshape(-1)
+            if attention_arr.shape[0] == raw_tokens.shape[0]:
+                valid = attention_arr.astype(bool)
+            else:
+                valid = np.ones(raw_tokens.shape[0], dtype=bool)
+        else:
+            valid = np.ones(raw_tokens.shape[0], dtype=bool)
+
+        tokens = raw_tokens[valid].astype(np.int32).tolist()
+        fields: dict[str, list[int]] = {}
+        for key, value in example.items():
+            if key in {self._input_field, "segment_ids", "position_ids"}:
+                continue
+            if self._aligned_fields is not None and key not in self._aligned_fields:
+                continue
+            try:
+                array = np.asarray(value).reshape(-1)
+            except (TypeError, ValueError):
+                continue
+            if array.shape[0] != raw_tokens.shape[0]:
+                continue
+            if not (np.issubdtype(array.dtype, np.number) or array.dtype == np.bool_):
+                continue
+            if key == "attention_mask":
+                continue
+            fields[key] = array[valid].astype(np.int32).tolist()
+
+        return tokens, fields
 
     @property
     def shard_names(self) -> "Sequence[str]":
@@ -455,7 +684,17 @@ class PackedShardedSource(ShardedDataSource[dict]):
             )
 
     def open_shard(self, shard_name: str) -> "Iterator[dict]":
-        """Open the packed shard."""
+        """Open the packed shard and iterate over packed sequences.
+
+        Reads all examples from the underlying source, packs them into
+        fixed-length sequences, and optionally shuffles the output.
+
+        Args:
+            shard_name: Shard identifier (ignored, single virtual shard).
+
+        Yields:
+            Dictionaries with packed "input_ids" and optional "segment_ids".
+        """
         if self._seed is not None:
             random.seed(self._seed)
 
@@ -480,20 +719,20 @@ class PackedShardedSource(ShardedDataSource[dict]):
         # Iterate through source
         for source_shard in self._source.shard_names:
             for example in self._source.open_shard(source_shard):
-                tokens = example.get(self._input_field, [])
+                tokens, fields = self._extract_tokens_and_fields(example)
                 if not tokens:
                     continue
 
                 source_id = example.get("__source__")
 
                 if isinstance(packer, (PoolPacker, FirstFitPacker)):
-                    results = packer.add(list(tokens), source_id)
+                    results = packer.add(list(tokens), source_id, fields)
                     for packed in results:
                         out = emit(packed)
                         if out is not None:
                             yield out
                 else:
-                    result = packer.add(list(tokens), source_id)
+                    result = packer.add(list(tokens), source_id, fields)
                     if result is not None:
                         out = emit(result)
                         if out is not None:
@@ -539,7 +778,12 @@ class PackedShardedSource(ShardedDataSource[dict]):
 
 
 class PackStage(BaseStage):
-    """Pipeline stage for packing sequences."""
+    """Pipeline stage for packing tokenized sequences into fixed-length chunks.
+
+    When enabled, wraps each dataset source with a PackedShardedSource that
+    concatenates multiple tokenized examples into fixed-length sequences,
+    reducing padding waste and improving training throughput.
+    """
 
     def __init__(self, config: PackStageConfig | None = None):
         """Initialize PackStage.

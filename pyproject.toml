@@ -29,13 +29,13 @@ classifiers = [
 	"Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-	"jax>=0.9.0",
-	"jaxlib>=0.9.0",
-	"ray[default]==2.53.0",
-	"eformer==0.0.98",
-	"ejkernel==0.0.66",
+	"jax>=0.9.2",
+	"jaxlib>=0.9.2",
+	"ray[default]==2.54.0",
+	"eformer==0.0.99.12",
+	"ejkernel==0.0.78",
 	"einops~=0.8.0",
-	"transformers~=5.0.0",
+	"transformers~=5.5.0",
 	"sentencepiece>=0.2.0",
 	"flax==0.12.3",
 	"fastapi>=0.115.2",
@@ -78,12 +78,12 @@ where = ["."]
 [project.optional-dependencies]
 torch = ["torch==2.8.0", "tensorboard>=2.19.0"]
 cuda = [
-	"jax[cuda13]>=0.9.0",
+	"jax[cuda13]>=0.9.2",
 	"torch==2.8.0",
 	"tensorboard>=2.19.0",
-	"ejkernel[cuda,triton]==0.0.66",
+	"ejkernel[cuda,triton]==0.0.78",
 ]
-tpu = ["jax[tpu]>=0.9.0", "tensorboard>=2.19.0", "ejkernel[tpu]==0.0.66"]
+tpu = ["jax[tpu]>=0.9.2", "tensorboard>=2.19.0", "ejkernel[tpu]==0.0.78"]
 tensorflow = ["tensorflow~=2.19.0", "tensorflow-datasets~=4.9.9"]
 lm_eval = ["lm_eval~=0.4.11"]
 profile = [
@@ -91,7 +91,7 @@ profile = [
 	"tb-nightly>=2.21.0a20250820",
 	"xprof-nightly>=2.21.6a20250820",
 ]
-podutils = ["eopod==0.0.35"]
+podutils = ["eopod==0.0.36"]
 
 [tool.black]
 line-length = 121

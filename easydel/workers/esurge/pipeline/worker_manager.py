@@ -42,6 +42,9 @@ from .zmq_workers import DetokenizerWorkerClient, TokenizerWorkerClient
 
 logger = get_logger(__name__)
 
+DEFAULT_WORKER_STARTUP_TIMEOUT = 120.0
+_WORKER_STARTUP_TIMEOUT_ENV_VARS = ("EASURGE_WORKER_STARTUP_TIMEOUT", "ESURGE_WORKER_STARTUP_TIMEOUT")
+
 
 class WorkerManager:
     """Spawns and manages tokenizer/detokenizer worker processes and clients.
@@ -56,12 +59,24 @@ class WorkerManager:
         tokenizer_source: str | None,
         *,
         tokenizer_kwargs: dict[str, Any] | None = None,
-        startup_timeout: float = 30.0,
+        startup_timeout: float | None = None,
         ipc_dir: str | None = None,
     ) -> None:
+        """Initialize the worker manager.
+
+        Args:
+            tokenizer_source: HuggingFace tokenizer identifier or local path.
+                Required when worker endpoints are not supplied to ``start()``.
+            tokenizer_kwargs: Extra keyword arguments forwarded to
+                ``AutoTokenizer.from_pretrained``.
+            startup_timeout: Seconds to wait for each worker to bind its
+                ZMQ endpoint.
+            ipc_dir: Directory for IPC socket files. Defaults to the
+                system temp directory.
+        """
         self._tokenizer_source = tokenizer_source
         self._tokenizer_kwargs = tokenizer_kwargs or {}
-        self._startup_timeout = startup_timeout
+        self._startup_timeout = self._resolve_startup_timeout(startup_timeout)
         self._ipc_dir = ipc_dir or tempfile.gettempdir()
 
         self._tokenizer_client: TokenizerWorkerClient | None = None
@@ -91,6 +106,25 @@ class WorkerManager:
         tokenizer_endpoint: str | None,
         detokenizer_endpoint: str | None,
     ) -> tuple[TokenizerWorkerClient, DetokenizerWorkerClient]:
+        """Start or connect to tokenizer and detokenizer workers.
+
+        Args:
+            detokenizer_max_states: Maximum number of concurrent decode
+                states the detokenizer worker should maintain.
+            tokenizer_endpoint: Optional existing tokenizer ZMQ endpoint.
+                When ``None``, a new tokenizer worker is spawned.
+            detokenizer_endpoint: Optional existing detokenizer ZMQ endpoint.
+                When ``None``, a new detokenizer worker is spawned.
+
+        Returns:
+            Tuple of (TokenizerWorkerClient, DetokenizerWorkerClient).
+
+        Raises:
+            RuntimeError: If workers have already been started.
+            ValueError: If tokenizer_source was not provided and endpoints
+                are not supplied.
+            TimeoutError: If a spawned worker does not bind within the timeout.
+        """
         if self._tokenizer_client or self._detokenizer_client:
             raise RuntimeError("WorkerManager has already started clients.")
 
@@ -110,7 +144,7 @@ class WorkerManager:
             )
             self._tokenizer_owned = True
             try:
-                self._wait_for_endpoint(tokenizer_endpoint, self._tokenizer_process)
+                self._wait_for_endpoint("tokenizer", tokenizer_endpoint, self._tokenizer_process)
             except Exception:
                 self._terminate_process("_tokenizer_process")
                 self._cleanup_ipc_file(tokenizer_endpoint)
@@ -126,7 +160,7 @@ class WorkerManager:
             )
             self._detokenizer_owned = True
             try:
-                self._wait_for_endpoint(detokenizer_endpoint, self._detokenizer_process)
+                self._wait_for_endpoint("detokenizer", detokenizer_endpoint, self._detokenizer_process)
             except Exception:
                 self._terminate_process("_detokenizer_process")
                 self._cleanup_ipc_file(detokenizer_endpoint)
@@ -138,6 +172,11 @@ class WorkerManager:
         return self._tokenizer_client, self._detokenizer_client
 
     def shutdown(self) -> None:
+        """Shut down all managed workers and release resources.
+
+        Sends shutdown commands to owned workers, terminates their
+        processes, and cleans up IPC socket files.
+        """
         self._shutdown_client("_tokenizer_client", "_tokenizer_owned", "_tokenizer_process", self._tokenizer_endpoint)
         self._shutdown_client(
             "_detokenizer_client", "_detokenizer_owned", "_detokenizer_process", self._detokenizer_endpoint
@@ -158,7 +197,36 @@ class WorkerManager:
             except Exception as exc:
                 logger.warning("Failed to drain %s worker: %s", name, exc)
 
-    # Internal helpers -----------------------------------------------------
+    def _resolve_startup_timeout(self, startup_timeout: float | None) -> float:
+        if startup_timeout is not None:
+            timeout = float(startup_timeout)
+            if timeout <= 0:
+                raise ValueError("startup_timeout must be greater than 0.")
+            return timeout
+
+        for env_name in _WORKER_STARTUP_TIMEOUT_ENV_VARS:
+            raw_value = os.environ.get(env_name)
+            if raw_value is None:
+                continue
+            try:
+                timeout = float(raw_value)
+            except ValueError:
+                logger.warning(
+                    "Ignoring invalid %s=%r; expected a positive timeout in seconds.",
+                    env_name,
+                    raw_value,
+                )
+                continue
+            if timeout <= 0:
+                logger.warning(
+                    "Ignoring invalid %s=%r; expected a positive timeout in seconds.",
+                    env_name,
+                    raw_value,
+                )
+                continue
+            return timeout
+
+        return DEFAULT_WORKER_STARTUP_TIMEOUT
 
     def _spawn_worker(
         self,
@@ -190,7 +258,7 @@ class WorkerManager:
 
         return subprocess.Popen(cmd, env=env)
 
-    def _wait_for_endpoint(self, endpoint: str, process: subprocess.Popen | None) -> None:
+    def _wait_for_endpoint(self, worker_name: str, endpoint: str, process: subprocess.Popen | None) -> None:
         deadline = time.time() + self._startup_timeout
         path = None
         if endpoint.startswith("ipc://"):
@@ -198,12 +266,18 @@ class WorkerManager:
 
         while time.time() < deadline:
             if process and process.poll() is not None:
-                raise RuntimeError(f"Worker process for {endpoint} exited with code {process.returncode}")
+                raise RuntimeError(
+                    f"{worker_name.capitalize()} worker process for {endpoint} exited with code {process.returncode}"
+                )
             if path and os.path.exists(path):
                 return
             time.sleep(0.05)
 
-        raise TimeoutError(f"Timed out waiting for worker to bind to {endpoint}")
+        pid_text = f" (pid={process.pid})" if process is not None and process.poll() is None else ""
+        raise TimeoutError(
+            f"Timed out waiting {self._startup_timeout:.1f}s for {worker_name} worker to bind to {endpoint}{pid_text}. "
+            "Increase `worker_startup_timeout` or set `EASURGE_WORKER_STARTUP_TIMEOUT`."
+        )
 
     def _make_ipc_endpoint(self, prefix: str) -> str:
         os.makedirs(self._ipc_dir, exist_ok=True)

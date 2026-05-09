@@ -1,11 +1,24 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Task-specific test classes for EasyDeL model testing.
 
 This module provides tester classes for different model task types,
 including CAUSAL_LM, BASE_MODULE, SEQUENCE_CLASSIFICATION, VLM, etc.
 """
 
-# pyright: reportPrivateLocalImportUsage=false
-
+import inspect
 import traceback
 from dataclasses import dataclass, field
 from typing import Any
@@ -273,7 +286,7 @@ class CausalLMTester(BaseTester):
                     ed_logits=ed_output.logits,
                     hf_loss=float(hf_output.loss.cpu().detach().numpy()),
                     ed_loss=float(ed_output.loss),
-                    hf_aux_loss=float(hf_aux) if hf_aux else 0,
+                    hf_aux_loss=float(hf_aux.cpu().detach()) if hf_aux else 0,
                     ed_aux_loss=float(ed_aux) if ed_aux else 0,
                 )
 
@@ -320,10 +333,7 @@ class CausalLMTester(BaseTester):
         try:
             # Setup config
             config = setup_config(config, small_model_config)
-            # Generation tests should be portable across backends. Some MoE paths
-            # use collectives that are not available on XLA:CPU when sharding on EP,
-            # so prefer placing the extra device on TP.
-            config.sharding_axis_dims = (1, 1, 1, -1, 1)
+            config.sharding_axis_dims = small_model_config["sharding_axis_dims"]
             # Handle EasyDeL-only models (no HF model needed for generation test)
             if hf_class is None:
                 with config.mesh:
@@ -626,12 +636,45 @@ class VisionLanguageTester(BaseTester):
     """Test IMAGE_TEXT_TO_TEXT (Vision-Language) models."""
 
     @staticmethod
+    def _supports_forward_kwarg(ed_model: Any, kwarg_name: str) -> bool:
+        """Best-effort check whether the model forward accepts a kwarg.
+
+        Args:
+            ed_model: EasyDeL model instance whose ``__call__`` signature is
+                inspected.
+            kwarg_name: Name of the keyword argument to look for.
+
+        Returns:
+            ``True`` if *kwarg_name* appears in the model's ``__call__``
+            signature, ``False`` otherwise or if the signature cannot be
+            retrieved.
+        """
+        try:
+            signature = inspect.signature(ed_model.__call__)
+        except (TypeError, ValueError):
+            return False
+        return kwarg_name in signature.parameters
+
+    @staticmethod
     def _build_vlm_jit_inputs(ed_model: Any, ed_inputs: dict, vlm_config: dict) -> tuple[dict, dict]:
         """Prepare inputs for a jittable VLM forward pass.
 
-        Computes `inputs_embeds` outside of `ejit` (including multimodal merge) and
-        passes only JIT-friendly tensors (e.g. `inputs_embeds`, `position_ids`,
-        `deepstack_visual_embeds`) to the compiled forward.
+        Computes ``inputs_embeds`` outside of ``ejit`` (including multimodal
+        merge) and passes only JIT-friendly tensors (e.g. ``inputs_embeds``,
+        ``position_ids``, ``deepstack_visual_embeds``) to the compiled forward.
+
+        Args:
+            ed_model: EasyDeL VLM model instance with
+                ``compute_embedding_with_info``.
+            ed_inputs: Dict of raw model inputs (``input_ids``,
+                ``attention_mask``, pixel values, etc.).
+            vlm_config: VLM test configuration dict (keys like
+                ``is_qwen_vl``).
+
+        Returns:
+            A ``(forward_kwargs, loss_kwargs)`` tuple where *forward_kwargs*
+            contains JIT-safe tensors for the model forward and
+            *loss_kwargs* holds the labels dict.
         """
         input_ids = ed_inputs["input_ids"]
         attention_mask = ed_inputs.get("attention_mask")
@@ -640,7 +683,9 @@ class VisionLanguageTester(BaseTester):
         else:
             attention_mask = attention_mask.astype(jnp.bool)
 
-        embedding_kwargs = {k: v for k, v in ed_inputs.items() if k not in ["input_ids", "attention_mask"]}
+        embedding_kwargs = {
+            k: v for k, v in ed_inputs.items() if k not in ["input_ids", "attention_mask", "mm_token_type_ids"]
+        }
         if vlm_config.get("is_qwen_vl", False):
             inputs_embeds, embed_info = ed_model.compute_embedding_with_info(
                 input_ids,
@@ -659,11 +704,25 @@ class VisionLanguageTester(BaseTester):
         token_type_ids = ed_inputs.get("token_type_ids")
         if token_type_ids is not None:
             forward_kwargs["token_type_ids"] = token_type_ids
+        mm_token_type_ids = ed_inputs.get("mm_token_type_ids")
+        supports_mm_token_type_ids = mm_token_type_ids is not None and VisionLanguageTester._supports_forward_kwarg(
+            ed_model,
+            "mm_token_type_ids",
+        )
+        if supports_mm_token_type_ids:
+            forward_kwargs["mm_token_type_ids"] = mm_token_type_ids
 
         if embed_info is not None:
             position_ids = getattr(embed_info, "position_ids", None)
-            if position_ids is not None:
+            if position_ids is not None and not supports_mm_token_type_ids:
                 forward_kwargs["position_ids"] = jnp.asarray(position_ids, dtype="i4")
+
+            per_layer_inputs = getattr(embed_info, "per_layer_inputs", None)
+            if per_layer_inputs is not None and VisionLanguageTester._supports_forward_kwarg(
+                ed_model,
+                "per_layer_inputs",
+            ):
+                forward_kwargs["per_layer_inputs"] = per_layer_inputs
 
             visual_pos_masks = getattr(embed_info, "visual_pos_masks", None)
             deepstack_visual_embeds = getattr(embed_info, "deepstack_visual_embeds", None)
@@ -673,7 +732,21 @@ class VisionLanguageTester(BaseTester):
 
         if vlm_config.get("is_qwen_vl", False) and hasattr(ed_model, "base_model"):
             base_model = ed_model.base_model
-            if hasattr(base_model, "get_rope_index"):
+            base_model_config = getattr(base_model, "config", None)
+            model_type = getattr(base_model_config, "model_type", None)
+            if supports_mm_token_type_ids and model_type in {"qwen3_5", "qwen3_5_moe"}:
+                from easydel.modules.qwen3_5.modeling_qwen3_5 import _get_rope_index_from_mm_token_types
+
+                position_ids, _rope_deltas = _get_rope_index_from_mm_token_types(
+                    input_ids=input_ids,
+                    mm_token_type_ids=mm_token_type_ids,
+                    image_grid_thw=ed_inputs.get("image_grid_thw"),
+                    video_grid_thw=ed_inputs.get("video_grid_thw"),
+                    attention_mask=attention_mask,
+                    spatial_merge_size=base_model_config.vision_config.spatial_merge_size,
+                )
+                forward_kwargs["position_ids"] = jnp.asarray(position_ids, dtype="i4")
+            elif hasattr(base_model, "get_rope_index"):
                 if "position_ids" not in forward_kwargs:
                     position_ids, _rope_deltas = base_model.get_rope_index(
                         input_ids=input_ids,
@@ -733,6 +806,7 @@ class VisionLanguageTester(BaseTester):
                     pixel_values_shape=vlm_config["pixel_values_shape"],
                     image_grid_thw=vlm_config["image_grid_thw"],
                     num_images=vlm_config.get("num_images", 1),
+                    mm_token_type_ids=vlm_config.get("use_mm_token_type_ids", False),
                 )
             else:
                 inputs = make_vlm_inputs(
@@ -744,6 +818,7 @@ class VisionLanguageTester(BaseTester):
                     pixel_values_shape=vlm_config["pixel_values_shape"],
                     num_images=vlm_config.get("num_images", 1),
                     token_type_ids=vlm_config.get("use_token_type_ids", False),
+                    mm_token_type_ids=vlm_config.get("use_mm_token_type_ids", False),
                     image_grid_hws=vlm_config.get("image_grid_hws"),
                     image_grid_thw=vlm_config.get("image_grid_thw"),
                     video_grid_thw=vlm_config.get("video_grid_thw"),
@@ -1230,4 +1305,89 @@ class EasyDeLOnlyTester:
             return TestResult(
                 success=False,
                 error_message=str(e),
+            )
+
+
+class EmbeddingTester:
+    """Test EMBEDDING models (EasyDeL-only, no HF comparison).
+
+    Verifies that embedding models:
+    1. Produce correct output shapes ``(batch, hidden_size)``
+    2. Return L2-normalized vectors when configured
+    3. Support Matryoshka truncation
+    """
+
+    def run(
+        self,
+        module_name: str,
+        task: ed.TaskType,
+        config: Any,
+        small_model_config: dict,
+    ) -> TestResult:
+        """Run embedding forward pass and verify output shapes + normalization.
+
+        Args:
+            module_name: Name of the module (e.g. ``"qwen2"``)
+            task: Task type (should be ``TaskType.EMBEDDING``)
+            config: Model configuration
+            small_model_config: Base config dictionary
+
+        Returns:
+            TestResult indicating success and extra info about shapes/norms.
+        """
+        try:
+            config = setup_config(config, small_model_config)
+
+            with config.mesh:
+                ed_model = create_ed_model_only(
+                    module_name=module_name,
+                    task=task,
+                    config=config,
+                    small_model_config=small_model_config,
+                )
+
+                batch_size = small_model_config["batch_size"]
+                seq_len = small_model_config["sequence_length"]
+                vocab_size = small_model_config["vocab_size"]
+
+                import numpy as np
+
+                np.random.seed(42)  # noqa: NPY002
+                input_ids = jnp.array(
+                    np.random.randint(0, vocab_size, (batch_size, seq_len)),  # noqa: NPY002
+                    dtype="i4",
+                )
+                attention_mask = jnp.ones_like(input_ids, dtype="bool")
+
+                output = ed_model(input_ids=input_ids, attention_mask=attention_mask)
+
+                embeddings = output.embeddings
+                hidden_size = config.hidden_size
+                expected_shape = (batch_size, hidden_size)
+                shape_ok = tuple(embeddings.shape) == expected_shape
+
+                norms = jnp.linalg.norm(embeddings, axis=-1)
+                norms_ok = bool(jnp.allclose(norms, 1.0, atol=1e-4))
+
+                success = shape_ok and norms_ok
+                msg = ""
+                if not shape_ok:
+                    msg += f"Shape mismatch: got {tuple(embeddings.shape)}, expected {expected_shape}. "
+                if not norms_ok:
+                    msg += f"L2 norms not ~1.0: min={float(norms.min()):.4f}, max={float(norms.max()):.4f}. "
+
+            return TestResult(
+                success=success,
+                error_message=msg,
+                extra_info={
+                    "embedding_shape": list(embeddings.shape),
+                    "norms_min": float(norms.min()),
+                    "norms_max": float(norms.max()),
+                },
+            )
+
+        except Exception as e:
+            return TestResult(
+                success=False,
+                error_message=f"{e}\n{traceback.format_exc()}",
             )

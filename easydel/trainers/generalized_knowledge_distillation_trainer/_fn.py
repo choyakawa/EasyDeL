@@ -15,9 +15,9 @@
 from __future__ import annotations
 
 import collections.abc
+import functools
 import typing as tp
 
-import flax
 import jax
 from eformer.escale import with_sharding_constraint
 from jax import numpy as jnp
@@ -165,18 +165,46 @@ def gkd_step(
     )
     batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
 
+    def teacher_forward(minibatch: collections.abc.Mapping[str, jax.Array]) -> jax.Array:
+        teacher_call_kwargs = dict(minibatch)
+        teacher_call_kwargs.pop("labels", None)
+        teacher_call_kwargs.pop("completion_mask", None)
+        teacher_call_kwargs.pop("assistant_masks", None)
+        teacher_call_kwargs = filter_kwargs_for_callable(teacher_state.model.__call__, teacher_call_kwargs)
+        teacher_call_kwargs = sanitize_model_call_kwargs(teacher_call_kwargs)
+        teacher_static_kwargs = {
+            key: teacher_call_kwargs.pop(key)
+            for key in list(teacher_call_kwargs)
+            if not hasattr(teacher_call_kwargs[key], "shape")
+        }
+
+        @functools.partial(
+            jax.checkpoint,
+            prevent_cse=True,
+            policy=jax.checkpoint_policies.nothing_saveable,
+        )
+        def _teacher_fwd(kw, t_graphstate):
+            teacher_module = teacher_state.merge(t_graphstate)
+            teacher_outputs = teacher_module(**kw, **teacher_static_kwargs)
+            return jax.lax.stop_gradient(teacher_outputs.logits)
+
+        return _teacher_fwd(
+            teacher_call_kwargs,
+            jax.lax.stop_gradient(teacher_state.graphstate),
+        )
+
     def loss_fn(tree, minibatch):
         if is_training and straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
-        module = flax.nnx.merge(student_state.graphdef, tree, student_state.graphother)
+        module = student_state.merge(tree)
         call_kwargs = dict(minibatch)
         labels = call_kwargs.pop("labels", None)
+        call_kwargs.pop("completion_mask", None)
+        call_kwargs.pop("assistant_masks", None)
+        teacher_logits = teacher_forward(minibatch)
         call_kwargs = filter_kwargs_for_callable(module.__call__, call_kwargs)
-        call_kwargs = filter_kwargs_for_callable(teacher_state.model.__call__, call_kwargs)
         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
         student_outputs = module(**call_kwargs)
-        teacher_outputs = teacher_state.model(**call_kwargs)
-        teacher_outputs = _stop_gradient_tree(teacher_outputs)
 
         completion_mask = minibatch.get("completion_mask")
         attention_mask = minibatch.get("attention_mask")
@@ -184,7 +212,7 @@ def gkd_step(
 
         loss_value = generalized_jsd_loss(
             student_logits=student_outputs.logits,
-            teacher_logits=teacher_outputs.logits,
+            teacher_logits=teacher_logits,
             labels=labels,
             mask=mask,
             beta=beta,

@@ -1,3 +1,17 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import pytest
 from jax import numpy as jnp
 
@@ -50,6 +64,11 @@ def test_training_arguments_from_dict_maps_legacy_quantization_block():
 def test_training_arguments_load_from_json_maps_legacy_quantization_block():
     cfg = TrainingArguments.load_from_json({**_base_training_args(), "quantization_block": 8})
     assert cfg.quantization_group_size == 8
+
+
+def test_training_arguments_accepts_use_data_collator():
+    cfg = TrainingArguments(**_base_training_args(), use_data_collator=False)
+    assert cfg.use_data_collator is False
 
 
 def test_resolve_straight_through_emulator_supports_legacy_alias_with_warning():

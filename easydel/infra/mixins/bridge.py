@@ -69,6 +69,7 @@ from dataclasses import dataclass
 import huggingface_hub
 import huggingface_hub.errors
 import jax
+import numpy as np
 from eformer.escale import PartitionAxis
 from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
@@ -102,9 +103,19 @@ except ImportError:  # transformers>=5 removed helper
 
 from transformers.utils.hub import PushToHubMixin
 
-from easydel.layers import QuantizationConfig
+from easydel.layers import QuantizationConfig, eLoRA
+from easydel.utils.helpers import is_remote_path
 from easydel.utils.readme_generator import ModelInfo, ReadmeGenerator
-from easydel.utils.traversals import flatten_dict, is_flatten, merge_model_and_tree, string_key_to_int, unflatten_dict
+from easydel.utils.traversals import (
+    flatten_dict,
+    get_module_from_path,
+    is_flatten,
+    merge_model_and_tree,
+    set_module_from_path,
+    string_key_to_int,
+    tree_path_to_string,
+    unflatten_dict,
+)
 
 from ..base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict, is_remote_url
 from ..base_config import download_url as _download_url
@@ -212,6 +223,130 @@ def _path_match_variants(path: str) -> tuple[str, ...]:
     dot_variants = {p.replace("/", ".") for p in slash_variants}
     all_variants = slash_variants | dot_variants
     return tuple(sorted(v for v in all_variants if v))
+
+
+def _checkpoint_cpu_device() -> jax.Device | None:  # pyright: ignore[reportInvalidTypeForm] #type: ignore
+    """Resolve a host CPU device for checkpoint-time array normalization."""
+    try:
+        cpu_devices = jax.devices("cpu")
+    except Exception:
+        return None
+    return cpu_devices[0] if cpu_devices else None
+
+
+def _normalize_checkpoint_leaf_to_jax(
+    value: tp.Any,
+    *,
+    cpu_device: jax.Device | None,  # pyright: ignore[reportInvalidTypeForm]
+) -> tp.Any:
+    """Convert NumPy leaves into JAX arrays without consuming accelerator HBM."""
+    if not isinstance(value, (np.ndarray, np.generic)):
+        return value
+    if cpu_device is not None:
+        return jax.device_put(value, cpu_device)
+    return jnp.asarray(value)
+
+
+def _collect_lora_checkpoint_paths(
+    flat_state: dict[tuple[tp.Any, ...], tp.Any],
+) -> dict[tuple[tp.Any, ...], dict[str, tp.Any]]:
+    """Extract LoRA adapter locations from a flattened checkpoint state.
+
+    Checkpoints are loaded as a flat mapping from tree paths to leaves. LoRA
+    adapters appear as sibling leaves such as ``(..., "lora_a")`` and
+    ``(..., "lora_b")``. This helper groups those leaves by their parent module
+    path and only returns entries where both adapter matrices are present.
+
+    Args:
+        flat_state: Flattened checkpoint mapping produced during load.
+
+    Returns:
+        A mapping from module path to a small dictionary containing the matched
+        ``lora_a`` and ``lora_b`` leaves for that module.
+    """
+    lora_paths: dict[tuple[tp.Any, ...], dict[str, tp.Any]] = {}
+    for key, value in flat_state.items():
+        if not isinstance(key, tuple) or not key:
+            continue
+        leaf_name = str(key[-1])
+        if leaf_name not in {"lora_a", "lora_b"}:
+            continue
+        entry = lora_paths.setdefault(key[:-1], {})
+        entry[leaf_name] = value
+    return {path: values for path, values in lora_paths.items() if {"lora_a", "lora_b"} <= set(values)}
+
+
+def _rebuild_lora_modules_from_checkpoint(
+    model: "EasyDeLBaseModule",
+    flat_state: dict[tuple[tp.Any, ...], tp.Any],
+) -> "EasyDeLBaseModule":
+    """Recreate LoRA wrappers before merging a LoRA checkpoint into a model.
+
+    ``from_pretrained`` first instantiates the plain base model and only then
+    merges checkpoint leaves into it. That is fine for standard checkpoints, but
+    LoRA checkpoints contain parameter paths like ``lm_head.lora_a`` that do not
+    exist on the plain model yet. This helper scans the checkpoint, identifies
+    which modules were LoRA-wrapped at save time, and rebuilds matching
+    :class:`eLoRA` wrappers on the live model so the subsequent parameter merge
+    lands on the correct paths.
+
+    Args:
+        model: Freshly initialized model instance that will receive checkpoint
+            weights.
+        flat_state: Flattened checkpoint mapping. Only the structure is
+            inspected here; values are merged later by the normal loader path.
+
+    Returns:
+        The same model instance, potentially mutated in-place with rebuilt LoRA
+        wrappers.
+    """
+    lora_paths = _collect_lora_checkpoint_paths(flat_state)
+    if not lora_paths:
+        return model
+
+    rebuilt = 0
+    for path in sorted(lora_paths, key=len):
+        module = get_module_from_path(model=model, path=path)
+        if module is None or isinstance(module, nn.LoRA):
+            continue
+
+        lora_a = lora_paths[path]["lora_a"]
+        shape = getattr(lora_a, "shape", None)
+        if shape is None or len(shape) < 2:
+            logger.warning(
+                "Skipping LoRA checkpoint path %s because lora_a has an unexpected shape %s.",
+                ".".join(str(part) for part in path),
+                shape,
+            )
+            continue
+        rank = shape[-1]
+        in_features = getattr(module, "in_features", None)
+        out_features = getattr(module, "out_features", None)
+        if rank is None or in_features is None or out_features is None:
+            logger.warning(
+                "Skipping LoRA checkpoint path %s because the target module does not expose linear dimensions.",
+                ".".join(str(part) for part in path),
+            )
+            continue
+
+        set_module_from_path(
+            model=model,
+            path=path,
+            new_value=eLoRA(
+                base_module=module,
+                rngs=nn.Rngs(0),
+                dtype=getattr(module, "dtype", None),
+                param_dtype=getattr(module, "param_dtype", getattr(lora_a, "dtype", jnp.float32)),
+                in_features=int(in_features),
+                lora_rank=int(rank),
+                out_features=int(out_features),
+            ),
+        )
+        rebuilt += 1
+
+    if rebuilt:
+        logger.info("Detected LoRA checkpoint; rebuilt %d LoRA wrapper(s) before parameter merge.", rebuilt)
+    return model
 
 
 def _build_safe_checkpoint_partition_rules(
@@ -465,7 +600,6 @@ class EasyBridgeMixin(PushToHubMixin):
     def _save_model_files(
         self,
         save_directory: ePathLike,
-        gather_fns: dict[str, tp.Callable] | None = None,
         float_dtype=None,
         *,
         step: int | None = None,
@@ -474,33 +608,52 @@ class EasyBridgeMixin(PushToHubMixin):
 
         Args:
             save_directory (ePathLike): The directory where the model files will be saved.
-            gather_fns (dict[Callable], optional): Custom gather functions for checkpoint saving.
-                Defaults to None, which uses the model's default gather functions.
             float_dtype (dtype, optional): Data type for saving weights. Defaults to None.
             step (int, optional): The training step number for versioned checkpoints.
                 Defaults to None.
         """
-        save_directory.mkdir(parents=True, exist_ok=True)
+        if not is_remote_path(save_directory) or jax.process_index() == 0:
+            save_directory.mkdir(parents=True, exist_ok=True)
 
-        config_to_save = deepcopy(self.config)
-        config_to_save.__dict__.pop("attn_dtype", None)
-        config_to_save.__dict__.pop("attn_softmax_dtype", None)
-        config_to_save.architectures = [self.__class__.__name__]
-        config_to_save.save_pretrained(str(save_directory))
+            config_to_save = deepcopy(self.config)
+            config_to_save.__dict__.pop("attn_dtype", None)
+            config_to_save.__dict__.pop("attn_softmax_dtype", None)
+            config_to_save.architectures = [self.__class__.__name__]
+            config_to_save.save_pretrained(str(save_directory))
 
-        if self.can_generate() and hasattr(self, "generation_config"):
-            if self.generation_config is not None:
-                _save_generation_config(self.generation_config, save_directory)
+            if self.can_generate() and hasattr(self, "generation_config"):
+                if self.generation_config is not None:
+                    _save_generation_config(self.generation_config, save_directory)
 
-        state = nn.split(self, nn.Param, ...)[1]  # NOTE: This one here ignores LoRA Params...
-        if gather_fns is None:
-            gather_fns = self._gather_fns
+        state = nn.split(self, nn.Param, ...)[1]
+        state_dict = state.to_pure_dict()
+        cpu_device = _checkpoint_cpu_device()
+        numpy_leaf_paths: list[str] = []
+        state_dict = jax.tree_util.tree_map_with_path(
+            lambda path, x: (
+                (
+                    numpy_leaf_paths.append(tree_path_to_string(path, sep=".")),
+                    _normalize_checkpoint_leaf_to_jax(x, cpu_device=cpu_device),
+                )[-1]
+                if isinstance(x, (np.ndarray, np.generic))
+                else x
+            ),
+            state_dict,
+        )
+        if numpy_leaf_paths:
+            preview_limit = 32
+            preview = ", ".join(numpy_leaf_paths[:preview_limit])
+            remainder = len(numpy_leaf_paths) - preview_limit
+            suffix = f" ... (+{remainder} more)" if remainder > 0 else ""
+            logger.info(
+                f"Normalizing {len(numpy_leaf_paths)} NumPy checkpoint leaves to CPU-backed JAX arrays before save: {preview}{suffix}"
+            )
         output_model_file = Checkpointer(
             base_path=str(save_directory),
             save_interval=None,
             step_policies=[],
         ).save_pytree(
-            tree=state.to_pure_dict(),
+            tree=state_dict,
             prefix="model",
             mesh=self.mesh,
             dtype=float_dtype,
@@ -515,9 +668,9 @@ class EasyBridgeMixin(PushToHubMixin):
         save_directory: str | os.PathLike,
         push_to_hub: bool = False,
         token: str | bool | None = None,
-        gather_fns: dict[str, tp.Callable] | None = None,
         float_dtype: jnp.dtype | None = None,
         step: int | None = None,
+        upload_num_threads: int | None = None,
         **kwargs,
     ):
         """Saves the model, its configuration, and optionally pushes it to the Hugging Face Hub.
@@ -528,13 +681,17 @@ class EasyBridgeMixin(PushToHubMixin):
                 Defaults to False.
             token (str or bool, optional): The Hugging Face Hub token for authentication.
                 Defaults to None.
-            gather_fns (dict[Callable], optional): Custom gather functions for checkpoint saving.
-                Defaults to None.
             float_dtype (jnp.dtype, optional): Data type for saving weights. Defaults to None.
             step (int, optional): The training step number for versioned checkpoints.
                 Defaults to None.
+            upload_num_threads (int | None, optional): Number of concurrent upload threads
+                to use for Hub commits. If None, EasyDeL auto-selects a capped default.
             **kwargs: Additional keyword arguments for Hugging Face Hub (e.g., repo_id,
                 commit_message).
+
+        Note:
+            This method saves the model state exactly as it exists. Call
+            ``gather_model()`` first if you need gathered weights before export.
         """
 
         easy_directory = ePath(save_directory)
@@ -552,12 +709,13 @@ class EasyBridgeMixin(PushToHubMixin):
 
         self._save_model_files(
             save_directory=easy_directory,
-            gather_fns=gather_fns,
             float_dtype=float_dtype,
             step=step,
         )
-        readme_path = easy_directory / "README.md"
-        readme_path.write_text(self._model_card(repo_id, repo_id))
+        if not is_remote_path(easy_directory) or jax.process_index() == 0:
+            readme_path = easy_directory / "README.md"
+            if not readme_path.exists():
+                readme_path.write_text(self._model_card(repo_id, repo_id))
 
         if push_to_hub and jax.process_index() == 0:
             self._upload_modified_files(
@@ -566,6 +724,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 files_timestamps,
                 commit_message=commit_message,
                 token=token,
+                upload_num_threads=upload_num_threads,
             )
 
     def push_to_hub(
@@ -576,12 +735,12 @@ class EasyBridgeMixin(PushToHubMixin):
         private: bool | None = None,
         token: bool | str | None = None,
         create_pr: bool = False,
-        gather_fns: dict[str, tp.Callable] | None = None,
         float_dtype: jnp.dtype | None = None,
         verbose: bool = True,
         mismatch_allowed: bool = True,
         revision: str | None = None,
         commit_description: str | None = None,
+        upload_num_threads: int | None = None,
     ) -> tp.Any:
         """Pushes the model to the Hugging Face Hub.
 
@@ -592,15 +751,20 @@ class EasyBridgeMixin(PushToHubMixin):
             private (bool, optional): If True, creates a private repository.
             token (str or bool, optional): The Hugging Face Hub token.
             create_pr (bool, optional): If True, creates a pull request.
-            gather_fns (dict[Callable], optional): Custom gather functions for checkpoint saving.
             float_dtype (dtype, optional): Data type for saving weights.
             verbose (bool, optional): Whether to print verbose messages. Defaults to True.
             mismatch_allowed (bool, optional): If True, allows mismatch in parameters while loading. Defaults to True.
             revision (str, optional): The revision to push to.
             commit_description (str, optional): The commit description for the push.
+            upload_num_threads (int | None, optional): Number of concurrent upload threads
+                to use for Hub commits. If None, EasyDeL auto-selects a capped default.
 
         Returns:
             str: The URL of the created repository.
+
+        Note:
+            Call ``gather_model()`` before pushing if you need gathered weights in
+            the exported checkpoint.
         """
         working_dir = ePath(repo_id.split("/")[-1])
 
@@ -620,7 +784,6 @@ class EasyBridgeMixin(PushToHubMixin):
                 save_directory=work_dir,
                 push_to_hub=False,
                 token=token,
-                gather_fns=gather_fns,
                 float_dtype=float_dtype,
                 verbose=verbose,
                 mismatch_allowed=mismatch_allowed,
@@ -636,6 +799,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 create_pr=create_pr,
                 revision=revision,
                 commit_description=commit_description,
+                upload_num_threads=upload_num_threads,
             )
 
     @classmethod
@@ -657,6 +821,7 @@ class EasyBridgeMixin(PushToHubMixin):
         create_pr: bool = False,
         revision: str | None = None,
         commit_description: str | None = None,
+        upload_num_threads: int | None = None,
     ):
         """
         Uploads all modified files under `working_dir` to `repo_id`, at arbitrary depth, based on `files_timestamps`.
@@ -710,6 +875,11 @@ class EasyBridgeMixin(PushToHubMixin):
             logger.info("No modified files found in %s; nothing to upload.", working_dir)
             return None
 
+        upload_num_threads = self._resolve_upload_num_threads(
+            upload_num_threads=upload_num_threads,
+            operation_count=len(operations),
+        )
+
         if revision is not None and not revision.startswith("refs/pr"):
             try:
                 create_branch(repo_id=repo_id, branch=revision, token=token, exist_ok=True)
@@ -720,7 +890,7 @@ class EasyBridgeMixin(PushToHubMixin):
                     raise
 
         logger.info(f"Uploading the files to {repo_id}")
-        return create_commit(
+        create_commit_kwargs = dict(
             repo_id=repo_id,
             operations=operations,
             commit_message=commit_message,
@@ -729,6 +899,25 @@ class EasyBridgeMixin(PushToHubMixin):
             create_pr=create_pr,
             revision=revision,
         )
+        if upload_num_threads is not None:
+            create_commit_kwargs["num_threads"] = upload_num_threads
+        return create_commit(**create_commit_kwargs)
+
+    @staticmethod
+    def _resolve_upload_num_threads(upload_num_threads: int | None, operation_count: int) -> int:
+        """Resolve Hub upload concurrency with a conservative automatic default."""
+        if upload_num_threads is not None:
+            return max(int(upload_num_threads), 1)
+
+        cpu_count = int(os.cpu_count() or 1)
+        auto_threads = max(1, min(cpu_count, 16, max(int(operation_count), 1)))
+        logger.info(
+            "Auto-selected upload_num_threads=%s (operations=%s, os.cpu_count()=%s).",
+            auto_threads,
+            int(operation_count),
+            cpu_count,
+        )
+        return auto_threads
 
     @classmethod
     def _load_model_weights(
@@ -847,6 +1036,7 @@ class EasyBridgeMixin(PushToHubMixin):
 
             state = flatten_dict(state)
             state = string_key_to_int(state)
+            model = _rebuild_lora_modules_from_checkpoint(model=model, flat_state=state)
 
             has_quantized_keys = any(
                 isinstance(k, tuple) and k and str(k[-1]).startswith("quant_") for k in state.keys()
@@ -893,6 +1083,7 @@ class EasyBridgeMixin(PushToHubMixin):
                     prepack_quantized_weights,
                     static_argnames=["group_size", "bits", "mode", "transpose"],
                 )
+                from easydel.layers.linears._linear_quantized import _effective_ejkernel_group_size
                 from easydel.layers.quantization._configs import resolve_ejkernel_quant_params
 
                 if kernel_map:
@@ -908,6 +1099,7 @@ class EasyBridgeMixin(PushToHubMixin):
                             continue
                         kernel_value = state.pop(kernel_key)
                         mode, group_size, bits, needs_biases = resolve_ejkernel_quant_params(quantization_config)
+                        group_size = _effective_ejkernel_group_size(mode, group_size, tuple(kernel_value.shape))
                         if needs_biases:
                             quant_kernel, quant_scales, quant_biases = prepack_quantized_weights(
                                 kernel_value,
@@ -932,12 +1124,18 @@ class EasyBridgeMixin(PushToHubMixin):
                             quant_kernel.block_until_ready()
                         del kernel_value
 
-            required_params = set(flatten_dict(model.graphtree_params_shape))
+            # Use the full nn.Param tree here instead of model.graphtree_params_shape:
+            # LoRA-enabled models expose only LoRAParam leaves via graphstate_type,
+            # but checkpoints still contain the untouched base weights.
+            required_params = set(flatten_dict(nn.split(model, nn.Param, ...)[1].to_pure_dict()))
             unexpected_keys = set(state.keys()) - required_params
             for unexpected_key in unexpected_keys:
                 del state[unexpected_key]
 
+            cpu_device = _checkpoint_cpu_device()
+
             def _convert(x):
+                x = _normalize_checkpoint_leaf_to_jax(x, cpu_device=cpu_device)
                 if not hasattr(x, "astype"):
                     return x
                 dtype = getattr(x, "dtype", None)
@@ -1046,7 +1244,8 @@ class EasyBridgeMixin(PushToHubMixin):
             quantization_config (QuantizationConfig | None): Quantization configuration
                 for loading. Pass None to disable. Defaults to None.
             apply_quantization (bool): Whether to apply module-level quantization. Defaults to False.
-            **kwargs: Additional keyword arguments (e.g., proxies, trust_remote_code, subfolder).
+            **kwargs: Additional keyword arguments (e.g., proxies, trust_remote_code, subfolder,
+                max_workers for remote snapshot downloads).
 
         Returns:
             EasyDeLBaseModule: The loaded EasyDeL model with weights.
@@ -1079,6 +1278,11 @@ class EasyBridgeMixin(PushToHubMixin):
         from_auto_class = kwargs.pop("_from_auto", False)
         subfolder = kwargs.pop("subfolder", "")
         commit_hash = kwargs.pop("_commit_hash", None)
+        snapshot_max_workers = kwargs.pop("max_workers", None)
+        if snapshot_max_workers is None:
+            snapshot_max_workers = max(1, min(int(os.cpu_count() or 1), 16))
+        else:
+            snapshot_max_workers = max(int(snapshot_max_workers), 1)
 
         # Not relevant for Flax Models
         _ = kwargs.pop("adapter_kwargs", None)
@@ -1233,6 +1437,7 @@ class EasyBridgeMixin(PushToHubMixin):
                     proxies=proxies,
                     token=token,
                     local_files_only=local_files_only,
+                    max_workers=snapshot_max_workers,
                 )
 
             if is_local:
@@ -1748,8 +1953,8 @@ class EasyBridgeMixin(PushToHubMixin):
         reform_param = transformer.keywords.get("reform_param")
 
         moe_names_set = set(moe_names or [])
-        excepted_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
-        expert_prefix = f".{excepted_expert_name}."
+        expected_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
+        expert_prefix = f".{expected_expert_name}."
 
         consolidated_moe_keys: set[str] = set()
         moe_groups: dict[str, dict[int, str]] = {}
@@ -1776,7 +1981,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 moe_name = moe_name_part[:-7] if moe_name_part.endswith(".weight") else moe_name_part
                 if moe_name not in moe_names_set:
                     continue
-                target_path = f"{block_path}.{excepted_expert_name}.{moe_name}"
+                target_path = f"{block_path}.{expected_expert_name}.{moe_name}"
                 moe_groups.setdefault(target_path, {})[expert_idx] = k
                 moe_expert_keys.add(k)
                 return
@@ -2232,13 +2437,7 @@ class EasyBridgeMixin(PushToHubMixin):
         )
 
         required_params = set(flatten_dict(model.graphtree_params_shape))
-        if partition_rules is None:
-            try:
-                partition_rules = ed_config.get_partition_rules(True)
-            except Exception:
-                partition_rules = None
-        if partition_rules is None:
-            partition_rules = model.resolve_shardings_automatically()
+        partition_rules = model._get_partition_rules(partition_rules)
         spec_map: dict[tuple, PartitionSpec] = {}
         if partition_rules is not None:
             try:
@@ -2259,8 +2458,8 @@ class EasyBridgeMixin(PushToHubMixin):
         uses_tie_word_embedding = getattr(hf_config, "tie_word_embeddings", False)
 
         moe_names_set = set(moe_names or [])
-        excepted_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
-        expert_prefix = f".{excepted_expert_name}."
+        expected_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
+        expert_prefix = f".{expected_expert_name}."
 
         consolidated_moe_keys: set[str] = set()
         moe_groups: dict[str, dict[int, str]] = {}
@@ -2287,7 +2486,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 moe_name = moe_name_part[:-7] if moe_name_part.endswith(".weight") else moe_name_part
                 if moe_name not in moe_names_set:
                     continue
-                target_path = f"{block_path}.{excepted_expert_name}.{moe_name}"
+                target_path = f"{block_path}.{expected_expert_name}.{moe_name}"
                 moe_groups.setdefault(target_path, {})[expert_idx] = k
                 expert_key_to_group[k] = (target_path, expert_idx)
                 return
@@ -2753,6 +2952,8 @@ class EasyBridgeMixin(PushToHubMixin):
             from transformers import AutoModelForImageTextToText as module
         elif cls._model_task == TaskType.SEQUENCE_CLASSIFICATION:
             from transformers import AutoModelForSequenceClassification as module
+        elif cls._model_task == TaskType.EMBEDDING:
+            from transformers import AutoModelForCausalLM as module
         elif cls._model_task == TaskType.BASE_MODULE:
             from transformers import AutoModel as module
         elif cls._model_task == TaskType.BASE_VISION:

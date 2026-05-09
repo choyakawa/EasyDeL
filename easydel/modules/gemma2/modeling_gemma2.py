@@ -103,11 +103,18 @@ class Gemma2RMSNorm(nn.Module):
 
 
 class Gemma2Attention(UnifiedAttention):
-    """Multi-head attention layer with RoPE embeddings for Gemma2 models.
+    """Multi-head attention layer for Gemma2 with sliding window and softcapping support.
 
-    Inherits from UnifiedAttention with Gemma2-specific customizations:
-    - Sliding window attention (layer-specific)
-    - Custom query pre-attention scalar
+    Extends UnifiedAttention with Gemma2-specific features:
+    - Layer-specific attention type: alternates between sliding window (odd layers)
+      and full attention (even layers) based on config.layer_types
+    - Custom query pre-attention scaling via query_pre_attn_scalar
+    - Optional attention logit softcapping
+
+    Attributes:
+        config (Gemma2Config): Model configuration.
+        head_dim (int): Dimensionality of each attention head.
+        attention_softmax_in_fp32 (bool): Whether to compute softmax in float32.
     """
 
     def __init__(
@@ -194,10 +201,18 @@ class Gemma2Attention(UnifiedAttention):
 
 
 class Gemma2MLP(nn.Module):
-    """Multi-Layer Perceptron module for Gemma2 models.
+    """Gated MLP (GeGLU) feedforward network for Gemma2 models.
 
-    Implements the feedforward network component of the transformer architecture
-    with gated linear units and optional activation functions.
+    Implements the gated linear unit feedforward network:
+    ``down_proj(act(gate_proj(x)) * up_proj(x))``. Uses approximate GeLU
+    (gelu_pytorch_tanh) by default, matching Google's Gemma2 implementation.
+
+    Attributes:
+        config (Gemma2Config): Model configuration.
+        dtype (jnp.dtype): Data type for computation.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Numerical precision for matrix operations.
+        act: Activation function applied to the gate projection.
     """
 
     def __init__(
@@ -294,10 +309,23 @@ class Gemma2MLP(nn.Module):
 
 
 class Gemma2DecoderLayer(nn.Module):
-    """Single decoder layer for Gemma2 models.
+    """Single decoder layer for Gemma2 models with post-norm architecture.
 
-    Combines multi-head attention and feedforward networks with residual connections
-    and layer normalization to form a complete transformer decoder layer.
+    Implements a transformer decoder layer with both pre- and post-normalization:
+    ``x + post_attn_norm(attn(pre_attn_norm(x)))`` followed by
+    ``x + post_ff_norm(mlp(pre_ff_norm(x)))``. The additional post-normalization
+    layers improve training stability compared to standard pre-norm.
+
+    Attributes:
+        config (Gemma2Config): Model configuration.
+        layer_idx (int): Index of this layer; determines sliding vs full attention.
+        is_sliding (bool): Whether this layer uses sliding window attention.
+        input_layernorm (Gemma2RMSNorm): Pre-attention normalization.
+        post_attention_layernorm (Gemma2RMSNorm): Post-attention normalization.
+        pre_feedforward_layernorm (Gemma2RMSNorm): Pre-MLP normalization.
+        post_feedforward_layernorm (Gemma2RMSNorm): Post-MLP normalization.
+        self_attn (Gemma2Attention): Multi-head attention module.
+        mlp (Gemma2MLP): Feedforward network module.
     """
 
     def __init__(
@@ -327,18 +355,9 @@ class Gemma2DecoderLayer(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        mlp_block = Gemma2MLP
-        attn_block = Gemma2Attention
 
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
         self.is_sliding = bool(self.layer_idx % 2)
-        self.self_attn = attn_block(
+        self.self_attn = Gemma2Attention(
             self.config,
             layer_idx=self.layer_idx,
             dtype=dtype,
@@ -346,7 +365,7 @@ class Gemma2DecoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.mlp = mlp_block(
+        self.mlp = Gemma2MLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -486,9 +505,15 @@ class Gemma2Model(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            Gemma2DecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Gemma2DecoderLayer(
+                remat_layer_block(
                     self.config,
                     layer_idx=i,
                     dtype=dtype,
@@ -791,22 +816,9 @@ class Gemma2ForCausalLM(BaseCausalLMModule[Gemma2Model, Gemma2Config]):
             inputs_embeds=inputs_embeds,
         )
 
-        hidden_states = outputs.last_hidden_state
-
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-
         lm_logits = None
         if apply_lm_head:
-            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
-
-        if self.config.final_logit_softcapping is not None:
-            assert lm_logits is not None
-            cap = jnp.array(self.config.final_logit_softcapping, dtype=lm_logits.dtype)
-            lm_logits = cap * jax.nn.tanh(lm_logits / cap)
+            lm_logits = self.compute_lm_logits(self.prepare_lm_head_inputs(outputs.last_hidden_state))
 
         return CausalLMOutput(
             logits=lm_logits,
@@ -822,6 +834,40 @@ class Gemma2ForCausalLM(BaseCausalLMModule[Gemma2Model, Gemma2Config]):
         Decoder-Only models don't have an encoder.
         """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def compute_lm_logits(self, hidden_states: Array) -> Array:
+        """Project hidden states to vocabulary logits with optional soft-capping.
+
+        Calls the base LM-head projection, then applies Gemma-2's logit
+        soft-capping when ``config.final_logit_softcapping`` is set:
+        ``cap * tanh(logits / cap)``, which smoothly bounds logit
+        magnitudes to ``[-cap, cap]``.
+
+        Args:
+            hidden_states: Hidden representations, shape ``[B, T, H]``.
+
+        Returns:
+            Logits with shape ``[B, T, V]``, optionally soft-capped.
+        """
+        lm_logits = super().compute_lm_logits(hidden_states)
+        if self.config.final_logit_softcapping is not None:
+            cap = jnp.array(self.config.final_logit_softcapping, dtype=lm_logits.dtype)
+            lm_logits = cap * jax.nn.tanh(lm_logits / cap)
+        return lm_logits
+
+    def make_lm_head_fn(self):
+        """Trace-safe projection with Gemma-2 soft-capping."""
+        base_fn = super().make_lm_head_fn()
+        cap_value = self.config.final_logit_softcapping
+        if cap_value is None:
+            return base_fn
+
+        def _project(hidden_states):
+            logits = base_fn(hidden_states)
+            cap = jnp.array(cap_value, dtype=logits.dtype)
+            return cap * jax.nn.tanh(logits / cap)
+
+        return _project
 
     def get_decoder(self):
         """

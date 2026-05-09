@@ -1,3 +1,17 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Unified builder for attention/cache runtime metadata.
 
 EasyDeL supports multiple attention mechanisms and cache formats:
@@ -131,7 +145,8 @@ class _RaggedComputed(tp.TypedDict):
             Shape: [max_num_reqs + 1]
         num_seqs: Number of active sequences.
             Shape: [1]
-        request_distribution: Distribution counts for v3 (decode, prefill, total).
+        request_distribution: Distribution bounds for v3
+            (decode_end, prefill_end, total).
             Shape: [3]. Optional, only present for v3.
         slot_mapping: Slot mapping for v2-style cache updates.
             Shape: [3, num_slices]. Optional, only present for v2.
@@ -184,7 +199,8 @@ class _PagedBatchComputed(tp.TypedDict):
             Shape: [padded_num_reqs]
         min_p: Optional min-p sampling parameter.
             Shape: [padded_num_reqs]
-        request_distribution: v3-style distribution [decode, prefill, total].
+        request_distribution: v3-style distribution
+            [decode_end, prefill_end, total].
             Shape: [3]. Optional, only present for v3.
         slot_mapping: v2-style slot mapping.
             Shape: [3, num_slices]. Optional, only present for v2.
@@ -259,10 +275,14 @@ class AttentionMetadataBuilder:
         ... )
     """
 
-    _RAGGED_MECH_PREFIXES: tp.ClassVar[tuple[str, ...]] = ("ragged_page_attention",)
+    _RAGGED_MECH_PREFIXES: tp.ClassVar[tuple[str, ...]] = (
+        "ragged_page_attention",
+        "multi_latent_ragged_page_attention",
+    )
     _RAGGED_MECH_EXACT: tp.ClassVar[set[str]] = {
         "ragged_page_attention_v2",
         "ragged_page_attention_v3",
+        "multi_latent_ragged_page_attention_v1",
         "page_attention",
         "paged_attention",
         "unified_attention",
@@ -381,7 +401,8 @@ class AttentionMetadataBuilder:
             slot_mapping: v2-style slot mapping for cache updates.
                 Shape: [3, num_slices]. Required for v2.
             position_ids: Position IDs for each token. Optional.
-            request_distribution: v3-style distribution [decode, prefill, total].
+            request_distribution: v3-style distribution
+                [decode_end, prefill_end, total].
                 Shape: [3]. Auto-computed for v3 if not provided.
             num_kv_update_slices: Number of update slices for v2.
                 Shape: [1]. Auto-computed for v2.
@@ -616,13 +637,10 @@ class AttentionMetadataBuilder:
         *,
         attention_mechanism: str | None = None,
         expected_cache_type: tp.Literal["auto", "transformer", "ragged", "recurrent"] = "auto",
-        # --- Transformer / hybrid fields ---
         postpadded: bool = False,
         starts: IntVectorLike | None = None,
         indexs: IntVectorLike | None = None,
-        # Optional cache view to infer starts/indexs when absent.
         cache_view: SupportsStartsIndexs | None = None,
-        # --- Ragged/paged fields ---
         pages_tables: IntMatrixLike | None = None,
         block_tables: IntMatrixLike | None = None,
         context_lens: IntVectorLike | None = None,
@@ -637,7 +655,6 @@ class AttentionMetadataBuilder:
         page_size: int = 128,
         prefill_chunk_size: int = 512,
         num_slices_per_kv_cache_update_page: int | None = None,
-        # --- Raw batch inputs for computing ragged fields ---
         scheduled_full: IntVectorLike | None = None,
         active_mask_full: BoolVectorLike | None = None,
         num_computed_tokens: IntVectorLike | None = None,
@@ -907,7 +924,7 @@ class AttentionMetadataBuilder:
                 - context_lens: Per-request context lengths
                 - query_start_loc: Cumulative query positions
                 - num_seqs: Active sequence count
-                - request_distribution (v3): [decode, prefill, total]
+                - request_distribution (v3): [decode_end, prefill_end, total]
                 - slot_mapping (v2): Update slice mapping
                 - num_kv_update_slices (v2): Total update slices
 
@@ -967,7 +984,11 @@ class AttentionMetadataBuilder:
             active_num_computed = np.where(mask_reqs, num_computed_np[:max_num_reqs_cap], 0)
             is_decode = (scheduled == 1) & (active_num_computed > 0)
             decode_count = int(np.sum(is_decode))
-            out["request_distribution"] = np.array([decode_count, decode_count, num_requests], dtype=np.int32)
+            prefill_count = int(np.sum((scheduled > 0) & (~is_decode)))
+            out["request_distribution"] = np.array(
+                [decode_count, decode_count + prefill_count, num_requests],
+                dtype=np.int32,
+            )
 
         elif version == "v2":
             if num_slices_per_kv_cache_update_page is None:
@@ -1352,7 +1373,11 @@ class AttentionMetadataBuilder:
             active_num_computed = np.where(mask_reqs, num_computed_np[:max_num_reqs_cap], 0)
             is_decode = (scheduled == 1) & (active_num_computed > 0)
             decode_count = int(np.sum(is_decode))
-            out["request_distribution"] = np.array([decode_count, decode_count, num_requests], dtype=np.int32)
+            prefill_count = int(np.sum((scheduled > 0) & (~is_decode)))
+            out["request_distribution"] = np.array(
+                [decode_count, decode_count + prefill_count, num_requests],
+                dtype=np.int32,
+            )
         elif version == "v2":
             if page_size is None:
                 page_size = int(ragged_config.page_size) if ragged_config is not None else 128

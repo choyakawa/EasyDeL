@@ -96,7 +96,8 @@ class DistillationTrainer(Trainer):
             tokenizer = processing_class.tokenizer
         if getattr(tokenizer, "pad_token", None) is None and hasattr(tokenizer, "eos_token"):
             tokenizer.pad_token = tokenizer.eos_token
-        assert isinstance(arguments, DistillationConfig), "passed argument must be a `DistillationConfig`."
+        if not isinstance(arguments, DistillationConfig):
+            raise TypeError("passed argument must be a `DistillationConfig`.")
 
         self.arguments = arguments
 
@@ -150,16 +151,17 @@ class DistillationTrainer(Trainer):
             True,  # is_train
             self.arguments.temperature,
             self.arguments.alpha,
-            float(self.arguments.hidden_state_loss_weight),
+            0.0 if self.arguments.hidden_state_loss_weight is None else float(self.arguments.hidden_state_loss_weight),
             hidden_layers,
             self.arguments.hidden_state_loss,
-            float(self.arguments.attention_loss_weight),
+            0.0 if self.arguments.attention_loss_weight is None else float(self.arguments.attention_loss_weight),
             attention_layers,
             bool(self.arguments.attention_normalize),
             straight_through_emulator,
+            self.arguments.logits_chunk_size,
         )
 
-        static_argnames = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+        static_argnames = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)
         sharded_training_step_function = ejit(
             distillation_step,
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
@@ -176,13 +178,14 @@ class DistillationTrainer(Trainer):
             False,  # is_train
             self.arguments.temperature,
             self.arguments.alpha,
-            float(self.arguments.hidden_state_loss_weight),
+            0.0 if self.arguments.hidden_state_loss_weight is None else float(self.arguments.hidden_state_loss_weight),
             hidden_layers,
             self.arguments.hidden_state_loss,
-            float(self.arguments.attention_loss_weight),
+            0.0 if self.arguments.attention_loss_weight is None else float(self.arguments.attention_loss_weight),
             attention_layers,
             bool(self.arguments.attention_normalize),
             None,
+            self.arguments.logits_chunk_size,
         )
 
         sharded_evaluation_step_function = ejit(
@@ -240,8 +243,12 @@ class DistillationTrainer(Trainer):
         """Normalize completion masks/labels for mixed SFT + pretrain distillation batches."""
         batch, infos = super()._preprocess_batch_input(state=state, batch=batch, is_train=is_train)
 
-        if "assistant_masks" in batch and "completion_mask" not in batch:
-            batch["completion_mask"] = batch["assistant_masks"]
+        if "assistant_masks" in batch:
+            if "completion_mask" not in batch:
+                batch["completion_mask"] = batch["assistant_masks"]
+            # Keep assistant mask only as training-time supervision metadata;
+            # model forwards must not receive this key.
+            batch.pop("assistant_masks", None)
 
         attention_mask = batch.get("attention_mask")
         completion_mask = batch.get("completion_mask")

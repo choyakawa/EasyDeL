@@ -111,14 +111,24 @@ MAX_CONSECUTIVE_SCHEDULER_ERRORS = int(os.environ.get("EASURGE_MAX_SCHEDULER_ERR
 WORKER_DRAIN_MAX_RETRIES = 3  # Maximum retry attempts for worker drain
 WORKER_DRAIN_INITIAL_DELAY = 0.1  # Initial retry delay in seconds
 SamplingCallable = typing.Callable[[SamplingParams, dict[str, typing.Any]], SamplingParams | None] | None
+MLA_RAGGED_ATTN_MECHANISM = "multi_latent_ragged_page_attention_v2"
+_MLA_RAGGED_ATTN_MECHANISMS = {
+    "multi_latent_ragged_page_attention_v1",
+    "multi_latent_ragged_page_attention_v2",
+}
 
 
 def _set_requested_new(sp, n: int):  # pyright: ignore[reportUnusedFunction]
-    """Set the max_tokens or max_new_tokens attribute on a SamplingParams object.
+    """Set the generation length on a SamplingParams object.
+
+    Attempts to set both ``max_tokens`` and ``max_new_tokens`` attributes
+    when they exist, ensuring compatibility across different SamplingParams
+    variants.
 
     Args:
-        sp: SamplingParams instance to modify.
-        n: Number of tokens to set.
+        sp: A SamplingParams-like object whose token-limit fields will be
+            mutated in place.
+        n: The desired number of new tokens to generate.
     """
     if hasattr(sp, "max_tokens"):
         sp.max_tokens = int(n)
@@ -127,40 +137,142 @@ def _set_requested_new(sp, n: int):  # pyright: ignore[reportUnusedFunction]
 
 
 def _normalize_data_parallelism_axis(axis: str) -> str:
-    """Normalize and validate the requested data-parallel axis name."""
+    """Normalize and validate a data-parallel axis name.
+
+    Strips whitespace and ensures the result is non-empty.
+
+    Args:
+        axis: Raw axis name string to normalize.
+
+    Returns:
+        The stripped, validated axis name.
+
+    Raises:
+        ValueError: If the axis name is empty after stripping.
+    """
     axis_name = str(axis).strip()
     if not axis_name:
         raise ValueError("`data_parallelism_axis` must be a non-empty string.")
     return axis_name
 
 
-def _with_data_parallel_axis(partition_axis: Any, data_parallelism_axis: str) -> Any:
-    """Return partition-axis metadata with an updated data-parallel axis."""
-    if partition_axis is None:
-        return {"data_parallel_axis": data_parallelism_axis}
+def _normalize_attn_mechanism_value(attn_mechanism: Any) -> str | None:
+    """Normalize an attention mechanism identifier to a plain string.
 
-    if isinstance(partition_axis, dict):
-        merged = dict(partition_axis)
-        merged["data_parallel_axis"] = data_parallelism_axis
-        return merged
+    Handles enum-like objects (with a ``.value`` attribute) as well as
+    raw strings.
 
-    if hasattr(partition_axis, "data_parallel_axis"):
-        try:
-            partition_axis.data_parallel_axis = data_parallelism_axis
-            return partition_axis
-        except Exception:
-            pass
+    Args:
+        attn_mechanism: An attention mechanism identifier. May be ``None``,
+            a string, or an enum with a ``value`` attribute.
 
-    attrs = getattr(partition_axis, "__dict__", None)
-    if isinstance(attrs, dict) and attrs:
-        merged = dict(attrs)
-        merged["data_parallel_axis"] = data_parallelism_axis
-        try:
-            return type(partition_axis)(**merged)
-        except Exception:
-            return merged
+    Returns:
+        The string representation of the mechanism, or ``None`` if the
+        input is ``None``.
+    """
+    if attn_mechanism is None:
+        return None
+    if hasattr(attn_mechanism, "value"):
+        attn_mechanism = attn_mechanism.value
+    return str(attn_mechanism)
 
-    return {"data_parallel_axis": data_parallelism_axis}
+
+def _text_config_uses_mla(text_config: Any) -> bool:
+    """Detect whether a text config indicates Multi-Latent Attention (MLA).
+
+    Uses several heuristics in order of priority:
+    1. Explicit ``attn_mechanism`` or ``mla_attn_mechanism`` matching the
+       MLA ragged attention constant.
+    2. An ``attention_type`` attribute equal to ``"mla"``.
+    3. A callable or boolean ``is_mla`` attribute.
+    4. Presence of ``kv_lora_rank`` (or ``kv_lora_dim``) together with
+       ``qk_rope_head_dim`` or ``qk_nope_head_dim``.
+
+    Args:
+        text_config: A model text configuration object (e.g.,
+            ``PretrainedConfig``). May be ``None``.
+
+    Returns:
+        ``True`` if the config signals MLA usage, ``False`` otherwise.
+    """
+    if text_config is None:
+        return False
+
+    attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "attn_mechanism", None))
+    if attn_mechanism in _MLA_RAGGED_ATTN_MECHANISMS:
+        return True
+    mla_attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "mla_attn_mechanism", None))
+    if mla_attn_mechanism in _MLA_RAGGED_ATTN_MECHANISMS:
+        return True
+
+    attention_type = getattr(text_config, "attention_type", None)
+    if attention_type is not None and str(attention_type).lower() == "mla":
+        return True
+
+    is_mla_attr = getattr(text_config, "is_mla", None)
+    try:
+        if callable(is_mla_attr):
+            if bool(is_mla_attr()):
+                return True
+        elif is_mla_attr is not None and bool(is_mla_attr):
+            return True
+    except Exception:
+        pass
+
+    kv_lora_rank = getattr(text_config, "kv_lora_rank", None)
+    if kv_lora_rank is None:
+        kv_lora_rank = getattr(text_config, "kv_lora_dim", None)
+
+    qk_rope_head_dim = getattr(text_config, "qk_rope_head_dim", None)
+    qk_nope_head_dim = getattr(text_config, "qk_nope_head_dim", None)
+
+    if kv_lora_rank is None or (qk_rope_head_dim is None and qk_nope_head_dim is None):
+        return False
+
+    try:
+        return int(kv_lora_rank) > 0
+    except Exception:
+        return True
+
+
+def _detect_mla_attention_mix(model: Any, text_config: Any = None) -> tuple[bool, bool]:
+    """Detect whether a model contains MLA and/or non-MLA attention blocks.
+
+    Traverses all ``UnifiedAttention`` sub-modules in *model* and inspects
+    each one's ``attention_type``. Falls back to config-level heuristics
+    via ``_text_config_uses_mla`` when no attention modules are found.
+
+    Args:
+        model: An EasyDeL model instance to inspect.
+        text_config: Optional text configuration used as a fallback when
+            module traversal yields no results.
+
+    Returns:
+        A ``(has_mla, has_non_mla)`` tuple of booleans indicating
+        whether MLA and/or standard attention blocks were detected.
+    """
+    has_mla_attention = False
+    has_non_mla_attention = False
+
+    try:
+        from easydel.layers.attention import UnifiedAttention
+        from easydel.utils.traversals import iter_module_search
+
+        for _, module in iter_module_search(model, UnifiedAttention):
+            attention_type = str(getattr(module, "attention_type", "standard")).lower()
+            if attention_type == "mla":
+                has_mla_attention = True
+            else:
+                has_non_mla_attention = True
+            if has_mla_attention and has_non_mla_attention:
+                break
+    except Exception:
+        pass
+
+    if not has_mla_attention and not has_non_mla_attention and _text_config_uses_mla(text_config):
+        has_mla_attention = True
+
+    return has_mla_attention, has_non_mla_attention
 
 
 @dataclass
@@ -187,6 +299,7 @@ class CompletionOutput:
     finish_reason: str | None = None
     tool_calls: list | None = None
     reasoning_content: str | None = None
+    raw_text: str | None = None
 
 
 @dataclass
@@ -224,6 +337,8 @@ class RequestOutput:
 
     accumulated_text: str = ""  # full text so far
     delta_text: str = ""  # only the latest decoded chunk
+    raw_accumulated_text: str = ""  # decoded text before reasoning/tool separation
+    raw_delta_text: str = ""  # latest raw decoded chunk before separation
     tokens_per_second: float = 0.0
     num_generated_tokens: int = 0
     time_spent_generating: float = 0.0
@@ -244,6 +359,8 @@ class RequestOutput:
         Returns:
             Generated text string, or empty string if no outputs.
         """
+        if self.accumulated_text:
+            return self.accumulated_text
         return self.outputs[0].text if self.outputs else ""
 
     def get_summary(self) -> dict[str, Any]:
@@ -302,6 +419,32 @@ class eSurge(
         ...     print(output.delta_text, end="", flush=True)
     """
 
+    @staticmethod
+    def _auto_detect_tool_parser(
+        *,
+        tokenizer: PreTrainedTokenizerBase | None,
+        model_type: str | None,
+    ) -> ToolParserName | None:
+        """Infer the tool parser from tokenizer/template hints and model type."""
+
+        from easydel.inference.tools.auto_detect import detect_tool_parser
+
+        detected = detect_tool_parser(model_type=model_type, tokenizer=tokenizer)
+        return detected or None
+
+    @staticmethod
+    def _auto_detect_reasoning_parser_name(
+        *,
+        tokenizer: PreTrainedTokenizerBase | None,
+        model_type: str | None,
+    ) -> ReasoningParserName | None:
+        """Infer the reasoning parser from tokenizer/template hints and model type."""
+
+        from easydel.inference.reasoning.auto_detect import detect_reasoning_parser
+
+        detected = detect_reasoning_parser(model_type=model_type, tokenizer=tokenizer)
+        return detected or None
+
     def __init__(
         self,
         model: str | EasyDeLBaseModule,
@@ -312,6 +455,7 @@ class eSurge(
         min_token_pad: int | None = None,
         max_num_seqs: int = 256,
         max_num_seq_buckets: list[int] | None = None,
+        async_scheduling: bool = True,
         max_num_batched_tokens: int | None | _Empty = NOT_GIVEN,
         hbm_utilization: float = 0.85,
         page_size: int = 128,
@@ -322,7 +466,7 @@ class eSurge(
         sharding_axis_dims: tuple[int, ...] = (1, 1, 1, -1, 1),
         compile_runner: bool = True,
         runner_verbose: bool = False,
-        overlap_execution: bool = False,
+        overlap_execution: bool = True,
         sampler_metrics: bool = False,
         data_parallelism_axis: str = "dp",
         esurge_name: str | None = None,
@@ -337,18 +481,21 @@ class eSurge(
         detokenizer_max_states: int = DEFAULT_DETOKENIZER_MAX_STATES,
         tokenizer_endpoint: str | None = None,
         detokenizer_endpoint: str | None = None,
+        worker_startup_timeout: float | None = None,
         max_request_outputs: int | None = 1000,
         idle_reset_seconds: float | None = None,
         idle_reset_min_interval: float = 60.0,
         sampling_params_callback: SamplingCallable = None,
         extra_eos_token_ids: list[int] | None = None,
         extra_stops: str | list[str] | None = None,
+        ignore_stop_strings_in_reasoning: bool = True,
         silent_mode: bool = False,
         processor: Any | None = None,
         resolution_buckets: list[tuple[int, int]] | None = None,
         vision_cache_capacity_mb: int = 1024,
         tool_parser: ToolParserName | None = None,
         reasoning_parser: ReasoningParserName | None = None,
+        long_prefill_token_threshold: int | None = None,
         distributed_mode: bool = False,
         distributed_role: typing.Literal["auto", "leader", "worker"] = "auto",
         distributed_service_name: str | None = None,
@@ -361,6 +508,7 @@ class eSurge(
         distributed_step_timeout_s: float = 30.0,
         distributed_connect_timeout_s: float = 15.0,
         distributed_verify_sampling_digest: bool = True,
+        enable_window_aware_runtime_cap: bool = False,
         **kwargs,
     ):
         """Initialize the eSurge engine.
@@ -379,6 +527,8 @@ class eSurge(
                 compilation (e.g., [1, 2, 4, 8, 16, 32]). When provided, the runner
                 compiles these bucket sizes and selects the smallest that can fit
                 the current active batch.
+            async_scheduling: Enable async token sampling overlap in the scheduler
+                and let the runner compile the corresponding safe batch shapes.
             max_num_batched_tokens: Maximum tokens per batch (auto-computed if None).
             hbm_utilization: Target HBM memory utilization (0.0-1.0).
             page_size: Page size for paged attention KV cache. Recommended >=256 for GPUs.
@@ -421,6 +571,10 @@ class eSurge(
                 pause() to free memory, and lazily reinitializing it on resume().
             tokenizer_endpoint: ZMQ endpoint of the external tokenizer worker.
             detokenizer_endpoint: ZMQ endpoint of the external detokenizer worker.
+            worker_startup_timeout: Seconds to wait for spawned tokenizer and
+                detokenizer workers to bind. If None, uses
+                ``EASURGE_WORKER_STARTUP_TIMEOUT`` when set, otherwise defaults
+                to 120 seconds.
             max_request_outputs: Maximum number of completed RequestOutput objects
                 to retain in memory for post-hoc access. Set to None for unlimited
                 retention or <=0 to disable retention entirely.
@@ -440,6 +594,10 @@ class eSurge(
             extra_stops: Additional stop strings applied to every request. These are
                 merged into per-request ``SamplingParams.stop`` at runtime and
                 de-duplicated while preserving existing stop order.
+            ignore_stop_strings_in_reasoning: When True, stop-string matching is
+                applied only to parsed visible content for requests that use a
+                reasoning parser. Stop strings that appear inside the reasoning
+                section will not terminate generation.
             silent_mode: If True, suppress informational eSurge engine logs.
             processor: Unified text/multimodal processor. Can be a tokenizer or an
                 HF processor (with an embedded tokenizer). If None, falls back to
@@ -474,6 +632,10 @@ class eSurge(
             distributed_connect_timeout_s: Worker connect/handshake timeout.
             distributed_verify_sampling_digest: Validate sampled-token digest
                 from workers against leader output each step.
+            enable_window_aware_runtime_cap: Whether to derive the runtime
+                request cap from the model's live KV-window page demand.
+                When False, eSurge falls back to the cache metadata's
+                heuristic request-cap estimate instead.
             **kwargs: Additional configuration passed to model loading.
 
         Raises:
@@ -495,6 +657,7 @@ class eSurge(
 
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
+        self.enable_window_aware_runtime_cap = bool(enable_window_aware_runtime_cap)
         self.page_size = page_size
         self.data_parallelism_axis = _normalize_data_parallelism_axis(data_parallelism_axis)
         register_attention_data_parallel_axis(self.data_parallelism_axis)
@@ -616,12 +779,15 @@ class eSurge(
         self._grafana_process: subprocess.Popen | None = None
         self._grafana_temp_dir: str | None = None
         self._grafana_url: str | None = None
+        self._prometheus_process: subprocess.Popen | None = None
+        self._prometheus_temp_dir: str | None = None
         self._esurge_name = esurge_name
         self._scheduler_running = False
         self.destroy_pages_on_pause = destroy_pages_on_pause
         self._kv_cache_valid = True
         self._paused = False
         self._sampling_params_callback = sampling_params_callback
+        self.ignore_stop_strings_in_reasoning = bool(ignore_stop_strings_in_reasoning)
 
         # Detokenizer cleanup tracking
         self._failed_detokenizer_resets: set[str] = set()
@@ -635,36 +801,10 @@ class eSurge(
         self._idle_monitor_event = threading.Event()
         self._idle_monitor_thread: threading.Thread | None = None
 
-        # Tool calling and reasoning parser initialization
-        self.tool_parser_name = tool_parser
-        self.reasoning_parser_name = reasoning_parser
-        self._tool_parser_class = None
-        self._reasoning_parser_class = None
-
-        if tool_parser:
-            try:
-                from easydel.inference.tools import ToolParserManager
-
-                self._tool_parser_class = ToolParserManager.get_tool_parser(tool_parser)
-                if not silent_mode:
-                    logger.info("Initialized tool parser: %s", tool_parser)
-            except KeyError:
-                logger.warning("Tool parser '%s' not found, function calling disabled", tool_parser)
-
-        if reasoning_parser:
-            try:
-                from easydel.inference.reasoning import ReasoningParserManager
-
-                self._reasoning_parser_class = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
-                if not silent_mode:
-                    logger.info("Initialized reasoning parser: %s", reasoning_parser)
-            except KeyError:
-                logger.warning("Reasoning parser '%s' not found, reasoning disabled", reasoning_parser)
-
         tokenizer_endpoint = tokenizer_endpoint or os.environ.get("EASURGE_TOKENIZER_ENDPOINT")
         detokenizer_endpoint = detokenizer_endpoint or os.environ.get("EASURGE_DETOKENIZER_ENDPOINT")
 
-        self._worker_manager = WorkerManager(tokenizer_source)
+        self._worker_manager = WorkerManager(tokenizer_source, startup_timeout=worker_startup_timeout)
         self._tokenizer_client, self._detokenizer_client = self._worker_manager.start(
             detokenizer_max_states=detokenizer_max_states,
             tokenizer_endpoint=tokenizer_endpoint,
@@ -672,6 +812,7 @@ class eSurge(
         )
         self._tokenizer_endpoint = self._worker_manager.tokenizer_endpoint
         self._detokenizer_endpoint = self._worker_manager.detokenizer_endpoint
+        self._worker_startup_timeout = self._worker_manager._startup_timeout
 
         if isinstance(model, str):
             backend = jax.default_backend()
@@ -731,9 +872,8 @@ class eSurge(
             config_kwargs = dict(kwargs.pop("config_kwargs", {}) or {})
             config_partition_axis = config_kwargs.pop("partition_axis", None)
             kwargs_partition_axis = kwargs.pop("partition_axis", None)
-            resolved_partition_axis = _with_data_parallel_axis(
-                kwargs_partition_axis if kwargs_partition_axis is not None else config_partition_axis,
-                self.data_parallelism_axis,
+            resolved_partition_axis = (
+                kwargs_partition_axis if kwargs_partition_axis is not None else config_partition_axis
             )
 
             model = AutoEasyDeLModelForCausalLM.from_pretrained(
@@ -755,36 +895,96 @@ class eSurge(
                 ),
                 **{k: v for k, v in kwargs.items() if k not in ["attn_mechanism", "config_kwargs"]},
             )
+            text_config = model.config.get_text_config()
+            has_mla_attention, has_non_mla_attention = _detect_mla_attention_mix(model, text_config)
+
+            _num_heads = getattr(text_config, "num_attention_heads", 0) or 0
+            _mla_kernel_compatible = int(_num_heads) > 0
+
+            if has_mla_attention and _mla_kernel_compatible:
+                attn_value = _normalize_attn_mechanism_value(getattr(text_config, "attn_mechanism", None))
+                mla_compatible = attn_value in _MLA_RAGGED_ATTN_MECHANISMS
+                if jax.default_backend() == "gpu":
+                    mla_compatible = mla_compatible or attn_value in {
+                        AttentionMechanisms.UNIFIED_ATTENTION.value,
+                        AttentionMechanisms.PAGED_FLASH_ATTENTION.value,
+                    }
+                if not mla_compatible:
+                    if has_non_mla_attention:
+                        logger.warning(
+                            "Mixed MLA and non-MLA full-attention layers detected, "
+                            "but forcing all inference layers to "
+                            f"{MLA_RAGGED_ATTN_MECHANISM!r}."
+                        )
+                    logger.info(
+                        "MLA architecture detected; forcing inference attention mechanism to "
+                        f"{MLA_RAGGED_ATTN_MECHANISM!r}."
+                    )
+                    compat_graphdef = model.new_graphdef(
+                        recursive_update=True,
+                        attn_mechanism=MLA_RAGGED_ATTN_MECHANISM,
+                        decode_attn_mechanism=MLA_RAGGED_ATTN_MECHANISM,
+                        mla_attn_mechanism=MLA_RAGGED_ATTN_MECHANISM,
+                    )
+                    model = model.merge_module(compat_graphdef, model.graphstate, model.graphother)
+            elif has_mla_attention and not _mla_kernel_compatible:
+                fallback_attn = (
+                    AttentionMechanisms.UNIFIED_ATTENTION
+                    if jax.default_backend() == "gpu"
+                    else AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3
+                )
+                logger.info(
+                    f"MLA architecture detected but num_attention_heads <= 0; falling back to {fallback_attn.value!r}."
+                )
+                compat_graphdef = model.new_graphdef(
+                    recursive_update=True,
+                    attn_mechanism=fallback_attn,
+                    decode_attn_mechanism=fallback_attn,
+                )
+                model = model.merge_module(compat_graphdef, model.graphstate, model.graphother)
 
         self._apply_data_parallel_axis_to_model(model)
 
         if self._multimodal_manager is not None and self._multimodal_manager.model is None:
             self._multimodal_manager.model = model
 
-        # Profiling state
-        self._profiling_active = False
-        self._profiling_steps_remaining = 0
-        self._profiling_output_dir: str | None = None
-        self._profiling_host_level: int | None = None
-        self._profiling_python_level: int | None = None
-        self._possible_name = self._get_model_name(model)
+        detected_model_type = getattr(getattr(model, "config", None), "model_type", None)
+        if tool_parser is None:
+            tool_parser = self._auto_detect_tool_parser(
+                tokenizer=self.tokenizer,
+                model_type=detected_model_type,
+            )
+        if reasoning_parser is None:
+            reasoning_parser = self._auto_detect_reasoning_parser_name(
+                tokenizer=self.tokenizer,
+                model_type=detected_model_type,
+            )
 
-        self.runner = eSurgeRunner(
-            model=model.esurge_compatible_model,
-            hbm_utilization=hbm_utilization,
-            page_size=page_size,
-            max_model_len=max_model_len,
-            min_input_pad=min_input_pad,
-            max_num_seqs=max_num_seqs,
-            max_num_seq_buckets=max_num_seq_buckets,
-            min_token_pad=min_token_pad,
-            use_aot_forward=use_aot_forward,
-            bind_graphstate_for_aot=bind_graphstate_for_aot,
-            verbose=runner_verbose,
-            enable_overlap_execution=overlap_execution,
-            enable_sampler_metrics=sampler_metrics,
-        )
-        self._overlap_execution = overlap_execution
+        self.tool_parser = tool_parser
+        self.reasoning_parser_name = reasoning_parser
+        self._tool_parser_class = None
+        self._reasoning_parser_class = None
+
+        if tool_parser:
+            try:
+                from easydel.inference.tools import ToolParserManager
+
+                self._tool_parser_class = ToolParserManager.get_tool_parser(tool_parser)
+                if not silent_mode:
+                    logger.info("Initialized tool parser: %s", tool_parser)
+            except KeyError:
+                logger.warning("Tool parser '%s' not found, function calling disabled", tool_parser)
+
+        if reasoning_parser:
+            try:
+                from easydel.inference.reasoning import ReasoningParserManager
+
+                self._reasoning_parser_class = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
+                if not silent_mode:
+                    logger.info("Initialized reasoning parser: %s", reasoning_parser)
+            except KeyError:
+                logger.warning("Reasoning parser '%s' not found, reasoning disabled", reasoning_parser)
+
         if max_num_batched_tokens is NOT_GIVEN and jax.default_backend() == "gpu":
             max_num_batched_tokens = min(max(2048, max_num_seqs), max_model_len)
             logger.info(
@@ -802,6 +1002,34 @@ class eSurge(
         elif max_num_batched_tokens is NOT_GIVEN:
             max_num_batched_tokens = None
 
+        # Profiling state
+        self._profiling_active = False
+        self._profiling_steps_remaining = 0
+        self._profiling_output_dir: str | None = None
+        self._profiling_host_level: int | None = None
+        self._profiling_python_level: int | None = None
+        self._possible_name = self._get_model_name(model)
+
+        self.runner = eSurgeRunner(
+            model=model.esurge_compatible_model,
+            hbm_utilization=hbm_utilization,
+            page_size=page_size,
+            max_model_len=max_model_len,
+            max_num_batched_tokens=max_num_batched_tokens,
+            enable_window_aware_runtime_cap=enable_window_aware_runtime_cap,
+            min_input_pad=min_input_pad,
+            max_num_seqs=max_num_seqs,
+            max_num_seq_buckets=max_num_seq_buckets,
+            async_scheduling=async_scheduling,
+            min_token_pad=min_token_pad,
+            use_aot_forward=use_aot_forward,
+            bind_graphstate_for_aot=bind_graphstate_for_aot,
+            verbose=runner_verbose,
+            enable_overlap_execution=overlap_execution,
+            enable_sampler_metrics=sampler_metrics,
+        )
+        self._overlap_execution = overlap_execution
+
         if compile_runner:
             # Limit compilation to the scheduler's per-step token budget when provided.
             # This avoids compiling long-context token buckets (e.g. 32K/64K) when
@@ -812,6 +1040,8 @@ class eSurge(
             self.runner,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_prefix_caching=enable_prefix_caching,
+            async_scheduling=async_scheduling,
+            long_prefill_token_threshold=long_prefill_token_threshold,
         )
         self._scheduler_max_num_batched_tokens = max_num_batched_tokens
         self._scheduler_enable_prefix_caching = enable_prefix_caching
@@ -910,6 +1140,7 @@ class eSurge(
                     if self.scheduler.max_num_scheduled_tokens is not None
                     else None
                 ),
+                "enable_window_aware_runtime_cap": bool(self.enable_window_aware_runtime_cap),
                 "scheduler_policy": str(
                     self.scheduler.policy.value if hasattr(self.scheduler.policy, "value") else self.scheduler.policy
                 ),
@@ -1002,34 +1233,84 @@ class eSurge(
         self._sampling_params_callback = callback
 
     def _apply_data_parallel_axis_to_model(self, model: EasyDeLBaseModule) -> None:
-        """Patch model config partition axes so eSurge KV-cache uses the requested DP axis."""
-        cfg = getattr(model, "config", None)
-        if cfg is None:
-            return
+        """Keep model partition axes unchanged.
 
-        maybe_text_cfg = getattr(cfg, "get_text_config", None)
-        text_cfg = maybe_text_cfg() if callable(maybe_text_cfg) else None
-
-        seen: set[int] = set()
-        for target_cfg in (cfg, text_cfg):
-            if target_cfg is None or id(target_cfg) in seen:
-                continue
-            seen.add(id(target_cfg))
-            current_axis = getattr(target_cfg, "partition_axis", None)
-            updated_axis = _with_data_parallel_axis(current_axis, self.data_parallelism_axis)
-            try:
-                target_cfg.partition_axis = updated_axis
-            except Exception:
-                logger.warning(
-                    "Failed to update model partition_axis with data_parallelism_axis=%r",
-                    self.data_parallelism_axis,
-                )
+        eSurge's KV-page parallelism uses the dedicated ``ATTN_DP`` semantic
+        axis registered during engine setup. Rewriting the model's standard
+        data-parallel axis here can alias DP with EP and break MoE shard maps.
+        """
+        del model
 
     def _distributed_execute_step(self, scheduler_output):
         """Execute a single scheduler step on worker ranks via control-plane RPC."""
 
         with self._scheduler_lock:
             return self.runner.execute_model(scheduler_output)
+
+    def _instantiate_reasoning_parser_for_metadata(self):
+        """Build a short-lived reasoning parser instance for token metadata lookups."""
+        if self._reasoning_parser_class is None or self.tokenizer is None:
+            return None
+        try:
+            return self._reasoning_parser_class(self.tokenizer)
+        except Exception:
+            return None
+
+    def _resolve_reasoning_boundary_token(self, attr_name: str) -> str | None:
+        """Resolve a reasoning boundary token from parser metadata when available."""
+        parser = self._instantiate_reasoning_parser_for_metadata()
+        return self._find_str_attr(parser, attr_name)
+
+    def _find_str_attr(self, parser, attr_name: str) -> str | None:
+        """Search parser, its delegate, and the parser class for a non-empty string attribute."""
+        candidates = (parser, getattr(parser, "_delegate", None), self._reasoning_parser_class)
+        for candidate in candidates:
+            token = getattr(candidate, attr_name, None)
+            if isinstance(token, str) and token:
+                return token
+        return None
+
+    def _resolve_reasoning_boundary_token_id(self, attr_name: str, token_attr_name: str) -> int | None:
+        """Resolve a reasoning boundary token ID from parser metadata or tokenizer vocab."""
+        parser = self._instantiate_reasoning_parser_for_metadata()
+        candidates = (parser, getattr(parser, "_delegate", None))
+        for candidate in candidates:
+            token_id = getattr(candidate, attr_name, None)
+            if isinstance(token_id, int):
+                return token_id
+        # Reuse the already-instantiated parser instead of creating a second one.
+        token = self._find_str_attr(parser, token_attr_name)
+        if token is None or self.tokenizer is None:
+            return None
+        try:
+            vocab = self.tokenizer.get_vocab()
+        except Exception:
+            vocab = None
+        if isinstance(vocab, dict):
+            token_id = vocab.get(token)
+            if isinstance(token_id, int):
+                return token_id
+        return None
+
+    @property
+    def think_start_token(self) -> str | None:
+        """Reasoning-start token for the active reasoning parser, if any."""
+        return self._resolve_reasoning_boundary_token("start_token")
+
+    @property
+    def think_end_token(self) -> str | None:
+        """Reasoning-end token for the active reasoning parser, if any."""
+        return self._resolve_reasoning_boundary_token("end_token")
+
+    @property
+    def think_start_token_id(self) -> int | None:
+        """Tokenizer ID for :attr:`think_start_token`, if resolvable."""
+        return self._resolve_reasoning_boundary_token_id("_start_token_id", "start_token")
+
+    @property
+    def think_end_token_id(self) -> int | None:
+        """Tokenizer ID for :attr:`think_end_token`, if resolvable."""
+        return self._resolve_reasoning_boundary_token_id("_end_token_id", "end_token")
 
     def __del__(self):
         """Destructor that cleans up resources.
@@ -1083,6 +1364,7 @@ class eSurge(
             f"max_model_len={self.max_model_len}",
             f"max_num_seqs={self.max_num_seqs}",
             f"page_size={self.page_size}",
+            f"enable_window_aware_runtime_cap={self.enable_window_aware_runtime_cap}",
             f"data_parallelism_axis={self.data_parallelism_axis!r}",
             f"reserve_tokens={self.reserve_tokens}",
             f"auto_truncate_prompt={self.auto_truncate_prompt}",

@@ -35,6 +35,8 @@ import typing as tp
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from ejkernel.loggings import get_logger
+
 from ..core.protocols import ShardedDataSource, ShardInfo
 from ..utils import glob_files, with_retry
 
@@ -43,14 +45,30 @@ if tp.TYPE_CHECKING:
 
     from ..core.config import DatasetConfig
 
+logger = get_logger(__name__)
+
 
 def _is_pathlike(s: str) -> bool:
-    """Check if a string represents a path-like structure."""
+    """Check if a string represents a filesystem path or URL.
+
+    Args:
+        s: String to check.
+
+    Returns:
+        True if the string looks like a path (contains "://", starts with "/", "./", or "../").
+    """
     return "://" in s or s.startswith("/") or s.startswith("./") or s.startswith("../")
 
 
 def _fix_missing_dot(pattern: str) -> str:
-    """Fix common glob pattern typos where dots are missing before extensions."""
+    """Fix common glob pattern typos where dots are missing before extensions.
+
+    Args:
+        pattern: Glob pattern to fix (e.g., "*parquet" becomes "*.parquet").
+
+    Returns:
+        Corrected glob pattern.
+    """
     fixes = {
         "*parquet": "*.parquet",
         "*jsonl": "*.jsonl",
@@ -67,7 +85,14 @@ def _fix_missing_dot(pattern: str) -> str:
 
 
 def _detect_format(files: list[str]) -> str:
-    """Detect file format from a list of files."""
+    """Detect the dataset file format from a list of file paths.
+
+    Args:
+        files: List of file paths to analyze by extension.
+
+    Returns:
+        Detected format string ("json", "parquet", "csv", "txt", or "arrow").
+    """
     exts_priority = [".arrow", ".parquet", ".jsonl", ".json", ".csv", ".pq", ".txt"]
 
     for f in files:
@@ -88,7 +113,17 @@ def _detect_format(files: list[str]) -> str:
 
 
 def _coerce_example(example: tp.Any) -> dict[str, tp.Any]:
-    """Normalize dataset rows to dictionary examples."""
+    """Normalize dataset rows to plain dictionary examples.
+
+    Args:
+        example: A mapping-like object (dict, Mapping, or object with items()).
+
+    Returns:
+        Plain dictionary representation of the example.
+
+    Raises:
+        TypeError: If the example cannot be converted to a dictionary.
+    """
     if isinstance(example, dict):
         return example
     if isinstance(example, Mapping):
@@ -144,7 +179,12 @@ def expand_data_files(data_files: str | os.PathLike | list[str | os.PathLike]) -
 
 @dataclass
 class ParquetShardInfo(ShardInfo):
-    """Extended shard info for Parquet files."""
+    """Extended shard info for Parquet files.
+
+    Attributes:
+        num_row_groups: Number of row groups in the Parquet file, used
+            for efficient seeking during resumption.
+    """
 
     num_row_groups: int = 0
 
@@ -193,7 +233,16 @@ class ParquetShardedSource(ShardedDataSource[dict]):
 
     @with_retry(max_retries=3, initial_delay=1.0)  # pyright: ignore[reportUntypedFunctionDecorator]
     def get_shard_info(self, shard_name: str) -> ParquetShardInfo:
-        """Get metadata about a Parquet shard."""
+        """Get metadata about a Parquet shard including row group count.
+
+        Results are cached to avoid repeated file reads.
+
+        Args:
+            shard_name: Path or URL to the Parquet file.
+
+        Returns:
+            ParquetShardInfo with file metadata.
+        """
         if shard_name in self._shard_info_cache:
             return self._shard_info_cache[shard_name]
 
@@ -212,7 +261,16 @@ class ParquetShardedSource(ShardedDataSource[dict]):
 
     @with_retry(max_retries=3, initial_delay=1.0)  # pyright: ignore[reportUntypedFunctionDecorator]
     def open_shard(self, shard_name: str) -> "Iterator[dict]":
-        """Open a Parquet shard and iterate over rows."""
+        """Open a Parquet shard and iterate over rows.
+
+        Reads row groups sequentially and yields individual rows as dictionaries.
+
+        Args:
+            shard_name: Path or URL to the Parquet file.
+
+        Yields:
+            Individual rows as dictionaries.
+        """
         import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
 
         with self._open_file(shard_name) as fh:
@@ -229,7 +287,15 @@ class ParquetShardedSource(ShardedDataSource[dict]):
     def open_shard_at_row(self, shard_name: str, row: int) -> "Iterator[dict]":
         """Open a Parquet shard starting at a specific row.
 
-        Uses row group metadata for efficient seeking.
+        Uses row group metadata to skip directly to the relevant row group,
+        avoiding sequential scanning of earlier rows.
+
+        Args:
+            shard_name: Path or URL to the Parquet file.
+            row: Zero-based row index to start from.
+
+        Yields:
+            Rows starting from the specified position.
         """
         import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
 
@@ -603,6 +669,52 @@ class HuggingFaceShardedSource(ShardedDataSource[dict]):
             for example in ds.select(range(row, len(ds))):
                 yield _coerce_example(example)
 
+    def get_shard_info(self, shard_name: str) -> ShardInfo | None:
+        """Return HuggingFace split metadata when it is available.
+
+        Streaming HuggingFace datasets usually do not implement ``len()``, but
+        many dataset builders still expose the original split cardinality via
+        ``dataset.info.splits``.  That number describes the raw split rows, not
+        transformed or packed training examples, so it is exposed as shard
+        metadata rather than as ``__len__``.
+        """
+        del shard_name
+        try:
+            ds = self._load_dataset()
+        except Exception:
+            return None
+
+        info = getattr(ds, "info", None)
+        splits = getattr(info, "splits", None)
+        if splits is None:
+            return None
+
+        split_info = None
+        try:
+            split_info = splits[self._split]
+        except Exception:
+            get = getattr(splits, "get", None)
+            if callable(get):
+                split_info = get(self._split)
+
+        if split_info is None:
+            return None
+
+        num_examples = getattr(split_info, "num_examples", None)
+        if num_examples is None:
+            return None
+
+        try:
+            num_rows = int(num_examples)
+        except (TypeError, ValueError):
+            return None
+
+        return ShardInfo(
+            shard_id=0,
+            shard_name=self.shard_names[0],
+            num_rows=num_rows,
+        )
+
     def __len__(self) -> int:
         """Return number of examples in the dataset.
 
@@ -749,25 +861,51 @@ def _detect_builder_and_files(data_files: str | os.PathLike | list[str | os.Path
 
 
 def load_for_inform(inform, mixture):
-    """Legacy function for backward compatibility.
+    """Load a HuggingFace dataset based on inform and mixture configuration.
 
-    Load a dataset based on the provided inform configuration.
+    Handles both HuggingFace Hub datasets and local file-based datasets.
+    Falls back to a streaming Parquet reader when the standard HF loader
+    fails with schema incompatibilities.
 
     Args:
-        inform: Dataset information object containing loading configuration.
-        mixture: DatasetMixture object containing global settings.
+        inform: Dataset information object (TextDatasetInform or VisualDatasetInform)
+            containing data files, type, split, and other loading parameters.
+        mixture: DatasetMixture object containing global settings like cache_dir,
+            streaming mode, and seed.
 
     Returns:
-        Loaded Dataset or IterableDataset.
+        Loaded Dataset or IterableDataset ready for further processing.
     """
     from datasets import IterableDataset, load_dataset  # pyright: ignore[reportMissingTypeStubs]
 
     t = str(inform.get_str_type())
     df = inform.data_files
 
+    def _apply_num_rows_limit(dataset):
+        num_rows = getattr(inform, "num_rows", None)
+        if num_rows is None:
+            return dataset
+
+        limit = int(num_rows)
+        if limit < 0:
+            raise ValueError("num_rows must be >= 0")
+
+        if mixture.streaming:
+            if hasattr(dataset, "take"):
+                return dataset.take(limit)
+            logger.warning("num_rows=%d requested but dataset has no .take() method; returning unlimited.", limit)
+            return dataset
+
+        if hasattr(dataset, "select"):
+            return dataset.select(range(min(limit, len(dataset))))
+
+        if hasattr(dataset, "take"):
+            return dataset.take(limit)
+        return dataset
+
     # Create source and convert to HF dataset
     if t in {"huggingface", "hf"} and isinstance(df, str) and not _is_pathlike(df):
-        return load_dataset(
+        dataset = load_dataset(
             path=df,
             name=inform.dataset_split_name,
             split=inform.split or "train",
@@ -775,6 +913,7 @@ def load_for_inform(inform, mixture):
             streaming=mixture.streaming,
             num_proc=None if mixture.streaming else 1,
         )
+        return _apply_num_rows_limit(dataset)
 
     # File-based loading
     builder, files = _detect_builder_and_files(df)
@@ -798,7 +937,7 @@ def load_for_inform(inform, mixture):
                         yield {k: v[i] for k, v in cols.items()}
 
     try:
-        return load_dataset(
+        dataset = load_dataset(
             path="json" if builder in {"json", "jsonl"} else builder,
             data_files=files,
             split=inform.split or "train",
@@ -806,8 +945,10 @@ def load_for_inform(inform, mixture):
             streaming=mixture.streaming,
             num_proc=None if mixture.streaming else 1,
         )
+        return _apply_num_rows_limit(dataset)
     except ValueError as e:
         msg = str(e)
         if builder == "parquet" and ("Feature type 'List' not found" in msg or "from_dict" in msg):
-            return IterableDataset.from_generator(lambda: _iter_parquet_rows(files))
+            dataset = IterableDataset.from_generator(lambda: _iter_parquet_rows(files))
+            return _apply_num_rows_limit(dataset)
         raise

@@ -505,16 +505,7 @@ class Grok1DecoderLayer(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-        attn_block = Grok1Attention
-        mlp_block = Grok1SparseMoeBlock
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.attn = attn_block(
+        self.attn = Grok1Attention(
             config=self.config,
             layer_index=layer_index,
             dtype=dtype,
@@ -522,7 +513,7 @@ class Grok1DecoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.moe_block = mlp_block(
+        self.moe_block = Grok1SparseMoeBlock(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -673,9 +664,15 @@ class Grok1Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = auto_remat(
+            Grok1DecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Grok1DecoderLayer(
+                remat_layer_block(
                     layer_index=layer_index,
                     config=config,
                     dtype=dtype,
@@ -1017,3 +1014,13 @@ class Grok1ForCausalLM(BaseCausalLMModule[Grok1Model, Grok1Config]):  # type: ig
         lm_logits = super().apply_lm_head(hidden_states)
         lm_logits = lm_logits * self.output_multiplier_scale
         return lm_logits
+
+    def make_lm_head_fn(self):
+        """Trace-safe projection with Grok-1 output multiplier scaling."""
+        base_fn = super().make_lm_head_fn()
+        scale = self.output_multiplier_scale
+
+        def _project(hidden_states):
+            return base_fn(hidden_states) * scale
+
+        return _project

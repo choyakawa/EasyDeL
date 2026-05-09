@@ -589,6 +589,15 @@ class Qwen3VLVisionAttention(UnifiedAttention):
         precision: jax.lax.PrecisionLike,
         rngs: nn.Rngs,
     ) -> None:
+        """Define the QKV and output projection layers for vision attention.
+
+        Args:
+            config: Vision encoder configuration.
+            dtype: Data type for computation.
+            param_dtype: Data type for parameters.
+            precision: Numerical precision for matrix operations.
+            rngs: Random number generator state.
+        """
         self.qkv = ColumnParallelLinear(
             self.hidden_size,
             self.hidden_size * 3,
@@ -1246,17 +1255,7 @@ class Qwen3VLTextDecoderLayer(nn.Module):
         self.precision = precision
         self.layer_idx = layer_idx
 
-        attn_block = Qwen3VLTextAttention
-        mlp_block = Qwen3VLTextMLP
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
-        self.self_attn = attn_block(
+        self.self_attn = Qwen3VLTextAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1265,7 +1264,7 @@ class Qwen3VLTextDecoderLayer(nn.Module):
             layer_idx=layer_idx,
         )
 
-        self.mlp = mlp_block(
+        self.mlp = Qwen3VLTextMLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1406,9 +1405,15 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = auto_remat(
+            Qwen3VLTextDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Qwen3VLTextDecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=i,
                     dtype=dtype,
@@ -2551,7 +2556,7 @@ class Qwen3VLForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLModel, Qwe
 
         lm_logits = None
         if apply_lm_head:
-            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
+            lm_logits = self.compute_lm_logits(hidden_states)
             lm_logits = self.apply_logit_cap(lm_logits)
 
         return VLMCausalLMOutput(
