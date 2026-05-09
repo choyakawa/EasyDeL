@@ -235,6 +235,8 @@ Test coverage:
 
 - packed assistant/completion masks stay aligned across packed segments
 - existing source padding is stripped before packing
+- packed sources can iterate streaming-like sources that do not support
+  `len()`
 - packed `segment_ids` build a block-diagonal `MaskInfo` attention mask that
   blocks cross-example attention and masks padding segment `0`
 - packed metadata has stable-style `segment_ids` and per-segment `position_ids`
@@ -267,6 +269,12 @@ Operational intent:
 - model forward receives either `segment_ids` directly or a prebuilt
   `MaskInfo.from_segments(...)`; blocksparse attention consumes that
   `MaskInfo` instead of relying on a flat padding-only mask
+- streaming HuggingFace sources are compatible with this path when the run has
+  explicit step bounds such as `--max_training_steps`; without a discoverable
+  length, the trainer requires configured training/evaluation steps
+- `packing_strategy='bfd'` uses bounded lazy first-fit buffering; it does not
+  materialize the whole streaming dataset, but the first packed examples may
+  wait until the first-fit buffer fills or the stream ends
 - focused pytest was attempted in the local Windows workspace but could not
   collect because the active Python environment lacks `jax`; `uv run` also
   could not prepare the environment because `uvloop==0.21.0` does not support

@@ -29,6 +29,22 @@ class _ListSource(ShardedDataSource[dict]):
         return len(self._rows)
 
 
+class _StreamingListSource(ShardedDataSource[dict]):
+    def __init__(self, rows: list[dict]):
+        self._rows = rows
+
+    @property
+    def shard_names(self) -> Sequence[str]:
+        return ["streaming_shard"]
+
+    def num_shards(self) -> int:
+        return 1
+
+    def open_shard(self, shard_name: str) -> Iterator[dict]:
+        del shard_name
+        yield from self._rows
+
+
 def test_packed_source_preserves_assistant_masks_across_segments():
     source = _ListSource(
         [
@@ -93,6 +109,39 @@ def test_packed_source_strips_existing_padding_before_packing_masks():
     np.testing.assert_array_equal(row["input_ids"], np.array([10, 11, 99, 0, 0]))
     np.testing.assert_array_equal(row["attention_mask"], np.array([1, 1, 1, 0, 0]))
     np.testing.assert_array_equal(row["assistant_masks"], np.array([0, 1, 0, 0, 0]))
+
+
+def test_packed_source_iterates_streaming_source_without_length():
+    source = _StreamingListSource(
+        [
+            {
+                "input_ids": [10, 11],
+                "attention_mask": [1, 1],
+                "assistant_masks": [0, 1],
+            },
+            {
+                "input_ids": [20],
+                "attention_mask": [1],
+                "assistant_masks": [1],
+            },
+        ]
+    )
+
+    packed = PackedShardedSource(
+        source,
+        seq_length=6,
+        eos_token_id=99,
+        pad_token_id=0,
+        strategy="first_fit",
+        shuffle=False,
+        aligned_fields=("attention_mask", "assistant_masks"),
+    )
+
+    row = next(packed.open_shard("packed_shard_0"))
+
+    np.testing.assert_array_equal(row["input_ids"], np.array([10, 11, 99, 20, 99, 0]))
+    np.testing.assert_array_equal(row["attention_mask"], np.array([1, 1, 1, 1, 1, 0]))
+    np.testing.assert_array_equal(row["assistant_masks"], np.array([0, 1, 0, 1, 0, 0]))
 
 
 def test_packed_segment_ids_create_block_diagonal_attention_mask():
