@@ -34,8 +34,6 @@ and multimodal architectures.
 import collections.abc
 import typing as tp
 
-import itertools
-
 import jax
 from jax.sharding import PartitionSpec
 
@@ -271,10 +269,7 @@ class Trainer(BaseTrainer):
         """Return the global step range assigned to an epoch."""
         if self.max_training_steps is None:
             raise RuntimeError("max_training_steps must be set before training")
-        total_epochs = self._effective_train_epoch_limit()
-        if total_epochs is None:
-            return 0, self.max_training_steps
-        total_epochs = max(int(total_epochs), 1)
+        total_epochs = max(int(self.arguments.num_train_epochs), 1)
         return (
             (epoch * self.max_training_steps) // total_epochs,
             ((epoch + 1) * self.max_training_steps) // total_epochs,
@@ -284,10 +279,7 @@ class Trainer(BaseTrainer):
         """Map a global training step back to its epoch index."""
         if self.max_training_steps is None:
             raise RuntimeError("max_training_steps must be set before training")
-        total_epochs = self._effective_train_epoch_limit()
-        if total_epochs is None:
-            return 0
-        total_epochs = max(int(total_epochs), 1)
+        total_epochs = max(int(self.arguments.num_train_epochs), 1)
         if step >= self.max_training_steps:
             return total_epochs
         for epoch in range(total_epochs):
@@ -347,30 +339,20 @@ class Trainer(BaseTrainer):
         disabled = False
         if jax.process_index() != 0 and not self.arguments.log_all_workers:
             disabled = True
-        raw_progress_total = None
-        raw_item_limit = getattr(self.arguments, "max_training_raw_items", None)
-        effective_epoch_limit = self._effective_train_epoch_limit()
-        if raw_item_limit is not None:
-            raw_progress_total = int(raw_item_limit)
-        elif getattr(self, "_raw_train_item_count", None) is not None and effective_epoch_limit is not None:
-            raw_progress_total = int(self._raw_train_item_count) * int(effective_epoch_limit)
-        pbar = self.create_progress_bar(total=raw_progress_total, disabled=disabled, desc="training process")
+        pbar = self.create_progress_bar(
+            total=self.max_training_steps,
+            disabled=disabled,
+            desc="training process",
+        )
 
         initial_step = int(jax.device_get(state.step))
         start_epoch = 0
-        self._consumed_train_raw_items = int(getattr(self, "_resumed_consumed_train_raw_items", 0))
-        self._pending_train_progress_update = 0
-
         train_iter = iter(self.dataloader_train)
 
         if initial_step > 0:
             if self.max_training_steps is None:
                 raise RuntimeError("max_training_steps must be set before training")
-            if getattr(self, "_train_progress_uses_raw_items", False):
-                if self._consumed_train_raw_items > 0:
-                    pbar.update(self._consumed_train_raw_items)
-            else:
-                pbar.update(min(initial_step, self.max_training_steps))
+            pbar.update(min(initial_step, self.max_training_steps))
             start_epoch = self._get_resume_epoch(initial_step)
             if initial_step < self.max_training_steps:
                 logger.info(
@@ -384,14 +366,11 @@ class Trainer(BaseTrainer):
                 )
         try:
             run_exception = None
-            epoch_iter = range(start_epoch, effective_epoch_limit) if effective_epoch_limit is not None else itertools.count(start_epoch)
             with self.mesh:
-                for epoch in epoch_iter:
-                    epoch_start_step = epoch_end_step = None
-                    if effective_epoch_limit is not None:
-                        epoch_start_step, epoch_end_step = self._get_epoch_step_bounds(epoch)
-                        if epoch_start_step >= epoch_end_step:
-                            continue
+                for epoch in range(start_epoch, self.arguments.num_train_epochs):
+                    epoch_start_step, epoch_end_step = self._get_epoch_step_bounds(epoch)
+                    if epoch_start_step >= epoch_end_step:
+                        continue
                     state, run_exception, train_iter = self._train_epoch(
                         state=state,
                         train_dataset=self.dataloader_train,
@@ -405,7 +384,7 @@ class Trainer(BaseTrainer):
                     )
 
                     current_step = int(jax.device_get(state.step))
-                    if self._should_stop_training(current_step):
+                    if current_step >= self.max_training_steps:
                         break
                     if run_exception is not None:
                         break
@@ -539,23 +518,16 @@ class Trainer(BaseTrainer):
         if self.max_training_steps is None:
             raise RuntimeError("max_training_steps must be set before training")
         if epoch_start_step is None or epoch_end_step is None:
-            effective_epoch_limit = self._effective_train_epoch_limit()
-            if effective_epoch_limit is None:
-                epoch_start_step, epoch_end_step = 0, self.max_training_steps
-            else:
-                epoch_start_step, epoch_end_step = self._get_epoch_step_bounds(epoch)
+            epoch_start_step, epoch_end_step = self._get_epoch_step_bounds(epoch)
         epoch_total_steps = max(epoch_end_step - epoch_start_step, 1)
         run_exception: Exception | None = None
 
         while True:
             current_step = int(jax.device_get(state.step))
-            if self._should_stop_training(current_step):
-                break
             if current_step >= self.max_training_steps or current_step >= epoch_end_step:
                 break
             try:
                 batch, train_iter = self._get_next_batch(train_iter, train_dataset)
-                raw_progress_items = self._count_raw_progress_items_in_batch(batch)
                 step_metrics.start_step()
                 state = self.on_step_start(state=state, step=current_step)
             except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, EasyDeLPreemptionSignal) as exc:
@@ -570,9 +542,6 @@ class Trainer(BaseTrainer):
             if run_exception is not None:
                 return state, run_exception, train_iter
             try:
-                if raw_progress_items is not None:
-                    self._consumed_train_raw_items += int(raw_progress_items)
-                    self._pending_train_progress_update += int(raw_progress_items)
                 mean_loss, mean_accuracy = metrics_tracker.update(
                     loss=metrics.loss,
                     accuracy=metrics.accuracy,
@@ -594,8 +563,6 @@ class Trainer(BaseTrainer):
                     mean_loss=mean_loss,
                     mean_accuracy=mean_accuracy,
                     mode="train",
-                    raw_items=self._consumed_train_raw_items,
-                    raw_items_limit=getattr(self.arguments, "max_training_raw_items", None),
                 )
                 state, metrics = self.on_step_end(
                     state=state,

@@ -79,7 +79,6 @@ import flax
 import flax.struct
 import jax
 import jax.tree_util
-from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from eformer.escale import make_shard_and_gather_fns, match_partition_rules
 from eformer.loggings import get_logger
 from flax import nnx as nn
@@ -1735,9 +1734,6 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             ...     kwargs.setdefault('use_cache', True)
             ...     return kwargs
         """
-        segment_ids = kwargs.get("segment_ids")
-        if segment_ids is not None and kwargs.get("mask_info") is None:
-            kwargs["mask_info"] = MaskInfo.from_segments(jnp.asarray(segment_ids, dtype=jnp.int32))
         return kwargs
 
     def get_static_arguments(self: Self) -> tuple:
@@ -2752,37 +2748,6 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         if labels is None:
             raise ValueError("`labels` can not be `None` for computing loss.")
         loss_kwargs = loss_kwargs or {}
-        loss_batch = dict(batch)
-        segment_ids = loss_batch.get("segment_ids", None)
-        if segment_ids is not None and "decoder_segment_ids" not in loss_batch:
-            loss_batch["decoder_segment_ids"] = segment_ids
-
-        if "decoder_positions" not in loss_batch and segment_ids is not None:
-            seg_array = jnp.asarray(segment_ids, dtype=jnp.int32)
-            if seg_array.ndim == 1:
-                seg_array = seg_array[None, :]
-                squeeze_positions = True
-            else:
-                squeeze_positions = False
-
-            def _positions_for_row(row: Array) -> Array:
-                def _scan_fn(carry, seg_id):
-                    prev_seg, prev_pos = carry
-                    is_padding = seg_id < 0
-                    same_segment = jnp.logical_and(seg_id == prev_seg, jnp.logical_not(is_padding))
-                    pos = jnp.where(is_padding, 0, jnp.where(same_segment, prev_pos + 1, 0))
-                    next_prev_seg = jnp.where(is_padding, -1, seg_id)
-                    next_prev_pos = jnp.where(is_padding, 0, pos)
-                    return (next_prev_seg, next_prev_pos), pos
-
-                (_, _), positions = jax.lax.scan(_scan_fn, (-1, 0), row)
-                return positions.astype(jnp.int32)
-
-            positions = jax.vmap(_positions_for_row)(seg_array)
-            if squeeze_positions:
-                positions = positions[0]
-            loss_batch["decoder_positions"] = positions.astype(jnp.int32)
-
         forward_batch = batch
         try:
             call_signature = inspect.signature(self.__call__)
