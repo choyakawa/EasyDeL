@@ -1,252 +1,172 @@
-# Local Divergence From `upstream/main`
+# Current Divergence From `upstream/main`
 
-This document describes the branch's real code-level divergence from `upstream/main` as it exists now.
+This document is a compact inventory of the branch's current code-level
+differences from `upstream/main`.
 
-It is meant for a maintainer who wants to reconstruct the local behavior starting from upstream without replaying local history.
+It intentionally describes only differences that still exist in the working
+tree.
 
-This guide intentionally focuses on behavioral and structural differences. It does not try to document merge commits, and it ignores low-signal metadata-only differences such as the executable-bit change on `scripts/mount_gcsfuse.sh`.
+## Changed Files
 
-## 1. Training config memory tracking is typed more narrowly
+- `easydel/trainers/training_configurations.py`
+- `easydel/infra/elarge/types/training.py`
+- `easydel/scripts/finetune/__init__.py`
+- `easydel/scripts/finetune/train.py`
+- `easydel/utils/parameters_transformation.py`
+- `easydel/infra/utils.py`
+- `easydel/trainers/trainer/_fn.py`
+- `easydel/modules/glm/modeling_glm.py`
+- `easydel/operations/kernels/paged_flash_attention.py`
 
-### Motivation
+## 1. Trainer Memory Tracking Typing
 
-The local branch narrows the trainer memory-tracking configuration surface.
+The trainer configuration narrows `track_memory` from `bool | float` to `bool`.
 
-### Behavioral target
+Files:
 
-Starting from upstream, reproduce this property:
+- `easydel/trainers/training_configurations.py`
+- `easydel/infra/elarge/types/training.py`
 
-- `track_memory` accepts a boolean value rather than `bool | float`
+Behavioral effect:
 
-### Reconstruction steps
+- float intervals are no longer represented in the public typed config surface
+- the dataclass and ELM typed config now agree that `track_memory` is boolean-only
 
-#### File: `easydel/trainers/training_configurations.py`
+## 2. Local SFT Finetune Entrypoint
 
-- `track_memory` is narrowed from `bool | float` to `bool`
+The branch adds a standalone SFT training script.
 
-#### File: `easydel/infra/elarge/types/training.py`
+Files:
 
-Mirror the same typing change in the typed config surface:
+- `easydel/scripts/finetune/__init__.py`
+- `easydel/scripts/finetune/train.py`
 
-- `track_memory: NotRequired[bool]`
+The script:
 
-## 2. The repository includes a local finetune entrypoint
+- initializes distributed JAX at import time
+- parses `ed.SFTConfig` plus a local `RunTimeConfig`
+- loads tokenizer and dataset via `HuggingFaceShardedSource`
+- chooses image-text or causal-LM EasyDeL auto model from the HF config
+- supports `full`, `lora`, and `lora_embed_head` training modes
+- optionally marks embedding and LM head parameters trainable through `nn.LoRAParam`
+- runs `ed.SFTTrainer`
+- unwraps LoRA after training when needed
+- converts the final EasyDeL model to a HF-compatible torch checkpoint
+- saves only on process 0 after multi-host synchronization
 
-### Motivation
+The export path sets:
 
-The local branch wants a single operational script for the most common SFT workflow, instead of relying only on reusable trainer primitives.
+- `EASY_SAFE_TRANSFER=1`
+- `EASYDEL_CHUNK_BYTES=64 * 1024 * 1024`
 
-### Behavioral target
+## 3. Multi-Host and Chunked Export Conversion
 
-The branch should contain one script that:
+The JAX-to-torch conversion path is customized for large sharded runs.
 
-- initializes distributed JAX
-- parses an `SFTConfig` plus runtime arguments
-- loads tokenizer and dataset
-- selects the proper EasyDeL auto-model
-- supports `full`, `lora`, and `lora_embed_head`
-- trains
-- merges LoRA when needed
-- exports an HF-compatible checkpoint in a multi-host-safe way
+File:
 
-### Reconstruction steps
+- `easydel/utils/parameters_transformation.py`
 
-#### File: `easydel/scripts/finetune/train.py`
+Changes:
 
-Create a direct training script with this structure:
+- imports `jax.experimental.multihost_utils` as `mhutils`
+- adds local-shard fallback logic for non-fully-addressable arrays
+- detects TPU via `jax.devices()` / `jax.default_backend()`
+- adds chunked CPU host transfer controlled by `EASYDEL_CHUNK_BYTES`
+- handles bf16 conversion through float32 before converting back to torch bf16
+- adds `TensorConverter.global_array_to_host_numpy(...)`
+- gathers addressable shards across processes and assembles the full array on process 0
+- uses module `_gather_fns` in `StateDictConverter.easydel_to_torch(...)` when available
+- changes model conversion checks to warn on missing keys
+- prints converted state-dict keys before strict `load_state_dict(...)`
 
-- call `jax.distributed.initialize()`
-- define a runtime dataclass with fields covering:
-  - repo id
-  - training mode
-  - LoRA rank/pattern
-  - dataset name/split/subset/streaming/cache dir
-  - processor repo id
-  - sharding axis and optional DCN sharding axis
-  - attention mechanism
-  - gradient checkpointing
-  - dtype / param_dtype / attention dtypes
-- parse `(ed.SFTConfig, RunTimeConfig)` with `DataClassArgumentParser`
-- load tokenizer and backfill `pad_token_id` from `eos_token_id` when missing
-- build a `HuggingFaceShardedSource`
-- inspect the HF config and choose:
-  - `AutoEasyDeLModelForImageTextToText`
-  - or `AutoEasyDeLModelForCausalLM`
-- initialize the model with local sharding/runtime settings
+Operational intent:
 
-Training modes:
+- avoid converting only local shard shapes
+- avoid large single host transfers
+- make TPU / multi-host checkpoint export possible from sharded arrays
 
-- `full`: no LoRA wrapping
-- `lora`: apply LoRA to matching layers
-- `lora_embed_head`: apply LoRA and additionally make embedding / lm_head params trainable via `nn.LoRAParam`
+## 4. LoRA Wrapping Sharding Metadata
 
-Formatting behavior:
+LoRA wrapping of `ParallelLinear` layers is extended with dynamic sharding metadata.
 
-- do not inject a custom formatting function
-- let message-style data flow directly into SFT preprocessing so the tokenizer chat template can produce assistant masks
+File:
 
-Training/export behavior:
+- `easydel/infra/utils.py`
 
-- instantiate `ed.SFTTrainer`
-- run `trainer.train()`
-- recover final state
-- unwrap LoRA if used
-- restore `LoRAParam` embedding / lm_head params back to plain `Param` when needed
-- export with:
-  - `EASY_SAFE_TRANSFER=1`
-  - `EASYDEL_CHUNK_BYTES=64 * 1024 * 1024`
-- synchronize hosts before and after save
-- on process 0:
-  - build the HF model on `torch.device("meta")`
-  - load converted weights with `assign=True`
-  - save with `safe_serialization=True`
+Changes:
 
-## 3. Export and LoRA wrapping are customized for multi-host and sharded local workflows
-
-### Motivation
-
-The local branch prioritizes successful export and sharding stability on large distributed runs over keeping the upstream conversion path minimal.
-
-### Behavioral target
-
-After reproducing the local branch:
-
-- JAX-to-torch conversion should work even when only local shards are directly addressable
-- multi-host TPU export should gather complete arrays on process 0
-- large host transfers should happen in chunks
-- LoRA-wrapped linear layers should preserve EasyDeL-specific calling and sharding conventions
-
-### Reconstruction steps
-
-#### File: `easydel/utils/parameters_transformation.py`
-
-Add:
-
-- `from jax.experimental import multihost_utils as mhutils`
-
-Inside `TensorConverter.jax_to_pytorch(...)`, add:
-
-- `_get_local_array(arr)`
-  - prefer fully addressable arrays
-  - otherwise fall back to the first addressable shard
-- more robust platform detection via `jax.devices()` and `jax.default_backend()`
-- `_cpu_chunked_transfer(arr)`
-  - flatten to 1D
-  - host-copy in chunks sized by `EASYDEL_CHUNK_BYTES`
-  - reassemble on CPU
-  - convert bf16 safely for torch
-- TPU-specific path:
-  - gather the full array through `global_array_to_host_numpy(...)`
-- CPU/GPU safe-transfer path:
-  - prefer the chunked host-copy implementation
-
-Add `global_array_to_host_numpy(...)`:
-
-- gather addressable shards per process
-- all-gather them across hosts with `mhutils.process_allgather(...)`
-- assemble the full host array on process 0
-
-`StateDictConverter.easydel_to_torch(...)` also differs:
-
-- try per-parameter gather functions from `module._gather_fns` before conversion
-- that avoids converting only a local shard shape
-
-`ModelConverter` differs slightly too:
-
-- when checking the converted state dict, warn on missing keys
-- emit debug prints of the converted key set before `load_state_dict(...)`
-
-#### File: `easydel/infra/utils.py`
-
-`apply_lora_to_layers(...)` differs like this:
-
-- wrap matching `ParallelLinear` modules with `eLoRA`
-- attach a dynamic `craft_sharding(...)` method to each wrapper
-- choose LoRA sharding based on the wrapped module's direction:
+- wraps matching `ParallelLinear` modules in `eLoRA` as before, but stores the wrapper first
+- attaches a dynamic `craft_sharding(...)` method to each wrapper
+- chooses LoRA sharding based on the wrapped base module direction:
   - row-parallel base: `lora_a` row-wise, `lora_b` replicated
   - column-parallel base: `lora_a` replicated, `lora_b` column-wise
-  - otherwise both replicated
-- include flattened base-module sharding specs under `base_module/...`
+  - unknown direction: both replicated
+- includes base-module sharding specs under `base_module/...`
 
-## 4. Trainer step functions explicitly merge auxiliary graph state
+Operational intent:
 
-### Motivation
+- keep LoRA adapter sharding compatible with EasyDeL parallel linear layouts
+- preserve base-module sharding information after wrapping
 
-The local branch expects the training and evaluation step functions to merge `graphother` explicitly instead of relying only on `state.merge(tree)`.
+## 5. Trainer Step Graph State Merge
 
-### Behavioral target
+Trainer step functions explicitly merge auxiliary graph state.
 
-Trainer step execution should preserve the auxiliary graph state and stop gradients through it.
+File:
 
-### Reconstruction steps
+- `easydel/trainers/trainer/_fn.py`
 
-#### File: `easydel/trainers/trainer/_fn.py`
+Changes in both training and evaluation steps:
 
-In both `training_step(...)` and `evaluation_step(...)`:
+- maps `state.graphother` leaves through `jax.lax.stop_gradient(...)` when they look array-like
+- merges with `nn.merge(state.graphdef, tree, tree_other)`
+- no longer relies only on `state.merge(tree)`
 
-- build `tree_other` from `state.graphother`
-- wrap tensor-like leaves with `jax.lax.stop_gradient(...)`
-- merge the module explicitly with:
-  - `nn.merge(state.graphdef, tree, tree_other)`
+Operational intent:
 
-## 5. The local GLM implementation intentionally diverges from upstream
+- preserve non-parameter graph state during step execution
+- prevent gradients through that auxiliary graph state
 
-### Motivation
+## 6. GLM Architecture Adjustments
 
-The local branch expects GLM internals that better match the local checkpoints and training assumptions than the upstream implementation does.
+The GLM implementation intentionally differs from upstream.
 
-### Behavioral target
+File:
 
-The GLM MLP and attention projections should follow the local structure, not upstream's current one.
+- `easydel/modules/glm/modeling_glm.py`
 
-### Reconstruction steps
+MLP changes:
 
-#### File: `easydel/modules/glm/modeling_glm.py`
+- replaces fused `gate_up_proj` with separate `gate_proj`, `up_proj`, and `down_proj`
+- computes SwiGLU as `down_proj(act(gate_proj(x)) * up_proj(x))`
+- adds explicit checkpoint names for gate, up, down, and output activations
 
-`GlmMLP` differs by:
+Attention changes:
 
-- replacing `gate_up_proj` with separate:
-  - `gate_proj`
-  - `up_proj`
-  - `down_proj`
-- computing SwiGLU as:
-  - `down_proj(act(gate_proj(x)) * up_proj(x))`
-
-`GlmAttention` differs by overriding projection builders:
-
-- `q_proj`, `k_proj`, `v_proj` use `use_bias=True`
+- overrides projection builders
+- `q_proj`, `k_proj`, and `v_proj` use `use_bias=True`
 - `o_proj` uses `use_bias=False`
 - rotary embedding creation uses:
   - `base=getattr(config, "rope_theta", 100000000.0)`
   - `is_neox_style=False`
 
-## 6. Local attention kernels do not force `logits_dtype`
+Operational intent:
 
-### Motivation
+- match local GLM checkpoint structure and rotary assumptions
 
-The local branch avoids hard-coding `logits_dtype=jnp.bfloat16` in these flash-attention call sites.
+## 7. Paged Flash Attention Logits Dtype
 
-### Behavioral target
+The paged flash attention call no longer forces bf16 logits.
 
-The kernels should inherit the upstream/default dtype behavior instead of forcing bf16 logits.
+File:
 
-### Reconstruction steps
+- `easydel/operations/kernels/paged_flash_attention.py`
 
-#### File: `easydel/operations/kernels/flash_attention.py`
+Change:
 
-- remove the forced `logits_dtype=jnp.bfloat16` argument from the flash-attention invocation
+- `logits_dtype=jnp.bfloat16` is commented out in the paged flash attention invocation
 
-#### File: `easydel/operations/kernels/paged_flash_attention.py`
+Operational intent:
 
-- remove the forced `logits_dtype=jnp.bfloat16` argument from the paged flash-attention invocation
-
-## 7. Summary
-
-If the local divergence has been reproduced correctly, these statements should all be true:
-
-- `track_memory` is narrowed to boolean-only typing
-- the repository contains a direct SFT entrypoint script for the local workflow
-- JAX-to-torch export is multi-host-safe and chunked for large arrays
-- LoRA wrappers preserve EasyDeL calling conventions and sharding metadata
-- trainer step functions merge `graphother` explicitly
-- the local GLM implementation and flash-attention call sites intentionally differ from upstream
+- let the kernel/default attention path choose logits dtype instead of hard-coding bf16
