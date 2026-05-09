@@ -235,15 +235,42 @@ Test coverage:
 
 - packed assistant/completion masks stay aligned across packed segments
 - existing source padding is stripped before packing
+- packed `segment_ids` build a block-diagonal `MaskInfo` attention mask that
+  blocks cross-example attention and masks padding segment `0`
 - packed metadata has stable-style `segment_ids` and per-segment `position_ids`
 - SFT packing disables pre-padding
 - wrapped packing is rejected for leakage-safe SFT
+- causal-LM loss shifts `decoder_loss_weights` with labels, so
+  assistant-only masks weight the assistant target tokens after next-token
+  shifting
 
 Operational intent:
 
 - keep `assistant_only_loss=True` accurate when `packing=True`
 - prevent attention leakage across packed examples
 - preserve stable-branch packed sequence semantics in the newer lazy data path
+
+2026-05-09 verification notes for the local finetune path:
+
+- the provided `--packing True --assistant_only_loss True --dataset_text_field
+  messages --attn_mechanism blocksparse` flow uses `SFTPreprocessTransform`
+  with padding disabled before packing, so the packer sees real sequence
+  lengths rather than 4096-token padded rows
+- SFT packing preserves `assistant_masks`/`completion_mask` as token-aligned
+  fields, gives synthetic EOS separators mask value `0`, and gives packed
+  padding mask value `0`
+- `_preprocess_batch_input` converts `assistant_masks` to `completion_mask`
+  and `decoder_loss_weights`, multiplies by `attention_mask`, and exposes
+  `decoder_segment_ids`/`decoder_positions`
+- causal-LM loss shifts both labels and `decoder_loss_weights`, so the mask
+  remains target-token aligned after next-token shifting
+- model forward receives either `segment_ids` directly or a prebuilt
+  `MaskInfo.from_segments(...)`; blocksparse attention consumes that
+  `MaskInfo` instead of relying on a flat padding-only mask
+- focused pytest was attempted in the local Windows workspace but could not
+  collect because the active Python environment lacks `jax`; `uv run` also
+  could not prepare the environment because `uvloop==0.21.0` does not support
+  Windows
 
 ## 9. GCS Fuse Script Mode
 

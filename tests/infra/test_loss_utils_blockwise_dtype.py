@@ -322,6 +322,23 @@ def test_causal_lm_loss_strategy_dense_preserves_decoder_loss_weights():
     assert jnp.allclose(actual.accuracy, expected.accuracy, atol=1e-5)
 
 
+def test_for_causal_lm_loss_uses_assistant_mask_on_shifted_targets():
+    logits = jnp.zeros((1, 8, 32), dtype=jnp.float32)
+    labels = jnp.array([[10, 11, 12, 31, 20, 21, 31, 0]], dtype=jnp.int32)
+    attention_mask = jnp.array([[1, 1, 1, 1, 1, 1, 1, 0]], dtype=jnp.int32)
+    assistant_mask = jnp.array([[0, 1, 1, 0, 0, 1, 0, 0]], dtype=jnp.float32)
+
+    metrics = ForCausalLMLoss(
+        logits=logits,
+        labels=labels,
+        attention_mask=attention_mask,
+        config=LossConfig(chunk_block_size=None),
+        batch={"decoder_loss_weights": assistant_mask},
+    )
+
+    assert float(metrics.weight_sum) == 3.0
+
+
 def test_causal_lm_loss_chunked_lm_head_disables_inner_ce_chunking(monkeypatch: pytest.MonkeyPatch):
     hidden_states = jnp.arange(2 * 5 * 4, dtype=jnp.float32).reshape(2, 5, 4) / 17
     labels = jnp.array([[0, 1, 2, 3, 4], [4, 3, 2, 1, 0]], dtype=jnp.int32)

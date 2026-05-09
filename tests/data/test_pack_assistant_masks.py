@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 
+import jax.numpy as jnp
 import numpy as np
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 
 from easydel.data.core.protocols import ShardedDataSource
 from easydel.data.transforms.pack import PackedShardedSource
@@ -91,3 +93,24 @@ def test_packed_source_strips_existing_padding_before_packing_masks():
     np.testing.assert_array_equal(row["input_ids"], np.array([10, 11, 99, 0, 0]))
     np.testing.assert_array_equal(row["attention_mask"], np.array([1, 1, 1, 0, 0]))
     np.testing.assert_array_equal(row["assistant_masks"], np.array([0, 1, 0, 0, 0]))
+
+
+def test_packed_segment_ids_create_block_diagonal_attention_mask():
+    segment_ids = jnp.array([[1, 1, 1, 1, 2, 2, 2, 0]], dtype=jnp.int32)
+    position_ids = jnp.array([[0, 1, 2, 3, 0, 1, 2, 0]], dtype=jnp.int32)
+    mask_info = MaskInfo.from_segments(
+        q_segment_ids=segment_ids,
+        kv_segment_ids=segment_ids,
+        q_positions=position_ids,
+        kv_positions=position_ids,
+    )
+
+    attention = np.asarray(mask_info.get_or_compute_attention_mask(dtype=jnp.bool_))
+    attention = np.squeeze(attention, axis=tuple(range(attention.ndim - 2)))
+
+    assert not attention[:4, 4:7].any()
+    assert not attention[4:7, :4].any()
+    assert not attention[7, :].any()
+    assert not attention[:, 7].any()
+    assert attention[:4, :4].any()
+    assert attention[4:7, 4:7].any()
