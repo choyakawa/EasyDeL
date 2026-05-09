@@ -60,6 +60,7 @@ class PackedSequence:
     fields: dict[str, np.ndarray] = field(default_factory=dict)
     source_ids: list[str] | None = None
     num_segments: int = 0
+    source_count: int = 0
 
     def to_dict(self) -> dict[str, np.ndarray]:
         """Convert to a dictionary suitable for training loops.
@@ -75,6 +76,8 @@ class PackedSequence:
             result["segment_ids"] = self.segment_ids
         if self.position_ids is not None:
             result["position_ids"] = self.position_ids
+        if self.source_count:
+            result["__num_source_examples"] = np.asarray(self.source_count, dtype=np.int32)
         result.update(self.fields)
         return result
 
@@ -151,6 +154,7 @@ class GreedyPacker:
         self._segment_ids: list[int] = []
         self._current_segment = 1
         self._source_ids: list[str] = []
+        self._source_count = 0
 
     def add(
         self,
@@ -170,6 +174,7 @@ class GreedyPacker:
         """
         result = None
         fields = fields or {}
+        self._source_count += 1
 
         # Add tokens to buffer
         for idx, tok in enumerate(tokens):
@@ -234,6 +239,7 @@ class GreedyPacker:
             fields=fields,
             source_ids=self._source_ids.copy() if self._source_ids else None,
             num_segments=self._current_segment,
+            source_count=self._source_count,
         )
 
         # Keep remainder
@@ -243,6 +249,7 @@ class GreedyPacker:
             self._segment_ids = self._segment_ids[self.seq_length :]
         self._fields = {key: values[self.seq_length :] for key, values in self._fields.items()}
         self._source_ids = []
+        self._source_count = 0
         self._current_segment = 1
 
         return result
@@ -284,6 +291,7 @@ class GreedyPacker:
             fields=fields,
             source_ids=self._source_ids.copy() if self._source_ids else None,
             num_segments=max(self._current_segment - 1, 0),
+            source_count=self._source_count,
         )
 
         self._buffer = []
@@ -291,6 +299,7 @@ class GreedyPacker:
         self._segment_ids = []
         self._fields = {}
         self._source_ids = []
+        self._source_count = 0
         self._current_segment = 1
 
         return result
@@ -408,7 +417,7 @@ class FirstFitPacker:
         self.include_segment_ids = include_segment_ids
         self.buffer_size = buffer_size
 
-        self._pending: list[tuple[list[int], str | None, dict[str, list[int]]]] = []
+        self._pending: list[tuple[list[int], str | None, dict[str, list[int]], int]] = []
 
     def add(
         self,
@@ -426,7 +435,7 @@ class FirstFitPacker:
         Returns:
             List of completed PackedSequences when buffer is full.
         """
-        self._pending.append((tokens, source_id, fields or {}))
+        self._pending.append((tokens, source_id, fields or {}, 1))
 
         if len(self._pending) >= self.buffer_size:
             return self._pack_buffer()
@@ -441,10 +450,10 @@ class FirstFitPacker:
         # Sort by length (decreasing)
         sorted_pending = sorted(self._pending, key=lambda x: len(x[0]), reverse=True)
 
-        # Bins: list of (tokens, segment_ids, fields, source_ids)
-        bins: list[tuple[list[int], list[int], dict[str, list[int]], list[str]]] = []
+        # Bins: list of (tokens, segment_ids, fields, source_ids, source_count)
+        bins: list[tuple[list[int], list[int], dict[str, list[int]], list[str], int]] = []
 
-        for tokens, source_id, fields in sorted_pending:
+        for tokens, source_id, fields, source_count in sorted_pending:
             if len(tokens) > self.seq_length:
                 tokens = tokens[: self.seq_length]
                 fields = {key: values[: self.seq_length] for key, values in fields.items()}
@@ -453,7 +462,7 @@ class FirstFitPacker:
             placed = False
 
             # Find first bin that fits
-            for _i, (bin_tokens, bin_segments, bin_fields, bin_sources) in enumerate(bins):
+            for bin_idx, (bin_tokens, bin_segments, bin_fields, bin_sources, bin_source_count) in enumerate(bins):
                 if len(bin_tokens) + token_len <= self.seq_length:
                     # Add to this bin
                     segment_id = max(bin_segments) + 1 if bin_segments else 1
@@ -478,6 +487,13 @@ class FirstFitPacker:
                             bin_fields.setdefault(field_name, []).append(_separator_value_for_field(field_name))
                     if source_id:
                         bin_sources.append(source_id)
+                    bins[bin_idx] = (
+                        bin_tokens,
+                        bin_segments,
+                        bin_fields,
+                        bin_sources,
+                        bin_source_count + source_count,
+                    )
                     placed = True
                     break
 
@@ -495,11 +511,11 @@ class FirstFitPacker:
                     for field_name in fields:
                         new_fields.setdefault(field_name, []).append(_separator_value_for_field(field_name))
                 new_sources = [source_id] if source_id else []
-                bins.append((new_tokens, new_segments, new_fields, new_sources))
+                bins.append((new_tokens, new_segments, new_fields, new_sources, source_count))
 
         # Convert bins to PackedSequences
         results = []
-        for bin_tokens, bin_segments, bin_fields, bin_sources in bins:
+        for bin_tokens, bin_segments, bin_fields, bin_sources, bin_source_count in bins:
             # Pad if needed
             pad_len = self.seq_length - len(bin_tokens)
             input_ids = np.array(bin_tokens + [self.pad_token_id] * pad_len, dtype=np.int32)
@@ -527,6 +543,7 @@ class FirstFitPacker:
                     fields=fields,
                     source_ids=bin_sources if bin_sources else None,
                     num_segments=max(bin_segments) if bin_segments else 0,
+                    source_count=bin_source_count,
                 )
             )
 

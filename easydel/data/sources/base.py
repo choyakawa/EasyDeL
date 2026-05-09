@@ -669,6 +669,52 @@ class HuggingFaceShardedSource(ShardedDataSource[dict]):
             for example in ds.select(range(row, len(ds))):
                 yield _coerce_example(example)
 
+    def get_shard_info(self, shard_name: str) -> ShardInfo | None:
+        """Return HuggingFace split metadata when it is available.
+
+        Streaming HuggingFace datasets usually do not implement ``len()``, but
+        many dataset builders still expose the original split cardinality via
+        ``dataset.info.splits``.  That number describes the raw split rows, not
+        transformed or packed training examples, so it is exposed as shard
+        metadata rather than as ``__len__``.
+        """
+        del shard_name
+        try:
+            ds = self._load_dataset()
+        except Exception:
+            return None
+
+        info = getattr(ds, "info", None)
+        splits = getattr(info, "splits", None)
+        if splits is None:
+            return None
+
+        split_info = None
+        try:
+            split_info = splits[self._split]
+        except Exception:
+            get = getattr(splits, "get", None)
+            if callable(get):
+                split_info = get(self._split)
+
+        if split_info is None:
+            return None
+
+        num_examples = getattr(split_info, "num_examples", None)
+        if num_examples is None:
+            return None
+
+        try:
+            num_rows = int(num_examples)
+        except (TypeError, ValueError):
+            return None
+
+        return ShardInfo(
+            shard_id=0,
+            shard_name=self.shard_names[0],
+            num_rows=num_rows,
+        )
+
     def __len__(self) -> int:
         """Return number of examples in the dataset.
 

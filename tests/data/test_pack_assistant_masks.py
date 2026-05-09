@@ -81,6 +81,7 @@ def test_packed_source_preserves_assistant_masks_across_segments():
     np.testing.assert_array_equal(row["assistant_masks"], np.array([0, 1, 1, 0, 0, 1, 0, 0]))
     np.testing.assert_array_equal(row["completion_mask"], np.array([0, 1, 1, 0, 0, 1, 0, 0]))
     np.testing.assert_array_equal(row["position_ids"], np.array([0, 1, 2, 3, 0, 1, 2, 0]))
+    assert int(row["__num_source_examples"]) == 2
 
 
 def test_packed_source_strips_existing_padding_before_packing_masks():
@@ -142,6 +143,7 @@ def test_packed_source_iterates_streaming_source_without_length():
     np.testing.assert_array_equal(row["input_ids"], np.array([10, 11, 99, 20, 99, 0]))
     np.testing.assert_array_equal(row["attention_mask"], np.array([1, 1, 1, 1, 1, 0]))
     np.testing.assert_array_equal(row["assistant_masks"], np.array([0, 1, 0, 1, 0, 0]))
+    assert int(row["__num_source_examples"]) == 2
 
 
 def test_packed_segment_ids_create_block_diagonal_attention_mask():

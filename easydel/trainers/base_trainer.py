@@ -1291,6 +1291,30 @@ class BaseTrainer(BaseTrainerProtocol):
             total += int(info.num_rows)
         return total
 
+    def _raw_source_for_progress(self, source: ShardedDataSource | None) -> ShardedDataSource | None:
+        """Peel non-cardinality-changing wrappers to find raw row metadata."""
+        current = source
+        while isinstance(current, ShardedDataSource):
+            source_type = type(current).__name__
+            if source_type == "PackedShardedSource":
+                current = getattr(current, "_source", None)
+                continue
+
+            transform = getattr(current, "_transform", None)
+            if source_type == "TransformedShardedSource":
+                if getattr(transform, "is_filter", False) or getattr(transform, "is_expand", False):
+                    return None
+                current = getattr(current, "_source", None)
+                continue
+
+            return current
+        return None
+
+    def _discover_raw_dataset_num_examples(self, source: ShardedDataSource | None) -> int | None:
+        """Discover raw source row count for progress metrics, when known."""
+        raw_source = self._raw_source_for_progress(source)
+        return self._sum_known_shard_rows(raw_source)
+
     def _discover_dataset_num_examples(
         self,
         dataset: "Dataset | IterableDataset | ShardedDataSource | None",
@@ -1664,11 +1688,15 @@ class BaseTrainer(BaseTrainerProtocol):
         self._train_dataset_size_source_label = getattr(self, "_train_dataset_size_source_label", "unknown")
         self._train_dataset_steps_auto_discovered = getattr(self, "_train_dataset_steps_auto_discovered", False)
         self._train_dataset_steps_auto_clamped = getattr(self, "_train_dataset_steps_auto_clamped", False)
+        self._train_raw_dataset_num_examples = getattr(self, "_train_raw_dataset_num_examples", None)
+        self._train_raw_examples_seen = getattr(self, "_train_raw_examples_seen", 0)
         self._eval_dataset_num_examples = getattr(self, "_eval_dataset_num_examples", None)
         self._eval_dataset_num_examples_exact = getattr(self, "_eval_dataset_num_examples_exact", False)
         self._eval_dataset_size_source_label = getattr(self, "_eval_dataset_size_source_label", "unknown")
         self._eval_dataset_steps_auto_discovered = getattr(self, "_eval_dataset_steps_auto_discovered", False)
         self._eval_dataset_steps_auto_clamped = getattr(self, "_eval_dataset_steps_auto_clamped", False)
+        self._eval_raw_dataset_num_examples = getattr(self, "_eval_raw_dataset_num_examples", None)
+        self._eval_raw_examples_seen = getattr(self, "_eval_raw_examples_seen", 0)
 
         self.scheduler = getattr(self, "scheduler", None)
         self.tx = getattr(self, "tx", None)
@@ -1875,9 +1903,56 @@ class BaseTrainer(BaseTrainerProtocol):
         such as data augmentation, masking, or format conversion.
         The batch is automatically purified to remove non-array fields.
         """
+        raw_examples_in_batch = self._pop_internal_batch_count(batch, "__num_source_examples")
+        infos: dict[str, float | int | str] = {}
+        if raw_examples_in_batch:
+            if is_train:
+                self._train_raw_examples_seen += raw_examples_in_batch
+                raw_examples_seen = self._train_raw_examples_seen
+                raw_examples_total = self._train_raw_dataset_num_examples
+            else:
+                self._eval_raw_examples_seen += raw_examples_in_batch
+                raw_examples_seen = self._eval_raw_examples_seen
+                raw_examples_total = self._eval_raw_dataset_num_examples
+
+            infos["raw_examples"] = raw_examples_in_batch
+            infos["raw_examples_seen"] = raw_examples_seen
+            if raw_examples_total is not None:
+                infos["raw_examples_total"] = raw_examples_total
+                if raw_examples_total > 0:
+                    infos["raw_examples_progress"] = raw_examples_seen / raw_examples_total
+
         # Purify batch to keep only JAX-compatible array fields
         batch = self._purify_batch(batch)
-        return batch, {}
+        return batch, infos
+
+    @staticmethod
+    def _pop_internal_batch_count(batch: tp.Any, key: str) -> int:
+        """Pop and sum an internal scalar count from a raw or collated batch."""
+        if isinstance(batch, dict):
+            value = batch.pop(key, None)
+            if value is None:
+                return 0
+            try:
+                return int(np.asarray(value).sum())
+            except (TypeError, ValueError):
+                return 0
+
+        if isinstance(batch, (list, tuple)):
+            total = 0
+            for example in batch:
+                if not isinstance(example, dict):
+                    continue
+                value = example.pop(key, None)
+                if value is None:
+                    continue
+                try:
+                    total += int(np.asarray(value).sum())
+                except (TypeError, ValueError):
+                    continue
+            return total
+
+        return 0
 
     def _purify_batch(self, batch: dict) -> dict:
         """Remove non-JAX-compatible fields from a batch.
@@ -4319,6 +4394,7 @@ class BaseTrainer(BaseTrainerProtocol):
             drop_remainder=True,
         )
         self._set_dataset_size_metadata(is_train=True, resolution=train_resolution)
+        self._train_raw_dataset_num_examples = self._discover_raw_dataset_num_examples(self._train_source)
         max_training_steps = train_resolution.steps
 
         # Use _train_source if available (has transforms applied)
@@ -4346,6 +4422,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 drop_remainder=True,
             )
             self._set_dataset_size_metadata(is_train=False, resolution=eval_resolution)
+            self._eval_raw_dataset_num_examples = self._discover_raw_dataset_num_examples(self._eval_source)
             max_evaluation_steps = eval_resolution.steps
             # Use _eval_source if available (has transforms applied)
             if self._eval_source is not None:
@@ -4502,6 +4579,7 @@ class BaseTrainer(BaseTrainerProtocol):
             drop_remainder=self._train_source is not None or hasattr(self.dataset_train, "__len__"),
         )
         self._set_dataset_size_metadata(is_train=True, resolution=train_resolution)
+        self._train_raw_dataset_num_examples = self._discover_raw_dataset_num_examples(self._train_source)
         max_training_steps = train_resolution.steps
 
         # Use _train_source if available (has transforms applied)
@@ -4528,6 +4606,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 drop_remainder=self._eval_source is not None or hasattr(self.dataset_eval, "__len__"),
             )
             self._set_dataset_size_metadata(is_train=False, resolution=eval_resolution)
+            self._eval_raw_dataset_num_examples = self._discover_raw_dataset_num_examples(self._eval_source)
             max_evaluation_steps = eval_resolution.steps
             # Use _eval_source if available (has transforms applied)
             if self._eval_source is not None:
@@ -5398,12 +5477,16 @@ class BaseTrainer(BaseTrainerProtocol):
             config_metrics["train_dataset_size_source"] = self._train_dataset_size_source_label
             config_metrics["train_steps_auto_discovered"] = self._train_dataset_steps_auto_discovered
             config_metrics["train_steps_auto_clamped"] = self._train_dataset_steps_auto_clamped
+        if self._train_raw_dataset_num_examples is not None:
+            config_metrics["train_raw_dataset_num_examples"] = self._train_raw_dataset_num_examples
         if self._eval_dataset_num_examples is not None:
             config_metrics["eval_dataset_num_examples"] = self._eval_dataset_num_examples
             config_metrics["eval_dataset_num_examples_exact"] = self._eval_dataset_num_examples_exact
             config_metrics["eval_dataset_size_source"] = self._eval_dataset_size_source_label
             config_metrics["eval_steps_auto_discovered"] = self._eval_dataset_steps_auto_discovered
             config_metrics["eval_steps_auto_clamped"] = self._eval_dataset_steps_auto_clamped
+        if self._eval_raw_dataset_num_examples is not None:
+            config_metrics["eval_raw_dataset_num_examples"] = self._eval_raw_dataset_num_examples
         self.arguments.log_metrics(
             config_metrics,
             step=0,

@@ -195,6 +195,8 @@ Files:
 Packing changes:
 
 - `PackedSequence` carries `position_ids` and arbitrary token-aligned fields.
+- packed outputs carry an internal `__num_source_examples` scalar so trainer
+  metrics can report raw rows consumed by each packed batch.
 - `PackedShardedSource` can preserve aligned fields such as:
   - `attention_mask`
   - `completion_mask`
@@ -237,6 +239,10 @@ Test coverage:
 - existing source padding is stripped before packing
 - packed sources can iterate streaming-like sources that do not support
   `len()`
+- packed sources report the number of raw examples represented by each packed
+  sequence
+- streaming HuggingFace sources expose split `num_examples` metadata through
+  `get_shard_info(...)` when the metadata is available
 - packed `segment_ids` build a block-diagonal `MaskInfo` attention mask that
   blocks cross-example attention and masks padding segment `0`
 - packed metadata has stable-style `segment_ids` and per-segment `position_ids`
@@ -264,6 +270,10 @@ Operational intent:
 - `_preprocess_batch_input` converts `assistant_masks` to `completion_mask`
   and `decoder_loss_weights`, multiplies by `attention_mask`, and exposes
   `decoder_segment_ids`/`decoder_positions`
+- trainer preprocessing removes internal `__num_source_examples` before JAX
+  execution, accumulates raw examples consumed, and logs
+  `raw_examples`, `raw_examples_seen`, optional `raw_examples_total`, and
+  optional `raw_examples_progress`
 - causal-LM loss shifts both labels and `decoder_loss_weights`, so the mask
   remains target-token aligned after next-token shifting
 - model forward receives either `segment_ids` directly or a prebuilt
@@ -272,6 +282,10 @@ Operational intent:
 - streaming HuggingFace sources are compatible with this path when the run has
   explicit step bounds such as `--max_training_steps`; without a discoverable
   length, the trainer requires configured training/evaluation steps
+- when HuggingFace split metadata contains `num_examples`, the trainer uses it
+  only as the raw-row progress denominator; packed training steps still follow
+  actual packed batches / configured max steps because raw rows do not map
+  exactly to packed sequences
 - `packing_strategy='bfd'` uses bounded lazy first-fit buffering; it does not
   materialize the whole streaming dataset, but the first packed examples may
   wait until the first-fit buffer fills or the stream ends
