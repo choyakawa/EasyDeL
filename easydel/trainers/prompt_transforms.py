@@ -984,6 +984,7 @@ class SFTPreprocessTransform(Transform):
         mask_prompt: bool = False,
         add_eos: bool = True,
         truncation: bool = True,
+        padding: bool = True,
         formatting_func: tp.Callable | None = None,
     ):
         self._tokenizer = tokenizer
@@ -993,6 +994,7 @@ class SFTPreprocessTransform(Transform):
         self._mask_prompt = mask_prompt
         self._add_eos = add_eos
         self._truncation = truncation
+        self._padding = padding
         self._formatting_func = formatting_func
         chat_template = getattr(tokenizer, "chat_template", None)
         self._return_assistant_tokens_mask = bool(
@@ -1079,7 +1081,7 @@ class SFTPreprocessTransform(Transform):
                 return_assistant_tokens_mask=self._return_assistant_tokens_mask,
                 truncation=self._truncation,
                 max_length=self._max_length,
-                padding="max_length" if self._max_length else False,
+                padding="max_length" if self._padding and self._max_length else False,
                 tools=tools,
             )
             result.update(processed)
@@ -1098,7 +1100,7 @@ class SFTPreprocessTransform(Transform):
                 text,
                 truncation=self._truncation,
                 max_length=self._max_length,
-                padding="max_length" if self._max_length else False,
+                padding="max_length" if self._padding and self._max_length else False,
                 return_attention_mask=True,
             )
             result["input_ids"] = tokens["input_ids"]
@@ -1177,7 +1179,7 @@ class SFTPreprocessTransform(Transform):
             full_text,
             truncation=self._truncation,
             max_length=self._max_length,
-            padding="max_length" if self._max_length else False,
+            padding="max_length" if self._padding and self._max_length else False,
             return_attention_mask=True,
             add_special_tokens=False,
         )
@@ -1212,7 +1214,7 @@ class SFTPreprocessTransform(Transform):
             text,
             truncation=self._truncation,
             max_length=self._max_length,
-            padding="max_length" if self._max_length else False,
+            padding="max_length" if self._padding and self._max_length else False,
             return_attention_mask=True,
         )
 

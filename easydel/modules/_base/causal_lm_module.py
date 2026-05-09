@@ -289,6 +289,7 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
@@ -317,6 +318,9 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
             position_ids: Position indices with shape (batch_size, sequence_length).
                 If None, positions are inferred from input_ids accounting for
                 padding. Important for correct positional encoding.
+            segment_ids: Segment IDs with shape (batch_size, sequence_length).
+                When provided for packed sequences, tokens can only attend within
+                the same non-zero segment. Padding should use segment id 0.
             mode: Runtime mode controlling model behavior:
                 - MODE_TRAIN: Training mode with full forward pass
                 - MODE_EVAL: Evaluation mode
@@ -371,6 +375,14 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
                 )
                 loss = cross_entropy(outputs.logits[:, :-1], input_ids[:, 1:])
         """
+        if mask_info is None and segment_ids is not None:
+            mask_info = MaskInfo.from_segments(
+                q_segment_ids=segment_ids,
+                kv_segment_ids=segment_ids,
+                q_positions=position_ids,
+                kv_positions=position_ids,
+            )
+
         # Forward through base model
         # Build kwargs conditionally to support models that don't accept inputs_embeds
         base_model_kwargs = {

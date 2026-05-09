@@ -156,6 +156,7 @@ class SFTTrainer(Trainer):
             max_length=self.arguments.max_length,
             text_field=self._dataset_text_field or "text",
             mask_prompt=mask_prompt,
+            padding=not bool(getattr(self.arguments, "packing", False)),
             formatting_func=self._formatting_func,
         )
 
@@ -194,9 +195,12 @@ class SFTTrainer(Trainer):
             logger.warning("No eos_token_id found, using pad_token_id for packing")
             eos_token_id = pad_token_id
 
-        # Map strategy names
-        strategy_map = {"bfd": "first_fit", "wrapped": "greedy"}
-        strategy = strategy_map.get(self.arguments.packing_strategy, "greedy")
+        if self.arguments.packing_strategy != "bfd":
+            raise ValueError(
+                "Only `packing_strategy='bfd'` is supported for leakage-safe SFT packing. "
+                "`wrapped` cuts through sequence boundaries and cannot preserve attention isolation."
+            )
+        strategy = "first_fit"
 
         # Apply packing to train source
         if self._train_source is not None:
@@ -207,6 +211,7 @@ class SFTTrainer(Trainer):
                 pad_token_id=pad_token_id,
                 strategy=strategy,
                 include_segment_ids=True,
+                aligned_fields=("attention_mask", "completion_mask", "assistant_masks", "labels"),
             )
 
         # Apply packing to eval source if eval_packing is enabled
@@ -222,6 +227,7 @@ class SFTTrainer(Trainer):
                 pad_token_id=pad_token_id,
                 strategy=strategy,
                 include_segment_ids=True,
+                aligned_fields=("attention_mask", "completion_mask", "assistant_masks", "labels"),
             )
 
     def _preprocess_batch_input(

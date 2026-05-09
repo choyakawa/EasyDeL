@@ -634,6 +634,37 @@ def test_sft_transform_uses_assistant_only_loss():
     assert transform._mask_prompt is True
 
 
+def test_sft_transform_disables_padding_before_packing():
+    trainer = SFTTrainer.__new__(SFTTrainer)
+    trainer.processing_class = SimpleNamespace(
+        chat_template="plain chat template",
+        pad_token_id=0,
+        eos_token_id=2,
+    )
+    trainer.arguments = SFTConfig(max_length=16, assistant_only_loss=True, packing=True)
+    trainer._formatting_func = None
+    trainer._dataset_text_field = None
+    trainer._is_pretokenized = lambda: False
+
+    transform = SFTTrainer._get_preprocess_transform(trainer)
+
+    assert transform is not None
+    assert transform._padding is False
+
+
+def test_sft_packing_rejects_wrapped_strategy(monkeypatch):
+    trainer = SFTTrainer.__new__(SFTTrainer)
+    trainer.arguments = SFTConfig(max_length=16, packing=True, packing_strategy="wrapped")
+    trainer.processing_class = SimpleNamespace(pad_token_id=0, eos_token_id=2)
+    trainer._train_source = None
+    trainer._eval_source = None
+
+    monkeypatch.setattr(Trainer, "_apply_preprocess_transforms", lambda self: None)
+
+    with pytest.raises(ValueError, match="leakage-safe SFT packing"):
+        SFTTrainer._apply_preprocess_transforms(trainer)
+
+
 def test_seq_kd_transform_passes_tools_to_chat_template():
     class _ToolAwareTokenizer:
         def __init__(self):
