@@ -1401,6 +1401,7 @@ def pad_and_truncate_dataset(
     truncate: bool = True,
     padding: bool = True,
     side: tp.Literal["left", "right"] = "left",
+    truncate_side: tp.Literal["left", "right"] = "right",
     map_kwargs: dict[str, tp.Any] | None = None,
     make_it_1d: bool = True,
 ) -> DatasetLike:
@@ -1422,6 +1423,8 @@ def pad_and_truncate_dataset(
       - If an entire batch column is None, backend cannot be inferred; it falls back to Python lists for that batch.
       - Hugging Face Datasets stores data in Arrow; on retrieval, types may depend on dataset.set_format().
         This function preserves types within the map, but downstream representation may vary unless you set a format.
+      - Padding side and truncation side are independent; by default sequences are right-truncated
+        (keep the prefix) while preserving the existing default of left padding.
     """
     if map_kwargs is None:
         map_kwargs = {}
@@ -1458,7 +1461,7 @@ def pad_and_truncate_dataset(
             pad_val = get_padding_value(k)
             pad = max_length - v.shape[-1]
             if pad < 0 and truncate:
-                v = v[..., -max_length:] if side == "left" else v[..., :max_length]
+                v = v[..., -max_length:] if truncate_side == "left" else v[..., :max_length]
             elif padding and pad > 0:
                 pad_width = [(0, 0)] * v.ndim
                 pad_width[-1] = (pad, 0) if side == "left" else (0, pad)

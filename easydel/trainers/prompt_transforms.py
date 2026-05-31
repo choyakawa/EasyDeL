@@ -191,7 +191,7 @@ class GRPOPreprocessTransform(Transform):
             or self._pad_token_id
         )
 
-    def __call__(self, example: Example) -> Example:
+    def __call__(self, example: Example) -> Example | None:
         """Apply GRPO preprocessing to example.
 
         Args:
@@ -996,10 +996,68 @@ class SFTPreprocessTransform(Transform):
         self._truncation = truncation
         self._padding = padding
         self._formatting_func = formatting_func
+        self._pad_token_id = getattr(tokenizer, "pad_token_id", 0) or 0
         chat_template = getattr(tokenizer, "chat_template", None)
         self._return_assistant_tokens_mask = bool(
             mask_prompt and isinstance(chat_template, str) and "{% generation %}" in chat_template
         )
+
+    @property
+    def is_filter(self) -> bool:
+        return self._mask_prompt
+
+    def _pad_value_for_field(self, field: str) -> int:
+        if field == "attention_mask" or field.endswith("_mask"):
+            return 0
+        if field == "labels":
+            return -100
+        return self._pad_token_id
+
+    def _pad_processed_to_max_length(self, processed: dict) -> dict:
+        if not self._padding or self._max_length is None:
+            return processed
+
+        input_ids = processed.get("input_ids")
+        if not isinstance(input_ids, list):
+            return processed
+
+        length = len(input_ids)
+        if length >= self._max_length:
+            return processed
+
+        pad_len = self._max_length - length
+        padding_side = getattr(self._tokenizer, "padding_side", "right")
+        output = dict(processed)
+        for key, value in output.items():
+            if isinstance(value, list) and len(value) == length:
+                padding = [self._pad_value_for_field(key)] * pad_len
+                output[key] = padding + value if padding_side == "left" else value + padding
+        return output
+
+    def _trim_to_last_trainable_token(self, processed: dict, mask_key: str) -> dict | None:
+        if not self._mask_prompt or not self._truncation or self._max_length is None:
+            return processed
+
+        input_ids = processed.get("input_ids")
+        mask = processed.get(mask_key)
+        if not isinstance(input_ids, list) or not isinstance(mask, list):
+            return processed
+
+        limit = min(len(input_ids), self._max_length)
+        last_trainable_idx = -1
+        for idx, value in enumerate(mask[:limit]):
+            if int(value) == 1:
+                last_trainable_idx = idx
+
+        if last_trainable_idx < 0:
+            return None
+
+        keep_length = last_trainable_idx + 1
+        output = dict(processed)
+        for key, value in output.items():
+            if isinstance(value, list) and len(value) == len(input_ids):
+                output[key] = value[:keep_length]
+        return self._pad_processed_to_max_length(output)
 
     def __call__(self, example: Example) -> Example:
         """Apply SFT preprocessing to example.
@@ -1063,7 +1121,7 @@ class SFTPreprocessTransform(Transform):
     def _normalize_message_list(messages: tp.Any) -> list[dict[str, tp.Any]] | None:
         return normalize_message_payload(messages, allow_plain_text=False)
 
-    def _tokenize_conversational(self, example: dict, messages: list) -> dict:
+    def _tokenize_conversational(self, example: dict, messages: list) -> dict | None:
         """Tokenize conversational data using chat template."""
         result = dict(example)
         normalized_messages = normalize_message_payload(messages, allow_plain_text=True)
@@ -1074,16 +1132,28 @@ class SFTPreprocessTransform(Transform):
         tools = resolve_example_tools(result)
 
         try:
+            template_kwargs = {
+                "return_dict": True,
+                "return_attention_mask": True,
+                "return_assistant_tokens_mask": self._return_assistant_tokens_mask,
+                "tools": tools,
+            }
+            if self._mask_prompt:
+                template_kwargs["truncation"] = False
+                template_kwargs["padding"] = False
+            else:
+                template_kwargs["truncation"] = self._truncation
+                template_kwargs["max_length"] = self._max_length
+                template_kwargs["padding"] = "max_length" if self._padding and self._max_length else False
+
             processed = self._tokenizer.apply_chat_template(
                 messages,
-                return_dict=True,
-                return_attention_mask=True,
-                return_assistant_tokens_mask=self._return_assistant_tokens_mask,
-                truncation=self._truncation,
-                max_length=self._max_length,
-                padding="max_length" if self._padding and self._max_length else False,
-                tools=tools,
+                **template_kwargs,
             )
+            if self._mask_prompt and "assistant_masks" in processed:
+                processed = self._trim_to_last_trainable_token(processed, "assistant_masks")
+                if processed is None:
+                    return None
             result.update(processed)
         except Exception:
             # Fallback if chat template fails - try without tools first
@@ -1147,7 +1217,7 @@ class SFTPreprocessTransform(Transform):
 
         return "\n".join(parts)
 
-    def _tokenize_prompt_completion(self, example: dict) -> dict:
+    def _tokenize_prompt_completion(self, example: dict) -> dict | None:
         """Tokenize prompt/completion format with optional masking."""
         raw_example = maybe_convert_to_chatml(dict(example))
         raw_prompt = raw_example.get("prompt")
@@ -1174,14 +1244,18 @@ class SFTPreprocessTransform(Transform):
             prompt_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
         full_text = prompt + completion
 
-        # Use tokenizer for truncation and padding
+        tokenization_kwargs = {
+            "truncation": False if self._mask_prompt else self._truncation,
+            "padding": False if self._mask_prompt else "max_length" if self._padding and self._max_length else False,
+            "return_attention_mask": True,
+            "add_special_tokens": False,
+        }
+        if not self._mask_prompt:
+            tokenization_kwargs["max_length"] = self._max_length
+
         tokens = self._tokenizer(
             full_text,
-            truncation=self._truncation,
-            max_length=self._max_length,
-            padding="max_length" if self._padding and self._max_length else False,
-            return_attention_mask=True,
-            add_special_tokens=False,
+            **tokenization_kwargs,
         )
 
         result["input_ids"] = tokens["input_ids"]
@@ -1196,6 +1270,10 @@ class SFTPreprocessTransform(Transform):
             # Apply attention mask to zero out padding positions
             completion_mask = [m * a for m, a in zip(completion_mask, tokens["attention_mask"], strict=True)]
             result["completion_mask"] = completion_mask
+            trimmed = self._trim_to_last_trainable_token(result, "completion_mask")
+            if trimmed is None:
+                return None
+            result = trimmed
 
         # Remove non-tokenized fields
         return purify_example(result)

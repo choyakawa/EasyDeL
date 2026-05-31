@@ -254,6 +254,91 @@ class PromptMaskTokenizer(MockTokenizer):
         raise AssertionError(f"Unexpected templated text: {text!r}")
 
 
+class AssistantMaskTokenizer(MockTokenizer):
+    """Tokenizer that emits assistant masks from chat template generation blocks."""
+
+    def __init__(self):
+        super().__init__()
+        self.chat_template = "{% generation %}"
+
+    def _ids(self, text):
+        return [ord(c) % 100 for c in text]
+
+    def __call__(
+        self,
+        text,
+        max_length=None,
+        truncation=True,
+        padding=False,
+        return_tensors=None,
+        add_special_tokens=True,
+        return_attention_mask=True,
+        **kwargs,
+    ):
+        tokens = self._ids(text)
+        if max_length and truncation:
+            tokens = tokens[:max_length]
+
+        attention_mask = [1] * len(tokens)
+        if padding == "max_length" and max_length:
+            pad_len = max_length - len(tokens)
+            if pad_len > 0:
+                tokens = tokens + [self.pad_token_id] * pad_len
+                attention_mask = attention_mask + [0] * pad_len
+
+        result = {"input_ids": tokens}
+        if return_attention_mask:
+            result["attention_mask"] = attention_mask
+        return result
+
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+        tools=None,
+        return_dict=False,
+        return_attention_mask=False,
+        return_assistant_tokens_mask=False,
+        truncation=True,
+        max_length=None,
+        padding=False,
+        **kwargs,
+    ):
+        input_ids = []
+        assistant_masks = []
+        for message in messages:
+            content_ids = self._ids(message.get("content", ""))
+            input_ids.extend(content_ids)
+            assistant_masks.extend([1 if message.get("role") == "assistant" else 0] * len(content_ids))
+        if add_generation_prompt:
+            input_ids.append(self.eos_token_id)
+            assistant_masks.append(0)
+
+        if max_length and truncation:
+            input_ids = input_ids[:max_length]
+            assistant_masks = assistant_masks[:max_length]
+
+        attention_mask = [1] * len(input_ids)
+        if padding == "max_length" and max_length:
+            pad_len = max_length - len(input_ids)
+            if pad_len > 0:
+                input_ids = input_ids + [self.pad_token_id] * pad_len
+                assistant_masks = assistant_masks + [0] * pad_len
+                attention_mask = attention_mask + [0] * pad_len
+
+        if return_dict:
+            result = {"input_ids": input_ids}
+            if return_attention_mask:
+                result["attention_mask"] = attention_mask
+            if return_assistant_tokens_mask:
+                result["assistant_masks"] = assistant_masks
+            return result
+        if tokenize:
+            return input_ids
+        return "".join(message.get("content", "") for message in messages)
+
+
 class TestSFTPreprocessTransform:
     """Tests for SFTPreprocessTransform."""
 
@@ -475,6 +560,64 @@ class TestSFTPreprocessTransform:
 
         assert result["tools"] == tools
         assert tokenizer.calls[-1]["tools"] == tools
+
+    def test_conversational_assistant_only_filters_when_assistant_is_truncated(self):
+        tokenizer = AssistantMaskTokenizer()
+        transform = SFTPreprocessTransform(
+            tokenizer=tokenizer,
+            max_length=4,
+            mask_prompt=True,
+        )
+
+        result = transform(
+            {
+                "messages": [
+                    {"role": "user", "content": "abcdef"},
+                    {"role": "assistant", "content": "ok"},
+                ]
+            }
+        )
+
+        assert result is None
+
+    def test_conversational_assistant_only_trims_trailing_user_suffix(self):
+        tokenizer = AssistantMaskTokenizer()
+        transform = SFTPreprocessTransform(
+            tokenizer=tokenizer,
+            max_length=6,
+            mask_prompt=True,
+        )
+
+        result = transform(
+            {
+                "messages": [
+                    {"role": "user", "content": "ab"},
+                    {"role": "assistant", "content": "cd"},
+                    {"role": "user", "content": "efgh"},
+                ]
+            }
+        )
+
+        assert result["input_ids"] == tokenizer._ids("abcd") + [tokenizer.pad_token_id] * 2
+        assert result["attention_mask"] == [1, 1, 1, 1, 0, 0]
+        assert result["assistant_masks"] == [0, 0, 1, 1, 0, 0]
+
+    def test_prompt_completion_mask_filters_when_completion_is_truncated(self):
+        tokenizer = MockTokenizer()
+        transform = SFTPreprocessTransform(
+            tokenizer=tokenizer,
+            max_length=4,
+            mask_prompt=True,
+        )
+
+        result = transform(
+            {
+                "prompt": "abcdef",
+                "completion": "ok",
+            }
+        )
+
+        assert result is None
 
     def test_repr(self):
         """Test string representation."""
