@@ -367,13 +367,29 @@ class SFTTrainer(Trainer):
                             **example.get("chat_template_kwargs", {}),
                         )
                         prompt_completion_ids = prompt_completion_processed["input_ids"]
+                        output.update(
+                            {
+                                key: value
+                                for key, value in prompt_completion_processed.items()
+                                if isinstance(value, list) and len(value) == len(prompt_completion_ids)
+                            }
+                        )
                         if "assistant_masks" in prompt_completion_processed:
                             output["assistant_masks"] = prompt_completion_processed["assistant_masks"]
                     else:
                         prompt_ids = processing_class(text=example["prompt"])["input_ids"]
-                        prompt_completion_ids = processing_class(text=example["prompt"] + example["completion"])[
-                            "input_ids"
-                        ]
+                        prompt_completion_processed = processing_class(
+                            text=example["prompt"] + example["completion"],
+                            return_attention_mask=True,
+                        )
+                        prompt_completion_ids = prompt_completion_processed["input_ids"]
+                        output.update(
+                            {
+                                key: value
+                                for key, value in prompt_completion_processed.items()
+                                if isinstance(value, list) and len(value) == len(prompt_completion_ids)
+                            }
+                        )
 
                     if not prompt_completion_ids[: len(prompt_ids)] == prompt_ids:
                         logger.warning(
@@ -387,15 +403,14 @@ class SFTTrainer(Trainer):
                     output["completion_mask"] = completion_mask
                     if assistant_only_loss:
                         mask_key = "assistant_masks" if "assistant_masks" in output else "completion_mask"
+                        untrimmed_output = output
                         output = trim_to_last_trainable_token(
                             output,
                             mask_key,
                             self.arguments.max_sequence_length,
                         )
                         if output is None:
-                            return empty_tokenized_example(
-                                {"input_ids": [], "attention_mask": [], mask_key: []}
-                            )
+                            return empty_tokenized_example(untrimmed_output)
 
                 else:
                     if is_conversational(example):
@@ -416,15 +431,14 @@ class SFTTrainer(Trainer):
                             **example.get("chat_template_kwargs", {}),
                         )
                         if assistant_only_loss and "assistant_masks" in processed:
+                            untrimmed_processed = processed
                             processed = trim_to_last_trainable_token(
                                 processed,
                                 "assistant_masks",
                                 self.arguments.max_sequence_length,
                             )
                             if processed is None:
-                                return empty_tokenized_example(
-                                    {"input_ids": [], "attention_mask": [], "assistant_masks": []}
-                                )
+                                return empty_tokenized_example(untrimmed_processed)
                         output = processed
                     else:
                         output = processing_class(
