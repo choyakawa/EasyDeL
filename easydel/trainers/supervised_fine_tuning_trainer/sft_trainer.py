@@ -310,6 +310,46 @@ class SFTTrainer(Trainer):
             if isinstance(dataset, Dataset):
                 map_kwargs["desc"] = "Tokenizing dataset"
 
+            def has_assistant_content(example):
+                messages = example.get("messages", [])
+                return any(
+                    isinstance(message, dict)
+                    and message.get("role") == "assistant"
+                    and bool(message.get("content"))
+                    for message in messages
+                )
+
+            def trim_to_last_trainable_token(processed, mask_key, max_length):
+                mask = processed.get(mask_key)
+                input_ids = processed.get("input_ids")
+                if mask is None or input_ids is None:
+                    return processed
+
+                limit = len(input_ids) if max_length is None else min(len(input_ids), max_length)
+                last_trainable_idx = -1
+                for idx, value in enumerate(mask[:limit]):
+                    if int(value) == 1:
+                        last_trainable_idx = idx
+
+                if last_trainable_idx < 0:
+                    return None
+
+                keep_length = last_trainable_idx + 1
+                output = dict(processed)
+                for key, value in output.items():
+                    if isinstance(value, list) and len(value) == len(input_ids):
+                        output[key] = value[:keep_length]
+                return output
+
+            def empty_tokenized_example(processed):
+                output = {}
+                for key, value in processed.items():
+                    if isinstance(value, list):
+                        output[key] = []
+                if "input_ids" not in output:
+                    output["input_ids"] = []
+                return output
+
             def tokenize(example, processing_class, dataset_text_field, assistant_only_loss):
                 if "prompt" in example:
                     output = {}
@@ -345,13 +385,24 @@ class SFTTrainer(Trainer):
                     completion_mask = [0] * len(prompt_ids) + [1] * (len(prompt_completion_ids) - len(prompt_ids))
                     output["input_ids"] = prompt_completion_ids
                     output["completion_mask"] = completion_mask
+                    if assistant_only_loss:
+                        mask_key = "assistant_masks" if "assistant_masks" in output else "completion_mask"
+                        output = trim_to_last_trainable_token(
+                            output,
+                            mask_key,
+                            self.arguments.max_sequence_length,
+                        )
+                        if output is None:
+                            return empty_tokenized_example(
+                                {"input_ids": [], "attention_mask": [], mask_key: []}
+                            )
 
                 else:
                     if is_conversational(example):
                         tools = example.get("tools")
                         if isinstance(tools, str):
                             tools = json.loads(tools)
-                        elif isinstance(tools, list):
+                        elif isinstance(tools, list) and len(tools) > 0:
                             if isinstance(tools[0], str):
                                 tools = json.loads(tools)
                         processed = processing_class.apply_chat_template(
@@ -360,18 +411,20 @@ class SFTTrainer(Trainer):
                             return_assistant_tokens_mask=assistant_only_loss,
                             return_attention_mask=True,
                             tools=tools,
-                            truncation=True,
-                            max_length=self.arguments.max_sequence_length,
+                            truncation=False if assistant_only_loss else True,
+                            max_length=None if assistant_only_loss else self.arguments.max_sequence_length,
                             **example.get("chat_template_kwargs", {}),
                         )
-                        if "assistant_masks" in processed and 1 not in processed["assistant_masks"]:
-                             raise RuntimeError(
-                                 "You're using `assistant_only_loss=True`, but at least one example has no "
-                                 "assistant tokens. This usually means the tokenizer's chat template doesn't "
-                                 "generate assistant masks — it may be missing the `{% generation %}` keyword. Please "
-                                 "check the template and ensure it's correctly configured to support assistant "
-                                 "masking."
-                             )
+                        if assistant_only_loss and "assistant_masks" in processed:
+                            processed = trim_to_last_trainable_token(
+                                processed,
+                                "assistant_masks",
+                                self.arguments.max_sequence_length,
+                            )
+                            if processed is None:
+                                return empty_tokenized_example(
+                                    {"input_ids": [], "attention_mask": [], "assistant_masks": []}
+                                )
                         output = processed
                     else:
                         output = processing_class(
@@ -402,12 +455,15 @@ class SFTTrainer(Trainer):
                             return_assistant_tokens_mask=True,
                             return_attention_mask=True,
                             tools=tools,
-                            truncation=True,
-                            max_length=self.arguments.max_sequence_length,
+                            truncation=False,
                             **check_example.get("chat_template_kwargs", {}),
                         )
 
-                        if "assistant_masks" in processed_check and 1 not in processed_check["assistant_masks"]:
+                        if (
+                            has_assistant_content(check_example)
+                            and "assistant_masks" in processed_check
+                            and 1 not in processed_check["assistant_masks"]
+                        ):
                             logger.warning(
                                 "Tokenizer chat template is missing `{% generation %}` blocks required for `assistant_only_loss`. "
                                 "Patching processing_class.chat_template with a standard ChatML template for the entire dataset."
@@ -442,6 +498,27 @@ class SFTTrainer(Trainer):
                 },
                 **map_kwargs,
             )
+            if self.arguments.assistant_only_loss:
+                if isinstance(dataset, Dataset):
+                    map_kwargs["desc"] = "Filtering examples without assistant tokens"
+
+                def has_assistant_tokens(example):
+                    assistant_masks = example.get("assistant_masks")
+                    if assistant_masks is not None:
+                        return 1 in assistant_masks
+                    completion_mask = example.get("completion_mask")
+                    if completion_mask is not None:
+                        return 1 in completion_mask
+                    return len(example.get("input_ids", [])) > 0
+
+                dataset = dataset.filter(has_assistant_tokens, **map_kwargs)
+                try:
+                    next(iter(dataset))
+                except StopIteration as e:
+                    raise ValueError(
+                        "All examples were filtered out because none contained assistant tokens after right-side "
+                        "truncation. Increase `max_sequence_length` or filter/shorten the source data."
+                    ) from e
 
         if do_packing:
             columns_names = next(iter(dataset)).keys()
@@ -498,6 +575,7 @@ class SFTTrainer(Trainer):
             padding_values={"segment_ids": 0},
             padding=True,
             truncate=True,
+            truncate_side="right",
             map_kwargs=map_kwargs,
         )
         return dataset
