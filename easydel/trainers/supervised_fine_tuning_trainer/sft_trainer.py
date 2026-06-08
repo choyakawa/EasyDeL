@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import os
 import typing as tp
 import warnings
 from functools import partial
@@ -169,6 +170,32 @@ class SFTTrainer(Trainer):
             data_collator=data_collator,
         )
 
+    def _delete_dataset_cache_files(self, dataset, step_name: str | None = None) -> None:
+        if not self.arguments.dataset_delete_cache_files:
+            return
+
+        removed = 0
+        for cache_file in getattr(dataset, "cache_files", None) or []:
+            filename = cache_file.get("filename") if isinstance(cache_file, dict) else cache_file
+            if not filename:
+                continue
+
+            basename = os.path.basename(filename)
+            if not (basename.startswith("cache") and basename.endswith(".arrow")):
+                continue
+
+            try:
+                os.remove(filename)
+                removed += 1
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                logger.warning(f"Failed to delete dataset cache file {filename!r}: {exc}")
+
+        if removed:
+            suffix = f" after {step_name}" if step_name else ""
+            logger.info(f"Deleted {removed} Hugging Face dataset cache file(s){suffix}.")
+
     def _prepare_dataset(
         self,
         processing_class: ProcessingClassType,
@@ -202,6 +229,10 @@ class SFTTrainer(Trainer):
         if isinstance(dataset, Dataset):  # IterableDataset does not support `with_transform`
             dataset = dataset.with_transform(remove_none_values)
 
+        map_kwargs = {}
+        if isinstance(dataset, Dataset):
+            map_kwargs["num_proc"] = self.dataset_num_proc
+
         # Detect and convert instruction/input/output/history/system format to messages first
         first_example_peek = next(iter(dataset))
         if (
@@ -225,13 +256,10 @@ class SFTTrainer(Trainer):
                 ],
                 **map_kwargs,
             )
+            self._delete_dataset_cache_files(dataset, "Converting instruction/history dataset to ChatML messages")
 
         column_names = list(next(iter(dataset)).keys())
         is_processed = "input_ids" in column_names
-
-        map_kwargs = {}
-        if isinstance(dataset, Dataset):
-            map_kwargs["num_proc"] = self.dataset_num_proc
 
         if formatting_func is not None and is_processed:
             logger.warning(
@@ -248,6 +276,7 @@ class SFTTrainer(Trainer):
                 return {"text": formatting_func(example)}
 
             dataset = dataset.map(_func, batched=False, **map_kwargs)
+            self._delete_dataset_cache_files(dataset, "Applying formatting function to dataset")
 
         # Capture a preview of formatted text before tokenization (no on-the-fly conversions in script)
         try:
@@ -287,6 +316,7 @@ class SFTTrainer(Trainer):
                     remove_columns="conversations" if "conversations" in column_names else None,
                     **map_kwargs,
                 )
+                self._delete_dataset_cache_files(dataset, "Converting dataset to ChatML")
 
             first_example = next(iter(dataset))
             if not is_conversational(first_example):
@@ -306,6 +336,7 @@ class SFTTrainer(Trainer):
                     remove_columns="messages" if "messages" in column_names else None,
                     **map_kwargs,
                 )
+                self._delete_dataset_cache_files(dataset, "Adding EOS to dataset")
 
             if isinstance(dataset, Dataset):
                 map_kwargs["desc"] = "Tokenizing dataset"
@@ -512,6 +543,7 @@ class SFTTrainer(Trainer):
                 },
                 **map_kwargs,
             )
+            self._delete_dataset_cache_files(dataset, "Tokenizing dataset")
             if self.arguments.assistant_only_loss:
                 if isinstance(dataset, Dataset):
                     map_kwargs["desc"] = "Filtering examples without assistant tokens"
@@ -533,6 +565,7 @@ class SFTTrainer(Trainer):
                         "All examples were filtered out because none contained assistant tokens after right-side "
                         "truncation. Increase `max_sequence_length` or filter/shorten the source data."
                     ) from e
+                self._delete_dataset_cache_files(dataset, "Filtering examples without assistant tokens")
 
         if do_packing:
             columns_names = next(iter(dataset)).keys()
@@ -562,9 +595,11 @@ class SFTTrainer(Trainer):
                 self.arguments.packing_strategy,
                 map_kwargs,
             )
+            self._delete_dataset_cache_files(dataset, "Packing dataset")
             if isinstance(dataset, Dataset):
                 map_kwargs["desc"] = "Building packed sequence metadata"
             dataset = dataset.map(add_packed_sequence_metadata, **map_kwargs)
+            self._delete_dataset_cache_files(dataset, "Building packed sequence metadata")
         if isinstance(dataset, Dataset):
             map_kwargs["desc"] = "Truncating dataset"
         columns_names = next(iter(dataset)).keys()
@@ -582,6 +617,7 @@ class SFTTrainer(Trainer):
             ),
             remove_columns=columns_names,
         )
+        self._delete_dataset_cache_files(dataset, "Keeping array columns")
         dataset = pad_and_truncate_dataset(
             dataset,
             max_length=self.arguments.max_sequence_length,
@@ -592,4 +628,5 @@ class SFTTrainer(Trainer):
             truncate_side="right",
             map_kwargs=map_kwargs,
         )
+        self._delete_dataset_cache_files(dataset, "Truncating dataset")
         return dataset
