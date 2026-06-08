@@ -43,9 +43,6 @@ class SFTConfig(TrainingArguments):
             batch. Defaults to 1000.
         dataset_kwargs (dict[str, Any], optional): Dictionary of optional keyword arguments to pass when creating
             packed or non-packed datasets. Defaults to None.
-        dataset_delete_cache_files (bool, optional): Whether to remove intermediate Hugging Face Datasets
-            `cache*.arrow` files immediately after each SFT preprocessing step creates its Dataset object. Defaults to
-            False.
         eval_packing (bool, optional): Whether to pack the eval dataset. If `None`, uses the same value as
             `packing`. Defaults to None.
         num_of_sequences (int, optional): Number of sequences to use for the [`ConstantLengthDataset`].
@@ -103,16 +100,6 @@ class SFTConfig(TrainingArguments):
     dataset_kwargs: dict[str, tp.Any] | None = field(
         default=None,
         metadata={"help": "Dictionary of optional keyword arguments to pass when creating datasets."},
-    )
-    dataset_delete_cache_files: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "Remove intermediate Hugging Face Datasets cache*.arrow files immediately after each SFT "
-                "preprocessing step creates its Dataset object. This relies on the active Dataset object retaining "
-                "access to the data and is intended for local, non-shared dataset caches."
-            )
-        },
     )
     eval_packing: bool | None = field(
         default=None,
