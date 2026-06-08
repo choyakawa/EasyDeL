@@ -110,7 +110,42 @@ class RunTimeConfig:
             )
         },
     )
-
+    endprompt_enable: bool = field(
+        default=False,
+        metadata={"help": "Enable EndPrompt terminal-anchor preprocessing. Requires --packing False."},
+    )
+    endprompt_logical_length: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Maximum logical target context length for EndPrompt position ids. "
+                "The terminal prompt is placed at positions [L-b, L-1]. "
+                "Defaults to --max_sequence_length."
+            )
+        },
+    )
+    endprompt_logical_length_min: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Minimum logical target context length for EndPrompt. "
+                "When set below --endprompt_logical_length, each row samples a stable pseudo-random "
+                "logical length in [min, max]. Defaults to the maximum logical length."
+            )
+        },
+    )
+    endprompt_prompts: str = field(
+        default="This is the end of text, please pay attention here",
+        metadata={"help": "Terminal prompt text. Use '||' to provide multiple prompts cycled by row index."},
+    )
+    endprompt_prompt_loss_weight: float = field(
+        default=0.1,
+        metadata={"help": "Loss weight for EndPrompt terminal prompt tokens."},
+    )
+    endprompt_context_loss_weight: float = field(
+        default=1.0,
+        metadata={"help": "Loss weight for original context tokens under EndPrompt."},
+    )
     def __post_init__(self):
         """Post-initialization to set dependent parameters."""
         if self.processor_repo_id is None:
@@ -133,17 +168,147 @@ if jax.process_index() == 0:
     print("----------------------")
 
 
+def _format_endprompt_text(value) -> str:
+    if isinstance(value, list):
+        return "".join(str(item) for item in value)
+    return str(value)
+
+
+def _tokenize_endprompt_example(
+    example,
+    index: int,
+    *,
+    tokenizer,
+    text_field: str,
+    max_sequence_length: int,
+    logical_length_min: int,
+    logical_length_max: int,
+    prompt_texts: list[str],
+    prompt_loss_weight: float,
+    context_loss_weight: float,
+    add_special_tokens: bool,
+):
+    if text_field not in example:
+        raise ValueError(f"EndPrompt requires dataset_text_field={text_field!r} to exist in the dataset.")
+
+    prompt_text = prompt_texts[index % len(prompt_texts)]
+    prompt_ids = tokenizer(
+        prompt_text,
+        add_special_tokens=False,
+        return_attention_mask=False,
+    )["input_ids"]
+    if len(prompt_ids) == 0:
+        raise ValueError("EndPrompt terminal prompt tokenized to an empty sequence.")
+    if len(prompt_ids) >= max_sequence_length:
+        raise ValueError(
+            "EndPrompt terminal prompt is longer than the physical training length. "
+            f"prompt_tokens={len(prompt_ids)}, max_sequence_length={max_sequence_length}"
+        )
+    if logical_length_min < len(prompt_ids):
+        raise ValueError(
+            f"EndPrompt minimum logical length ({logical_length_min}) must be >= prompt token length ({len(prompt_ids)})."
+        )
+    span = logical_length_max - logical_length_min + 1
+    if span <= 0:
+        raise ValueError(
+            f"EndPrompt logical_length_min must be <= logical_length_max, got {logical_length_min} > {logical_length_max}."
+        )
+    logical_length = logical_length_min
+    if span > 1:
+        # Stable per-row pseudo-random sampling; reproducible with dataset.map(num_proc=...).
+        logical_length += ((index * 1103515245 + 12345) & 0x7FFFFFFF) % span
+
+    text = _format_endprompt_text(example[text_field])
+
+    context_budget = max_sequence_length - len(prompt_ids)
+    context_ids = tokenizer(
+        text,
+        add_special_tokens=add_special_tokens,
+        truncation=True,
+        max_length=context_budget,
+        return_attention_mask=False,
+    )["input_ids"]
+
+    prompt_start = logical_length - len(prompt_ids)
+    input_ids = context_ids + prompt_ids
+    if len(input_ids) > max_sequence_length:
+        raise ValueError(
+            "EndPrompt preprocessing produced a sequence longer than max_sequence_length. "
+            f"sequence_length={len(input_ids)}, max_sequence_length={max_sequence_length}"
+        )
+    if input_ids[-len(prompt_ids) :] != prompt_ids:
+        raise ValueError("EndPrompt terminal prompt is not preserved at the end of the training sequence.")
+    position_ids = list(range(len(context_ids))) + list(range(prompt_start, logical_length))
+    loss_weights = [context_loss_weight] * len(context_ids) + [prompt_loss_weight] * len(prompt_ids)
+
+    return {
+        "input_ids": input_ids,
+        "labels": input_ids,
+        "attention_mask": [1] * len(input_ids),
+        "position_ids": position_ids,
+        "loss_weights": loss_weights,
+    }
+
+
 def main():
     processor = AutoTokenizer.from_pretrained(runtime_config.processor_repo_id)
 
     if processor.pad_token_id is None:
         processor.pad_token_id = processor.eos_token_id
 
+    endprompt_logical_length = runtime_config.endprompt_logical_length or sft_config.max_sequence_length
+    endprompt_logical_length_min = runtime_config.endprompt_logical_length_min or endprompt_logical_length
+    if runtime_config.endprompt_enable:
+        if sft_config.packing:
+            raise ValueError("EndPrompt position manipulation is only supported with --packing False.")
+        if sft_config.assistant_only_loss:
+            raise ValueError("EndPrompt uses its own token loss weights and requires --assistant_only_loss False.")
+        if sft_config.dataset_text_field is None:
+            raise ValueError("EndPrompt requires --dataset_text_field to point at a text column.")
+        if endprompt_logical_length < sft_config.max_sequence_length:
+            raise ValueError(
+                "EndPrompt logical length must be >= physical --max_sequence_length. "
+                f"got logical={endprompt_logical_length}, physical={sft_config.max_sequence_length}"
+            )
+        if endprompt_logical_length_min < sft_config.max_sequence_length:
+            raise ValueError(
+                "EndPrompt minimum logical length must be >= physical --max_sequence_length. "
+                f"got min={endprompt_logical_length_min}, physical={sft_config.max_sequence_length}"
+            )
+        if endprompt_logical_length_min > endprompt_logical_length:
+            raise ValueError(
+                "EndPrompt minimum logical length must be <= maximum logical length. "
+                f"got min={endprompt_logical_length_min}, max={endprompt_logical_length}"
+            )
+
     # Load dataset
     dataset = load_dataset(
         runtime_config.dataset_name,
         split=runtime_config.dataset_split,
     )
+
+    if runtime_config.endprompt_enable:
+        prompt_texts = [prompt for prompt in runtime_config.endprompt_prompts.split("||") if prompt]
+        if not prompt_texts:
+            raise ValueError("--endprompt_prompts must contain at least one non-empty prompt.")
+        dataset = dataset.map(
+            _tokenize_endprompt_example,
+            with_indices=True,
+            fn_kwargs={
+                "tokenizer": processor,
+                "text_field": sft_config.dataset_text_field,
+                "max_sequence_length": sft_config.max_sequence_length,
+                "logical_length_min": endprompt_logical_length_min,
+                "logical_length_max": endprompt_logical_length,
+                "prompt_texts": prompt_texts,
+                "prompt_loss_weight": runtime_config.endprompt_prompt_loss_weight,
+                "context_loss_weight": runtime_config.endprompt_context_loss_weight,
+                "add_special_tokens": sft_config.add_special_tokens,
+            },
+            remove_columns=dataset.column_names,
+            num_proc=sft_config.dataset_num_proc,
+            desc="Applying EndPrompt terminal-anchor preprocessing",
+        )
 
     hf_config = AutoConfig.from_pretrained(runtime_config.repo_id)
 
@@ -154,21 +319,24 @@ def main():
     else:
         load_module = ed.AutoEasyDeLModelForCausalLM
 
+    config_kwargs = ed.EasyDeLBaseConfigDict(
+        freq_max_position_embeddings=endprompt_logical_length
+        if runtime_config.endprompt_enable
+        else sft_config.max_sequence_length,
+        mask_max_position_embeddings=sft_config.max_sequence_length,
+        attn_dtype=runtime_config.attn_dtype,
+        attn_softmax_dtype=runtime_config.attn_softmax_dtype,
+        gradient_checkpointing=runtime_config.gradient_checkpointing,
+        kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+        attn_mechanism=runtime_config.attn_mechanism,
+    )
     # Initialize model
     model = load_module.from_pretrained(
         runtime_config.repo_id,
         auto_shard_model=True,
         sharding_axis_dims=runtime_config.sharding_axis,
         sharding_dcn_axis_dims=runtime_config.sharding_dcn_axis,
-        config_kwargs=ed.EasyDeLBaseConfigDict(
-            freq_max_position_embeddings=sft_config.max_sequence_length,
-            mask_max_position_embeddings=sft_config.max_sequence_length,
-            attn_dtype=runtime_config.attn_dtype,
-            attn_softmax_dtype=runtime_config.attn_softmax_dtype,
-            gradient_checkpointing=runtime_config.gradient_checkpointing,
-            kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-            attn_mechanism=runtime_config.attn_mechanism,
-        ),
+        config_kwargs=config_kwargs,
         quantization_method=ed.EasyDeLQuantizationMethods.NONE,
         platform=ed.EasyDeLPlatforms.JAX,
         param_dtype=runtime_config.param_dtype,

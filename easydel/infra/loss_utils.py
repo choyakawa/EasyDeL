@@ -1282,6 +1282,7 @@ def ForCausalLMLoss(
     attention_mask: jax.Array | None = None,
     assistant_masks: jax.Array | None = None,
     completion_mask: jax.Array | None = None,
+    loss_weights: jax.Array | None = None,
     config: LossConfig | None = None,
     paxis: PartitionAxis | None = None,
     num_items_in_batch: int | None = None,
@@ -1324,6 +1325,8 @@ def ForCausalLMLoss(
         loss_mask = completion_mask if loss_mask is None else (loss_mask * completion_mask)
     if assistant_masks is not None:
         loss_mask = assistant_masks if loss_mask is None else (loss_mask * assistant_masks)
+    if loss_weights is not None:
+        loss_mask = loss_weights if loss_mask is None else (loss_mask * loss_weights)
 
     shift_attn_m = loss_mask
     if config is None:

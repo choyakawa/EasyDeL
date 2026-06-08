@@ -288,25 +288,6 @@ class SFTTrainer(Trainer):
                     **map_kwargs,
                 )
 
-            first_example = next(iter(dataset))
-            if not is_conversational(first_example):
-                if isinstance(dataset, Dataset):
-                    map_kwargs["desc"] = "Adding EOS to dataset"
-
-                def add_eos(example, eos_token):
-                    if "text" in example and not example["text"].endswith(eos_token):
-                        example["text"] = example["text"] + eos_token
-                    elif "completion" in example and not example["completion"].endswith(eos_token):
-                        example["completion"] = example["completion"] + eos_token
-                    return example
-
-                dataset = dataset.map(
-                    add_eos,
-                    fn_kwargs={"eos_token": processing_class.eos_token},
-                    remove_columns="messages" if "messages" in column_names else None,
-                    **map_kwargs,
-                )
-
             if isinstance(dataset, Dataset):
                 map_kwargs["desc"] = "Tokenizing dataset"
 
@@ -578,6 +559,7 @@ class SFTTrainer(Trainer):
                     "segment_ids",
                     "assistant_masks",
                     "completion_mask",
+                    "loss_weights",
                 ],
             ),
             remove_columns=columns_names,
