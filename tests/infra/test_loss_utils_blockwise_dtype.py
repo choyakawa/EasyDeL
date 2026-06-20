@@ -339,6 +339,43 @@ def test_for_causal_lm_loss_uses_assistant_mask_on_shifted_targets():
     assert float(metrics.weight_sum) == 3.0
 
 
+def test_for_causal_lm_loss_masks_packed_segment_boundaries():
+    logits = jnp.zeros((1, 8, 32), dtype=jnp.float32)
+    labels = jnp.array([[10, 11, 12, 31, 20, 21, 31, 0]], dtype=jnp.int32)
+    attention_mask = jnp.array([[1, 1, 1, 1, 1, 1, 1, 0]], dtype=jnp.int32)
+    segment_ids = jnp.array([[1, 1, 1, 1, 2, 2, 2, 0]], dtype=jnp.int32)
+
+    metrics = ForCausalLMLoss(
+        logits=logits,
+        labels=labels,
+        attention_mask=attention_mask,
+        config=LossConfig(chunk_block_size=None),
+        batch={"decoder_segment_ids": segment_ids},
+    )
+
+    assert float(metrics.weight_sum) == 5.0
+
+
+def test_causal_lm_loss_chunked_lm_head_masks_packed_segment_boundaries():
+    hidden_states = jnp.zeros((1, 8, 32), dtype=jnp.float32)
+    labels = jnp.array([[10, 11, 12, 31, 20, 21, 31, 0]], dtype=jnp.int32)
+    attention_mask = jnp.array([[1, 1, 1, 1, 1, 1, 1, 0]], dtype=jnp.int32)
+    segment_ids = jnp.array([[1, 1, 1, 1, 2, 2, 2, 0]], dtype=jnp.int32)
+
+    metrics = causal_lm_loss_chunked_lm_head(
+        hidden_states=hidden_states,
+        labels=labels,
+        lm_head_fn=lambda x: x,
+        vocab_size=hidden_states.shape[-1],
+        attention_mask=attention_mask,
+        config=LossConfig(chunk_block_size=None),
+        batch={"decoder_segment_ids": segment_ids},
+        token_chunk_size=3,
+    )
+
+    assert float(metrics.weight_sum) == 5.0
+
+
 def test_causal_lm_loss_chunked_lm_head_disables_inner_ce_chunking(monkeypatch: pytest.MonkeyPatch):
     hidden_states = jnp.arange(2 * 5 * 4, dtype=jnp.float32).reshape(2, 5, 4) / 17
     labels = jnp.array([[0, 1, 2, 3, 4], [4, 3, 2, 1, 0]], dtype=jnp.int32)

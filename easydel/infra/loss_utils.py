@@ -2117,6 +2117,59 @@ def resolve_causal_lm_chunk_token_size(
     return min(chunk, seq_len)
 
 
+def _causal_lm_segment_transition_mask(
+    *,
+    segment_ids: jax.Array | None,
+    labels: jax.Array,
+    shifted_labels: jax.Array,
+    shift_tokens: bool,
+) -> jax.Array | None:
+    """Build a loss mask that drops packed-sample boundary predictions."""
+    if segment_ids is None:
+        return None
+
+    segment_ids = jnp.asarray(segment_ids)
+    if shift_tokens:
+        if segment_ids.shape == labels.shape:
+            return jnp.logical_and(
+                segment_ids[:, 1:] == segment_ids[:, :-1],
+                segment_ids[:, 1:] != 0,
+            )
+        if segment_ids.shape == shifted_labels.shape:
+            return segment_ids != 0
+    elif segment_ids.shape == shifted_labels.shape:
+        return segment_ids != 0
+
+    raise ValueError(
+        "`segment_ids` must match labels or shifted labels, "
+        f"got {segment_ids.shape}, labels {labels.shape}, shifted {shifted_labels.shape}."
+    )
+
+
+def _apply_causal_lm_segment_loss_mask(
+    *,
+    loss_weights: jax.Array | None,
+    segment_ids: jax.Array | None,
+    labels: jax.Array,
+    shifted_labels: jax.Array,
+    shift_tokens: bool,
+    config: LossConfig,
+    compute_dtype: jnp.dtype,
+) -> jax.Array | None:
+    segment_mask = _causal_lm_segment_transition_mask(
+        segment_ids=segment_ids,
+        labels=labels,
+        shifted_labels=shifted_labels,
+        shift_tokens=shift_tokens,
+    )
+    if segment_mask is None:
+        return loss_weights
+
+    if loss_weights is None:
+        loss_weights = shifted_labels != config.ignore_index
+    return loss_weights.astype(compute_dtype) * segment_mask.astype(compute_dtype)
+
+
 def causal_lm_loss_chunked_lm_head(
     hidden_states: jax.Array | None,
     labels: jax.Array | None,
@@ -2205,6 +2258,7 @@ def causal_lm_loss_chunked_lm_head(
         else (jnp.bfloat16 if config.compute_dtype == "bf16" else shift_hidden_states.dtype)
     )
     global_loss_batch = dict(batch or {})
+    raw_segment_ids = global_loss_batch.get("segment_ids", global_loss_batch.get("decoder_segment_ids", None))
     if "decoder_target_tokens" not in global_loss_batch:
         global_loss_batch["decoder_target_tokens"] = shift_labels
     else:
@@ -2230,6 +2284,15 @@ def causal_lm_loss_chunked_lm_head(
             global_loss_batch["decoder_loss_weights"] = shift_attn_m.astype(compute_dtype)
         else:
             global_loss_batch["decoder_loss_weights"] = (shift_labels != config.ignore_index).astype(compute_dtype)
+    global_loss_batch["decoder_loss_weights"] = _apply_causal_lm_segment_loss_mask(
+        loss_weights=global_loss_batch["decoder_loss_weights"],
+        segment_ids=raw_segment_ids,
+        labels=labels,
+        shifted_labels=shift_labels,
+        shift_tokens=config.shift_tokens,
+        config=config,
+        compute_dtype=compute_dtype,
+    )
 
     global_loss_factor, _ = get_factor_and_weight(
         config.loss_normalizing_factor,
@@ -2689,6 +2752,7 @@ def ForCausalLMLoss(
     if config is None:
         config = LossConfig()
     assert logits is not None and labels is not None
+    raw_segment_ids = None if batch is None else batch.get("segment_ids", batch.get("decoder_segment_ids", None))
     if config.shift_tokens:
         shift_logits = logits[:, :-1, :]
         shift_labels = labels[:, 1:]
@@ -2715,6 +2779,22 @@ def ForCausalLMLoss(
     loss_attention_mask = shift_attn_m
     if batch is not None and "decoder_loss_weights" in batch:
         loss_attention_mask = batch["decoder_loss_weights"]
+    compute_dtype = (
+        jnp.float32
+        if config.compute_dtype == "fp32"
+        else (jnp.bfloat16 if config.compute_dtype == "bf16" else logits.dtype)
+    )
+    loss_attention_mask = _apply_causal_lm_segment_loss_mask(
+        loss_weights=loss_attention_mask,
+        segment_ids=raw_segment_ids,
+        labels=labels,
+        shifted_labels=shift_labels,
+        shift_tokens=config.shift_tokens,
+        config=config,
+        compute_dtype=compute_dtype,
+    )
+    if batch is not None and loss_attention_mask is not None:
+        batch["decoder_loss_weights"] = loss_attention_mask
 
     loss = fixed_cross_entropy(
         source=shift_logits,
