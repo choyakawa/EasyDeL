@@ -91,6 +91,7 @@ class SplashAttn(AttentionImpl):
         k: Array,
         v: Array,
         mask: Array | None = None,
+        segment_ids: Array | None = None,
         causal: bool = True,
         cache_metadata: TransformerMetadata | None = None,
         **ignore,
@@ -108,6 +109,8 @@ class SplashAttn(AttentionImpl):
             v: Value tensor (B, S, Hkv, Dv).
             mask: Optional boolean attention mask (broadcastable to B, 1, T, S).
                 Used to generate segment IDs if provided.
+            segment_ids: Optional packed sequence segment IDs. When provided, these
+                are passed directly to SplashAttention to preserve packed sample boundaries.
             causal: If True, applies causal masking via the kernel's mask configuration.
                 If False, falls back to VanillaAttn.
             **ignore: Ignored keyword arguments.
@@ -124,6 +127,7 @@ class SplashAttn(AttentionImpl):
                 k=k,
                 v=v,
                 mask=mask,
+                segment_ids=segment_ids,
                 causal=causal,
                 cache_metadata=cache_metadata,
                 **ignore,
@@ -144,6 +148,9 @@ class SplashAttn(AttentionImpl):
         if mask is not None and mask.shape[0] != q.shape[0]:
             num_reps_mask = q.shape[0] // mask.shape[0]
             mask = jnp.repeat(mask, num_reps_mask, 0)
+        if segment_ids is not None and segment_ids.shape[0] != q.shape[0]:
+            num_reps_segment_ids = q.shape[0] // segment_ids.shape[0]
+            segment_ids = jnp.repeat(segment_ids, num_reps_segment_ids, 0)
 
         block_sizes = BlockSizes(
             block_q=min(self.metadata.blocksize_q, query_lenght),
@@ -158,7 +165,10 @@ class SplashAttn(AttentionImpl):
         qkv_mask_sharding = Ps(q_sharding[0], q_sharding[2])
         views_sharding = Ps(q_sharding[0])
         q_mask, kv_mask = [None] * 2
-        if mask is not None:
+        if segment_ids is not None and segment_ids.shape[-1] >= max(query_lenght, value_lenght):
+            q_mask = segment_ids[:, -query_lenght:].astype("i4")
+            kv_mask = segment_ids[:, -value_lenght:].astype("i4")
+        elif mask is not None:
             q_mask, kv_mask = self._split_attention_mask(mask)
             q_mask, kv_mask = (q_mask.astype("i4"), kv_mask.astype("i4"))
 

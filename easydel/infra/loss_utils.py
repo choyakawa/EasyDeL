@@ -1280,6 +1280,7 @@ def ForCausalLMLoss(
     logits: jax.Array,
     labels: jax.Array,
     attention_mask: jax.Array | None = None,
+    segment_ids: jax.Array | None = None,
     assistant_masks: jax.Array | None = None,
     completion_mask: jax.Array | None = None,
     loss_weights: jax.Array | None = None,
@@ -1336,12 +1337,29 @@ def ForCausalLMLoss(
         shift_labels = labels[:, 1:]
         if loss_mask is not None:
             shift_attn_m = loss_mask[:, 1:]
+        if segment_ids is not None:
+            segment_transition_mask = jnp.logical_and(
+                segment_ids[:, 1:] == segment_ids[:, :-1],
+                segment_ids[:, 1:] != 0,
+            )
+            shift_attn_m = (
+                segment_transition_mask
+                if shift_attn_m is None
+                else shift_attn_m * segment_transition_mask.astype(shift_attn_m.dtype)
+            )
     else:
         shift_logits = logits
         shift_labels = labels
 
         if loss_mask is not None:
             shift_attn_m = loss_mask
+        if segment_ids is not None:
+            segment_mask = segment_ids != 0
+            shift_attn_m = (
+                segment_mask
+                if shift_attn_m is None
+                else shift_attn_m * segment_mask.astype(shift_attn_m.dtype)
+            )
 
     loss = fixed_cross_entropy(
         source=shift_logits,

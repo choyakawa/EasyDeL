@@ -295,6 +295,30 @@ class FlexibleAttentionModule(nn.Module):
             )
 
     @jax.named_scope("easydel-flexible-attention")
+    def _apply_segment_mask(
+        self,
+        attention_mask: Bool[JArray, "batch ... seq_q seq_k"] | None,
+        segment_ids: Int[JArray, "batch seq"] | None,
+        query_length: int,
+        key_length: int,
+    ) -> Bool[JArray, "batch ... seq_q seq_k"] | None:
+        """Restrict packed self-attention to tokens from the same non-padding segment."""
+        if attention_mask is None or segment_ids is None:
+            return attention_mask
+        if segment_ids.shape[-1] < query_length or segment_ids.shape[-1] < key_length:
+            return attention_mask
+
+        q_segment_ids = segment_ids[:, -query_length:]
+        kv_segment_ids = segment_ids[:, -key_length:]
+        same_segment_mask = jnp.equal(q_segment_ids[:, None, :, None], kv_segment_ids[:, None, None, :])
+        valid_segment_mask = jnp.logical_and(
+            q_segment_ids[:, None, :, None] != 0,
+            kv_segment_ids[:, None, None, :] != 0,
+        )
+        segment_mask = jnp.logical_and(same_segment_mask, valid_segment_mask)
+        return jnp.logical_and(attention_mask, segment_mask)
+
+    @jax.named_scope("easydel-flexible-attention")
     def forward(
         self,
         query_states: Float[JArray, "batch seq_q heads dim"],
@@ -338,6 +362,12 @@ class FlexibleAttentionModule(nn.Module):
             rngs = self.rngs()
         except flax.errors.TraceContextError:
             rngs = None
+        attention_mask = self._apply_segment_mask(
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            query_length=query_states.shape[1],
+            key_length=key_states.shape[1],
+        )
         with self.config.mesh:
             input_dict = dict(
                 q=query_states,

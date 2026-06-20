@@ -263,9 +263,8 @@ class FlashAttn(AttentionImpl):
             a_sharding,
         ) = self.metadata.get_shardings(model_mode, BTHD=True)
 
-        if bias is None and init_bias is not None:
+        if mask is None and bias is None and init_bias is not None:
             bias = init_bias()
-            mask = None
 
         func = functools.partial(
             triton_flash_attention,
