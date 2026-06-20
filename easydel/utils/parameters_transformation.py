@@ -20,6 +20,7 @@ import functools
 import gc
 import inspect
 import os
+import re
 import typing as tp
 import warnings
 from collections.abc import Mapping
@@ -30,6 +31,7 @@ import numpy as np
 from eformer.loggings import get_logger
 from jax import dlpack
 from jax import numpy as jnp
+from jax.experimental import multihost_utils as mhutils
 from tqdm.autonotebook import tqdm
 
 from easydel.utils.helpers import check_bool_flag
@@ -46,9 +48,13 @@ if tp.TYPE_CHECKING:
 
 mem_ops = SMPMemoryMonitor(5)
 logger = get_logger(__name__)
-EASYDEL_PERFRED_HOST_COPY_INDEX = int(os.getenv("EASYDEL_PERFRED_HOST_COPY_INDEX", "0"))
-_perfred_host_copy_raw = str(os.getenv("EASYDEL_PERFRED_HOST_COPY", "cpu")).lower()
-EASYDEL_PERFRED_HOST_COPY: str | None = None if _perfred_host_copy_raw == "none" else _perfred_host_copy_raw
+EASYDEL_PREFERRED_HOST_COPY_INDEX = int(
+    os.getenv("EASYDEL_PREFERRED_HOST_COPY_INDEX", os.getenv("EASYDEL_PERFRED_HOST_COPY_INDEX", "0"))
+)
+_preferred_host_copy_raw = str(
+    os.getenv("EASYDEL_PREFERRED_HOST_COPY", os.getenv("EASYDEL_PERFRED_HOST_COPY", "cpu"))
+).lower()
+EASYDEL_PREFERRED_HOST_COPY: str | None = None if _preferred_host_copy_raw == "none" else _preferred_host_copy_raw
 
 
 class DtypeHandler:
@@ -131,35 +137,205 @@ class TensorConverter:
     @staticmethod
     def jax_to_pytorch(x: jax.Array) -> tp.Any:
         """Convert JAX array to PyTorch tensor."""
+        def _get_local_array(arr):
+            """Return an addressable local device array for multi-host safe transfer."""
+            try:
+                if getattr(arr, "is_fully_addressable", False):
+                    return arr
+            except Exception:
+                ...
+            try:
+                shards = getattr(arr, "addressable_shards", None)
+                if shards and len(shards) > 0:
+                    return shards[0].data
+            except Exception:
+                ...
+            return arr
+
+        # 更稳健的平台检测：优先使用已存在设备的平台集合
+        try:
+            device_platforms = {d.platform for d in jax.devices()}
+        except Exception:
+            device_platforms = set()
+        try:
+            default_backend = jax.default_backend()
+        except Exception:
+            default_backend = None
+
+        def _cpu_chunked_transfer(arr: jax.Array):
+            """Safely transfer possibly-large JAX array to torch via CPU in chunks to avoid HBM spikes.
+
+            Strategy:
+            - Always flatten to 1D on-device (reshape is cheap/view) to enable uniform chunking.
+            - Copy chunks of size <= EASYDEL_CHUNK_BYTES from device to host and stitch on CPU.
+            - Finally, reshape back to original shape on CPU and convert to torch.
+            """
+            import math
+            torch = TensorConverter.get_torch()
+            local = _get_local_array(arr)
+            shape = tuple(local.shape)
+            # Fast path for scalars/small tensors
+            total_elems = int(np.prod(shape)) if len(shape) > 0 else 1
+            dtype_np = np.dtype(str(local.dtype)) if isinstance(local.dtype, jnp.dtype) else local.dtype
+            if total_elems == 0:
+                return torch.from_numpy(np.array(jax.device_get(local)))
+
+            # Flatten to 1D for consistent chunking
+            local_1d = jnp.reshape(local, (total_elems,))
+            # Default 128MB per chunk on TPU unless overridden
+            chunk_bytes = int(os.getenv("EASYDEL_CHUNK_BYTES", str(128 * 1024 * 1024)))
+            bytes_per_elem = np.dtype(dtype_np).itemsize
+            elems_per_chunk = max(1, chunk_bytes // max(1, bytes_per_elem))
+
+            host_np_flat = np.empty((total_elems,), dtype=dtype_np)
+            for start in range(0, total_elems, elems_per_chunk):
+                end = min(total_elems, start + elems_per_chunk)
+                # Device to host for a flat slice to minimize transient allocations
+                chunk = jax.device_get(local_1d[start:end])
+                host_np_flat[start:end] = np.asarray(chunk, dtype=dtype_np)
+            host_np = host_np_flat.reshape(shape)
+            # torch.from_numpy 不支持 ml_dtypes.bfloat16，需转换
+            if str(dtype_np) in ("bfloat16", "bf16"):
+                return torch.from_numpy(host_np.astype(np.float32)).to(torch.bfloat16)
+            return torch.from_numpy(host_np)
+
+        # TPU 专用路径：使用多主机安全的全局收集，避免一次性在某个 TPU 上分配大缓冲
+        if ("tpu" in device_platforms) or (isinstance(default_backend, str) and default_backend.lower() == "tpu"):
+            host_np = TensorConverter.global_array_to_host_numpy(x, x.dtype)
+            torch = TensorConverter.get_torch()
+            if host_np is None:
+                # 非主进程不返回内容；这里返回一个占位 0 张量，调用方在主进程执行
+                return torch.zeros((), dtype=torch.float32)
+            if str(host_np.dtype) in ("bfloat16", "bf16"):
+                return torch.from_numpy(host_np.astype(np.float32)).to(torch.bfloat16)
+            return torch.from_numpy(host_np)
+
+        # CPU/GPU 平台或强制安全转移：走分块 CPU 转移，避免单次大拷贝
         if check_bool_flag("EASY_SAFE_TRANSFER", True):
-            x = jax.device_get(x)
-            return TensorConverter.get_torch().from_numpy(np.array(x.tolist(), dtype=x.dtype))
+            try:
+                return _cpu_chunked_transfer(x)
+            except Exception:
+                return _cpu_chunked_transfer(_get_local_array(x))
         else:
             from torch import cuda
             from torch.utils import dlpack as dlpack_pt
 
-            platform = jax.extend.backend.get_backend()
             cpu_force = not cuda.is_available()
 
+            def _to_dlpack_capsule(arr):
+                """Create a DLPack capsule from a JAX array, compatible with JAX >= 0.7."""
+                try:
+                    # Preferred path on modern JAX: use __dlpack__ on a local-addressable view
+                    _arr = _get_local_array(arr)
+                    return _arr.__dlpack__()
+                except Exception:
+                    # Fallback for older JAX versions
+                    if hasattr(dlpack, "to_dlpack"):
+                        try:
+                            return dlpack.to_dlpack(_get_local_array(arr))
+                        except Exception:
+                            ...
+                    # Last resort: host copy then try again
+                    host_arr = jax.device_get(_get_local_array(arr))
+                    return host_arr.__dlpack__() if hasattr(host_arr, "__dlpack__") else dlpack.to_dlpack(host_arr)
+
             if (
-                platform in ["cpu", "gpu"]
+                str(platform).lower() in ["cpu", "gpu"]
                 and not cpu_force
                 and not check_bool_flag("EASYDEL_FORCE_TORCH_USE_CPU", False)
             ):
-                dl_pack_jax = dlpack.to_dlpack(
-                    x,
-                    stream=True if (platform == "gpu" and not cpu_force) else None,
-                    src_device=next(iter(x.devices())),
-                )
+                capsule = _to_dlpack_capsule(x)
             else:
-                dl_pack_jax = dlpack.to_dlpack(
-                    jax.device_put(
-                        jax.device_get(x),
-                        jax.devices(EASYDEL_PERFRED_HOST_COPY)[EASYDEL_PERFRED_HOST_COPY_INDEX],
-                    ),
-                    stream=None,
+                y = jax.device_put(
+                    jax.device_get(_get_local_array(x)),
+                    jax.devices(EASYDEL_PREFERRED_HOST_COPY or "cpu")[EASYDEL_PREFERRED_HOST_COPY_INDEX],
                 )
-            return dlpack_pt.from_dlpack(dl_pack_jax)
+                capsule = _to_dlpack_capsule(y)
+            return dlpack_pt.from_dlpack(capsule)
+
+    @staticmethod
+    def global_array_to_host_numpy(x: jax.Array, target_dtype: jnp.dtype) -> np.ndarray | None:
+        """Gather a potentially multi-host sharded JAX array into host numpy on process 0.
+
+        - On fully addressable arrays: simple device_get.
+        - On sharded arrays: gather addressable shards per process, all-gather across processes,
+          and assemble the full array on process 0 CPU. Other processes return None.
+        """
+        is_main = jax.process_index() == 0
+
+        # Fast path: already fully addressable
+        try:
+            if getattr(x, "is_fully_addressable", False):
+                host_arr = jax.device_get(x)
+                return np.asarray(host_arr, dtype=np.dtype(DtypeHandler.get_dtype(target_dtype)))
+        except Exception:
+            ...
+
+        # Sharded path: collect local shards
+        local_chunks: list[tuple[list[tuple[int, int]], np.ndarray]] = []
+        try:
+            shards = getattr(x, "addressable_shards", None)
+        except Exception:
+            shards = None
+
+        if shards is None or len(shards) == 0:
+            # Fallback: try to get a local view; may still fail if non-addressable
+            try:
+                host_arr = jax.device_get(x)
+                return np.asarray(host_arr, dtype=np.dtype(DtypeHandler.get_dtype(target_dtype)))
+            except Exception:
+                # As a last resort, return None on non-main to avoid crashes
+                return None if not is_main else np.asarray(
+                    jax.device_get(x.addressable_shards[0].data),
+                    dtype=np.dtype(DtypeHandler.get_dtype(target_dtype)),
+                )
+
+        for shard in shards:
+            idx_pairs: list[tuple[int, int]] = []
+            for dim, sl in enumerate(shard.index):
+                start = 0 if sl.start is None else int(sl.start)
+                stop = x.shape[dim] if sl.stop is None else int(sl.stop)
+                idx_pairs.append((start, stop))
+            chunk_np = np.asarray(
+                jax.device_get(shard.data),
+                dtype=np.dtype(DtypeHandler.get_dtype(target_dtype)),
+            )
+            local_chunks.append((idx_pairs, chunk_np))
+
+        # Cross-host gather (host-only). All processes must participate.
+        gathered: list[list[tuple[list[tuple[int, int]], np.ndarray]]] = mhutils.process_allgather(local_chunks)
+
+        if not is_main:
+            # Other processes do not assemble to save memory
+            return None
+
+        # Assemble on process 0
+        full_np = np.empty(x.shape, dtype=np.dtype(DtypeHandler.get_dtype(target_dtype)))
+        for proc_chunks in gathered:
+            for idx_pairs, chunk in proc_chunks:
+                # 兼容 (start, stop) 或 (start, stop, step) 或直接 slice 对象
+                slices_list = []
+                for item in idx_pairs:
+                    if isinstance(item, slice):
+                        s = item
+                    elif isinstance(item, (list, tuple)):
+                        if len(item) == 2:
+                            s = slice(item[0], item[1])
+                        elif len(item) >= 3:
+                            s = slice(item[0], item[1], item[2])
+                        else:
+                            s = slice(0, None)
+                    else:
+                        # 单值索引不预期，这里退化为范围 1 的切片
+                        try:
+                            idx_int = int(item)
+                            s = slice(idx_int, idx_int + 1)
+                        except Exception:
+                            s = slice(0, None)
+                    slices_list.append(s)
+                slices = tuple(slices_list)
+                full_np[slices] = chunk
+        return full_np
 
     @staticmethod
     def pytorch_to_jax(x: tp.Any) -> jnp.ndarray:
@@ -177,7 +353,22 @@ class StateDictConverter:
 
     @staticmethod
     def process_tensor(key: str, tensor: tp.Any, config: dict[str, tp.Any]) -> list[tuple[tuple, jnp.ndarray]] | None:
-        """Process a single tensor and return its processed key and value."""
+        """Process a single PyTorch tensor into EasyDeL format.
+
+        Applies key renaming (e.g., ``.weight`` -> ``.kernel``), axis
+        transposition for dense layers, embedding/layernorm detection,
+        and optional ``reform_param`` splitting rules.
+
+        Args:
+            key: Dot-separated PyTorch parameter name.
+            tensor: PyTorch tensor to convert.
+            config: Conversion configuration containing ``embedding_layer_names``,
+                ``layernorm_names``, ``dtype``, ``reform_param``, etc.
+
+        Returns:
+            List of ``(key_tuple, jax_array)`` pairs, or ``None`` if the
+            parameter should be skipped.
+        """
         new_key = key
 
         reform_param = config.get("reform_param", None)
@@ -275,7 +466,33 @@ class StateDictConverter:
         reform_param: dict | None = None,
         **kwargs,
     ) -> dict[str, tp.Any]:
-        """Base conversion function from PyTorch state dict to EasyDeL format."""
+        """Base conversion from a PyTorch state dict to EasyDeL nested dict format.
+
+        Iterates over all keys in ``state_dict``, applies per-tensor
+        processing (key renaming, axis transposition, dtype casting),
+        optional shard functions, and a user callback.
+
+        Args:
+            state_dict: PyTorch model ``state_dict()``.
+            device: Target JAX device for parameter placement.
+            embedding_layer_names: Parameter name substrings identifying embeddings.
+            layernorm_names: Parameter name substrings identifying layer norms.
+            moe_block_names: Names of MoE block modules.
+            moe_names: Names of individual MoE expert sub-modules.
+            shard_fns: Optional mapping of key tuples to sharding functions.
+            dtype: Target JAX dtype for converted parameters.
+            verbose: Whether to display a progress bar.
+            callback: Optional function called on each converted array.
+            remove_state_dict: Whether to delete the input dict after conversion.
+            lm_head_name: Name of the language model head parameter.
+            uses_tie_word_embedding: Whether embeddings are tied with lm_head.
+            consolidated_moe_keys: Set of keys that were consolidated from
+                per-expert weights.
+            reform_param: Optional parameter splitting/merging rules.
+
+        Returns:
+            Nested EasyDeL parameter dictionary.
+        """
         try:
             import torch
 
@@ -341,6 +558,7 @@ class StateDictConverter:
         moe_block_path: list[str] | None = None,
         moe_path: list[str] | None = None,
         tensor_transform: tp.Callable | None = None,
+        reform_param: dict | None = None,
     ) -> tuple[dict[str, tp.Any], set[str]]:
         """
         Transform MoE weights from HuggingFace format (separate experts) to EasyDel format (stacked experts).
@@ -356,17 +574,25 @@ class StateDictConverter:
 
         import torch
 
-        assert moe_path is not None
-        assert moe_names is not None
-        assert moe_block_path is not None
+        if moe_path is None:
+            raise ValueError("moe_path cannot be None")
+        if moe_names is None:
+            raise ValueError("moe_names cannot be None")
+        if moe_block_path is None:
+            raise ValueError("moe_block_path cannot be None")
 
-        excepted_expert_name = moe_path[0].split(".")[-2]
-        expert_prefix = f".{excepted_expert_name}."
+        expected_expert_name = moe_path[0].split(".")[-2]
+        expert_prefix = f".{expected_expert_name}."
 
         moe_names_set = set(moe_names)
         moe_stacked_paths = {
-            f"{block_path}.{excepted_expert_name}.{moe_name}" for block_path in moe_block_path for moe_name in moe_names
+            f"{block_path}.{expected_expert_name}.{moe_name}" for block_path in moe_block_path for moe_name in moe_names
         }
+        reform_param = reform_param or {}
+        fallback_reform_keys = {
+            key[:-1] if key.endswith("$") else key for key in reform_param if f".{expected_expert_name}." in key
+        }
+        sibling_expert_parents = {path.rsplit(".", 1)[0] for path in moe_path if f".{expected_expert_name}." in path}
 
         new_state_dict = {}
         moe_groups = {path: {} for path in moe_stacked_paths}
@@ -397,10 +623,21 @@ class StateDictConverter:
                     moe_name = moe_name_part[:-7] if moe_name_part.endswith(".weight") else moe_name_part
 
                     if moe_name in moe_names_set:
-                        target_path = f"{block_path}.{excepted_expert_name}.{moe_name}"
+                        target_path = f"{block_path}.{expected_expert_name}.{moe_name}"
                         moe_groups[target_path][expert_idx] = value
                         is_moe_expert = True
                         break
+
+            if not is_moe_expert:
+                match = re.match(rf"^(.*\.{expected_expert_name})\.(\d+)\.([^.]+)\.weight$", key)
+                if match:
+                    expert_parent, expert_idx_str, moe_name = match.groups()
+                    target_path = f"{expert_parent}.{moe_name}"
+                    if expert_parent in sibling_expert_parents and (
+                        moe_name in moe_names_set or target_path in fallback_reform_keys
+                    ):
+                        moe_groups.setdefault(target_path, {})[int(expert_idx_str)] = value
+                        is_moe_expert = True
 
             if not is_moe_expert:
                 new_state_dict[key] = value
@@ -444,7 +681,7 @@ class StateDictConverter:
                 logger.error(f"Failed to stack MoE tensors for {target_path}: {e}")
                 for idx, tensor in expert_dict.items():
                     fallback_key = (
-                        f"{target_path.replace(f'.{excepted_expert_name}.', f'.{excepted_expert_name}.{idx}.')}.weight"
+                        f"{target_path.replace(f'.{expected_expert_name}.', f'.{expected_expert_name}.{idx}.')}.weight"
                     )
                     new_state_dict[fallback_key] = tensor
 
@@ -471,7 +708,33 @@ class StateDictConverter:
         reform_param: dict | None = None,
         **kwargs,
     ) -> dict[str, tp.Any]:
-        """Convert PyTorch state dict to EasyDeL format with MoE transformations."""
+        """Convert a PyTorch state dict to EasyDeL format with MoE support.
+
+        If MoE parameters are present, first stacks per-expert weights into
+        consolidated tensors, then delegates to ``_base_huggingface_to_easydel``
+        for the standard conversion pipeline.
+
+        Args:
+            state_dict: PyTorch model ``state_dict()``.
+            device: Target JAX device.
+            embedding_layer_names: Substrings identifying embedding layers.
+            layernorm_names: Substrings identifying layer norm layers.
+            moe_block_names: Names of MoE block modules.
+            moe_names: Names of individual expert sub-modules.
+            moe_block_path: Full dot-paths to MoE blocks in the model.
+            moe_path: Full dot-paths to expert modules.
+            shard_fns: Optional sharding functions per key tuple.
+            dtype: Target JAX dtype.
+            verbose: Whether to show progress.
+            callback: Optional per-array callback.
+            remove_state_dict: Whether to delete input dict after conversion.
+            lm_head_name: Language model head parameter name.
+            uses_tie_word_embedding: Whether embeddings are tied.
+            reform_param: Optional splitting/merging rules.
+
+        Returns:
+            Nested EasyDeL parameter dictionary.
+        """
         consolidated_moe_keys = set()
         if moe_block_names is not None and moe_names is not None:
             state_dict, consolidated_moe_keys = StateDictConverter.apply_moe_transformations(
@@ -480,6 +743,7 @@ class StateDictConverter:
                 moe_path=moe_path,
                 moe_block_names=moe_block_names,
                 moe_block_path=moe_block_path,
+                reform_param=reform_param,
             )
 
         return StateDictConverter._base_huggingface_to_easydel(
@@ -525,12 +789,17 @@ class StateDictConverter:
         if not all([moe_block_names, moe_names, moe_block_path]):
             return state_dict
 
-        assert moe_names is not None
-        assert moe_block_path is not None
+        if moe_names is None:
+            raise ValueError("moe_names cannot be None")
+        if moe_block_path is None:
+            raise ValueError("moe_block_path cannot be None")
 
         new_state_dict = {}
         processed_keys = set()
-        excepted_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
+        expected_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
+        sibling_expert_parents = {
+            path.rsplit(".", 1)[0] for path in moe_path or [] if f".{expected_expert_name}." in path
+        }
 
         for key, value in state_dict.items():
             is_stacked_moe = False
@@ -540,7 +809,7 @@ class StateDictConverter:
                     parts = remainder.split(".")
                     if (
                         len(parts) == 3
-                        and parts[0] == excepted_expert_name
+                        and parts[0] == expected_expert_name
                         and parts[1] in moe_names
                         and parts[2] == "weight"
                     ):
@@ -553,11 +822,26 @@ class StateDictConverter:
                                 expert_tensor = value[expert_idx]
                                 if tensor_transform is not None:
                                     expert_tensor = tensor_transform(expert_tensor)
-                                new_key = f"{block_path}.{excepted_expert_name}.{expert_idx}.{moe_name}.weight"
+                                new_key = f"{block_path}.{expected_expert_name}.{expert_idx}.{moe_name}.weight"
                                 new_state_dict[new_key] = expert_tensor
 
                             processed_keys.add(key)
                             break
+
+            if not is_stacked_moe:
+                match = re.match(rf"^(.*\.{expected_expert_name})\.([^.]+)\.weight$", key)
+                if match:
+                    expert_parent, moe_name = match.groups()
+                    if expert_parent in sibling_expert_parents and hasattr(value, "shape") and len(value.shape) >= 3:
+                        num_experts = value.shape[0]
+                        for expert_idx in range(num_experts):
+                            expert_tensor = value[expert_idx]
+                            if tensor_transform is not None:
+                                expert_tensor = tensor_transform(expert_tensor)
+                            new_key = f"{expert_parent}.{expert_idx}.{moe_name}.weight"
+                            new_state_dict[new_key] = expert_tensor
+                        processed_keys.add(key)
+                        is_stacked_moe = True
 
             if not is_stacked_moe:
                 new_state_dict[key] = value
@@ -567,7 +851,20 @@ class StateDictConverter:
     def easydel_to_torch(
         module: EasyDeLBaseModule, dtype: jnp.dtype | None = jnp.float16, **kwargs
     ) -> dict[str, tp.Any]:
-        """Convert EasyDeL module to PyTorch state dict."""
+        """Convert an EasyDeL module's parameters to a PyTorch state dict.
+
+        Flattens the module's parameter tree, transposes weight axes back
+        to PyTorch conventions, renames keys (``.kernel`` -> ``.weight``,
+        ``.embedding`` -> ``.weight``, ``.scale`` -> ``.weight``), and
+        un-stacks MoE expert weights if present.
+
+        Args:
+            module: EasyDeL module whose parameters will be exported.
+            dtype: Target dtype for the exported tensors.
+
+        Returns:
+            Dictionary mapping PyTorch-style parameter names to tensors.
+        """
         if dtype is None:
             dtype = module.param_dtype
 
@@ -592,6 +889,13 @@ class StateDictConverter:
                     potential_key = f"{block_path}.experts.{moe_name}.kernel"
                     if potential_key in model_parameters:
                         stacked_moe_keys.add(potential_key)
+        # 准备逐参数 gather 函数（如果可用，用于确保张量是全局形状而非本地分片形状）
+        try:
+            gather_fns_tree = module._gather_fns  # type: ignore[attr-defined]
+            gather_fns = flatten_dict(gather_fns_tree, sep=".") if gather_fns_tree is not None else {}
+        except Exception:
+            gather_fns = {}
+
         torch_state_dict = {}
         with tqdm(model_parameters.items(), desc=f"Converting {module.__class__.__name__} to torch") as pbar:
             for key, tensor in pbar:
@@ -601,8 +905,12 @@ class StateDictConverter:
                     tensor = tensor.materialize()
                 if hasattr(tensor, "value") and hasattr(tensor.value, "materialize"):
                     tensor = tensor.value.materialize()
-                if tensor.dtype != DtypeHandler.get_dtype(dtype):
-                    tensor = tensor.astype(DtypeHandler.get_dtype(dtype))
+                # 尝试对单参数进行 gather，避免仅拿到本地分片（导致形状变成 1/N）
+                try:
+                    if key in gather_fns:
+                        tensor = gather_fns[key](tensor)
+                except Exception:
+                    ...
                 tensor = TensorConverter.jax_to_pytorch(jax.block_until_ready(tensor))
                 is_stacked_moe = key in stacked_moe_keys
 
@@ -715,7 +1023,26 @@ class ModelConverter:
         reform_param: dict | None = None,
         **kw,
     ) -> tp.Any:
-        """Convert EasyDeL module to HuggingFace model."""
+        """Convert an EasyDeL module to a HuggingFace ``PreTrainedModel``.
+
+        Creates a HuggingFace model instance, converts the EasyDeL
+        parameters to a PyTorch state dict via ``easydel_to_torch``,
+        and loads the weights into the HuggingFace model.
+
+        Args:
+            module: Source EasyDeL module.
+            config: EasyDeL configuration to derive the HuggingFace config.
+            base_huggingface_module: HuggingFace model class to instantiate.
+            base_huggingface_module_kwarguments: Extra kwargs for the HF
+                model constructor.
+            dtype: Target dtype for the conversion.
+            use_meta_torch: Whether to use ``torch.device("meta")`` for
+                memory-efficient model construction.
+            reform_param: Optional parameter splitting/merging rules.
+
+        Returns:
+            Instantiated HuggingFace model with loaded weights.
+        """
 
         import torch
 
@@ -730,8 +1057,13 @@ class ModelConverter:
             if len(list(key_shape_checks.keys())) != len(list(state_dict.keys())):
                 warnings.warn("There might be an issue with converted `state_dict`.", stacklevel=1)
             for key, shape in key_shape_checks.items():
-                if state_dict[key].shape != shape:
+                if key not in state_dict:
+                    warnings.warn(f"Missing {key}.", stacklevel=1)
+                elif state_dict[key].shape != shape:
                     warnings.warn(f"Shape conflict at {key}.", stacklevel=1)
+            print("state_dict:")
+            for key in state_dict:
+                print(key)
             model.load_state_dict(state_dict, assign=True, strict=True)
 
         return model

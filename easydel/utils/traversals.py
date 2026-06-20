@@ -41,18 +41,28 @@ logger = get_logger(__name__)
 
 
 class MetaValueRecreator:
-    """Helper class for recreating meta values with state tracking"""
+    """Helper for recreating nnx meta values (RNG keys/counts) deterministically.
+
+    Maintains an internal counter and PRNG key that advance on each call,
+    producing reproducible sequences for RNG count and key state variables.
+
+    Attributes:
+        _count: Monotonically increasing counter for ``RngCount`` variables.
+        _rng: Current PRNG key, split on each ``get_rng`` call.
+    """
 
     def __init__(self, seed: int = 42):
         self._count = 0
         self._rng = jax.random.PRNGKey(seed)
 
     def get_count(self) -> jnp.ndarray:
+        """Return the next counter value as a uint32 array and increment."""
         count = self._count
         self._count += 1
         return jnp.array(count, dtype=jnp.uint32)
 
     def get_rng(self) -> jax.random.PRNGKey:
+        """Split the internal PRNG key and return one half."""
         key, self._rng = jax.random.split(self._rng)
         return key
 
@@ -64,6 +74,14 @@ class _EmptyNode:
 
 @auto_pytree
 class StateValidationResult:
+    """Result of validating a state dictionary against a reference.
+
+    Attributes:
+        is_valid: ``True`` if no missing keys or type mismatches were found.
+        missing_keys: Keys present in the reference but absent in the state.
+        invalid_types: Mapping of keys whose value types differ from the reference.
+    """
+
     is_valid: bool
     missing_keys: set
     invalid_types: dict[str, type]
@@ -74,6 +92,14 @@ M = tp.TypeVar("M")
 
 
 def int_key_to_string(xs):
+    """Convert all integer keys in a (possibly nested) dictionary to strings.
+
+    Args:
+        xs: Dictionary, possibly nested or already flattened.
+
+    Returns:
+        Dictionary with the same structure but all integer keys cast to strings.
+    """
     flatten = False
     if not is_flatten(xs):
         flatten = True
@@ -87,6 +113,14 @@ def int_key_to_string(xs):
 
 
 def string_key_to_int(xs):
+    """Convert digit-only string keys in a dictionary back to integers.
+
+    Args:
+        xs: Dictionary, possibly nested or already flattened.
+
+    Returns:
+        Dictionary with digit-string keys converted to ``int`` where possible.
+    """
     flatten = False
     if not is_flatten(xs):
         flatten = True
@@ -102,7 +136,8 @@ def string_key_to_int(xs):
 
 def _dict_flatten_dict(xs, keep_empty_nodes=False, is_leaf=None, sep=None, fumap=False):
     if not fumap:
-        assert isinstance(xs, dict), f"expected dict; got {type(xs)}"
+        if not isinstance(xs, dict):
+            raise TypeError(f"expected dict; got {type(xs)}")
 
     def _key(path):
         if sep is None:
@@ -128,11 +163,13 @@ def _dict_flatten_dict(xs, keep_empty_nodes=False, is_leaf=None, sep=None, fumap
 
 
 def is_iterable(obj):
+    """Check whether ``obj`` is an iterable (excluding strings)."""
     return isinstance(obj, Iterable)
 
 
 def _dict_unflatten_dict(xs, sep=None):
-    assert isinstance(xs, dict), f"input is not a dict; it is a {type(xs)}"
+    if not isinstance(xs, dict):
+        raise TypeError(f"input is not a dict; it is a {type(xs)}")
     result = {}
     for path, value in xs.items():
         if sep is not None:
@@ -193,6 +230,15 @@ def flatten_dict(
 
 
 def unflatten_dict(xs, sep=None):
+    """Reconstruct a nested dictionary from a flattened one.
+
+    Args:
+        xs: Flattened dictionary with tuple or separated-string keys.
+        sep: Separator used in string keys, or ``None`` for tuple keys.
+
+    Returns:
+        Nested dictionary.
+    """
     if isinstance(xs, dict):
         return _dict_unflatten_dict(xs=xs, sep=sep)
     return traversals.unflatten_mapping(xs, sep=sep)
@@ -269,7 +315,7 @@ def create_graphdef(
     )[0]
 
 
-def init_garphstate(
+def init_graphstate(
     module: nnx.Module,
     _add_rngs: bool = True,
     _rng_key: str = "rngs",
@@ -310,7 +356,18 @@ def init_garphstate(
 
 
 def validate_state(state: dict[str, tp.Any], init_state: dict[str, tp.Any]) -> StateValidationResult:
-    """Validates state against init_state before differentiation."""
+    """Validate a state dictionary against a reference init state.
+
+    Checks for missing keys and type mismatches between ``state`` and
+    ``init_state``.
+
+    Args:
+        state: State dictionary to validate.
+        init_state: Reference state dictionary.
+
+    Returns:
+        ``StateValidationResult`` with validation outcome details.
+    """
     missing_keys = set(init_state.keys()) - set(state.keys())
     invalid_types = {k: type(v) for k, v in state.items() if k in init_state and not isinstance(v, type(init_state[k]))}
     return StateValidationResult(
@@ -320,7 +377,7 @@ def validate_state(state: dict[str, tp.Any], init_state: dict[str, tp.Any]) -> S
     )
 
 
-def diffrentiate_state(
+def differentiate_state(
     state: dict[str, tp.Any],
     init_state: dict[str, tp.Any],
     validate: bool = True,
@@ -381,7 +438,8 @@ def redefine_state(state: dict, missings: dict[str, nnx.VariableState]) -> dict:
     _state_rngs: jax.random.PRNGKey = jax.random.PRNGKey(42)
     for key, value in missings.items():
         if isinstance(type(value), nnx.Param) or issubclass(type(value), nnx.Param):
-            assert value.value is None, "there's missing parameter in state which can't be None."
+            if value.value is not None:
+                raise ValueError("there's missing parameter in state which can't be None.")
             state[key] = value
         elif isinstance(type(value), nnx.RngCount) or issubclass(type(value), nnx.RngCount):
             state[key] = nnx.VariableState(
@@ -393,7 +451,7 @@ def redefine_state(state: dict, missings: dict[str, nnx.VariableState]) -> dict:
             state[key] = nnx.VariableState(nnx.RngKey, _state_rngs)
             _state_rngs = jax.random.split(_state_rngs)[0]
         else:
-            raise AttributeError(f"Unexcepted type({type(value)}) found which cannot be redefined.")
+            raise AttributeError(f"Unexpected type({type(value)}) found which cannot be redefined.")
     return state
 
 
@@ -515,7 +573,7 @@ def merge_state_and_tree(tree: dict, state: nnx.State, *, silence: bool = False)
             # Avoid type '<class 'jax._src.api.ShapeDtypeStruct'>' is not a valid JAX type
             params[keys].value = None
     if lost_data:
-        logger.info(f"tree-array strc keys {tree.keys()}")
+        logger.debug(f"tree-array strc keys {tree.keys()}")
     others = recreate_meta_values(others)
     state = refine_graphs(others, params)
     return state

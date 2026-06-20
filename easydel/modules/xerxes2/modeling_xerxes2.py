@@ -627,15 +627,7 @@ class Xerxes2DecoderLayer(nn.Module):
         self.precision = precision
         self.rngs = rngs
 
-        attn_block, mlp_block, moe_block = auto_remat(
-            Xerxes2Attention,
-            Xerxes2MLP,
-            Xerxes2MoeSparseBlock,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.self_attn = attn_block(
+        self.self_attn = Xerxes2Attention(
             config=self.config,
             layer_idx=layer_idx,
             dtype=dtype,
@@ -647,7 +639,7 @@ class Xerxes2DecoderLayer(nn.Module):
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         )
         if self.is_moe:
-            self.mlp = moe_block(
+            self.mlp = Xerxes2MoeSparseBlock(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -655,7 +647,7 @@ class Xerxes2DecoderLayer(nn.Module):
                 rngs=rngs,
             )
         else:
-            self.mlp = mlp_block(
+            self.mlp = Xerxes2MLP(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -806,9 +798,15 @@ class Xerxes2Model(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            Xerxes2DecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Xerxes2DecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=layer_idx,
                     dtype=dtype,
@@ -1139,7 +1137,7 @@ class Xerxes2ForCausalLM(BaseCausalLMModule[Xerxes2Model, Xerxes2Config]):  # ty
 
         return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
 
-    def create_transformer_cache_config(self, batch_size: int, max_length: int):
+    def create_transformer_cache_config(self, batch_size: int, max_length: int, **kwargs):
         """Create cache configuration for MLA-based key-value caching.
 
         Creates a TransformerCacheConfig with dimensions appropriate for Multi-head

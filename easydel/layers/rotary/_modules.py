@@ -28,7 +28,7 @@ Classes:
     Phi3LongRoPEScaledRotaryEmbedding: RoPE with Phi-3 LongRoPE scaling.
     Llama3RotaryEmbedding: RoPE with Llama-3 wavelength-based scaling.
 
-The `rope_wraper` decorator registers each class in `AVAILABLE_ROPE_TYPES`
+The `rope_wrapper` decorator registers each class in `AVAILABLE_ROPE_TYPES`
 for dynamic lookup by rope type name.
 
 Example:
@@ -58,6 +58,8 @@ import jax
 import jax.numpy as jnp
 from flax import nnx as nn
 
+from easydel.layers.norms import lowfloats
+
 from ._compute_fns import (
     apply_basic_rope,
     apply_phi3_rope,
@@ -79,7 +81,18 @@ AVAILABLE_ROPE_TYPES = {}
 _T = tp.TypeVar("_T")
 
 
-def rope_wraper(type: str) -> tp.Callable[[_T], _T]:  # noqa
+def _promote_rotary_operands(*operands: jax.Array) -> tuple[jax.Array, ...]:
+    """Promote rotary operands explicitly when low-precision dtypes are involved."""
+    if any(operand.dtype in lowfloats for operand in operands):
+        compute_dtype = jnp.float32
+    else:
+        compute_dtype = operands[0].dtype
+        for operand in operands[1:]:
+            compute_dtype = jnp.promote_types(compute_dtype, operand.dtype)
+    return tuple(operand.astype(compute_dtype) for operand in operands)
+
+
+def rope_wrapper(type: str) -> tp.Callable[[_T], _T]:  # noqa
     """
     A decorator factory that registers a RotaryEmbedding class under a specific type name.
 
@@ -114,7 +127,7 @@ def rope_wraper(type: str) -> tp.Callable[[_T], _T]:  # noqa
     return w
 
 
-@rope_wraper("default")
+@rope_wrapper("default")
 class RotaryEmbedding(nn.Module):
     """
     Standard Rotary Positional Embedding (RoPE) module.
@@ -214,7 +227,7 @@ class RotaryEmbedding(nn.Module):
         return {}
 
 
-@rope_wraper("mrope")
+@rope_wrapper("mrope")
 class MultiModalRotaryEmbedding(RotaryEmbedding):
     """Multi-dimensional RoPE (MRoPE) with interleaved THW layout for Qwen2/3-VL models.
 
@@ -454,14 +467,20 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
 
         cos = cos[:, :, jnp.newaxis, :]
         sin = sin[:, :, jnp.newaxis, :]
+
+        # mRoPE can be partial (e.g. rotary_dim=64 on head_size=256). Align rotary
+        # dimensions with Q/K tensors and keep the non-rotary tail as pass-through.
+        rotary_dim = min(int(cos.shape[-1]), int(query.shape[-1]), int(key.shape[-1]))
+        cos = cos[..., :rotary_dim]
+        sin = sin[..., :rotary_dim]
         if self.repetition_style:
-            rotary_dim = self.rotary_dim
             q_rot = query[..., :rotary_dim]
             k_rot = key[..., :rotary_dim]
+            q_rot, k_rot, cos, sin = _promote_rotary_operands(q_rot, k_rot, cos, sin)
 
             q_pass = None
             k_pass = None
-            if rotary_dim < self.head_size:
+            if rotary_dim < query.shape[-1]:
                 q_pass = query[..., rotary_dim:]
                 k_pass = key[..., rotary_dim:]
 
@@ -470,17 +489,26 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
             k_rot = (k_rot * cos) + (rotate_fn(k_rot) * sin)
 
             if q_pass is not None:
-                q_rot = jnp.concatenate([q_rot, q_pass], axis=-1)
-                k_rot = jnp.concatenate([k_rot, k_pass], axis=-1)
+                q_rot = jnp.concatenate([q_rot, q_pass.astype(q_rot.dtype)], axis=-1)
+                k_rot = jnp.concatenate([k_rot, k_pass.astype(k_rot.dtype)], axis=-1)
 
             return q_rot.astype(self.dtype), k_rot.astype(self.dtype)
         else:
-            q_embed = (query * cos) + (_rotate_neox(query) * sin)
-            k_embed = (key * cos) + (_rotate_neox(key) * sin)
+            q_rot = query[..., :rotary_dim]
+            k_rot = key[..., :rotary_dim]
+            q_rot, k_rot, cos, sin = _promote_rotary_operands(q_rot, k_rot, cos, sin)
+
+            q_embed = (q_rot * cos) + (_rotate_neox(q_rot) * sin)
+            k_embed = (k_rot * cos) + (_rotate_neox(k_rot) * sin)
+
+            if rotary_dim < query.shape[-1]:
+                q_embed = jnp.concatenate([q_embed, query[..., rotary_dim:].astype(q_embed.dtype)], axis=-1)
+                k_embed = jnp.concatenate([k_embed, key[..., rotary_dim:].astype(k_embed.dtype)], axis=-1)
+
             return q_embed.astype(self.dtype), k_embed.astype(self.dtype)
 
 
-@rope_wraper("linear")
+@rope_wrapper("linear")
 class LinearScalingRotaryEmbedding(RotaryEmbedding):
     """
     RotaryEmbedding extended with Linear Scaling.
@@ -574,7 +602,7 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
             )
 
 
-@rope_wraper("dynamic")
+@rope_wrapper("dynamic")
 class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
     """
     RotaryEmbedding extended with Dynamic NTK scaling.
@@ -669,7 +697,7 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
             )
 
 
-@rope_wraper("yarn")
+@rope_wrapper("yarn")
 class YaRNScalingRotaryEmbedding(RotaryEmbedding):
     """
     RotaryEmbedding extended with the YaRN (Yet another RoPE extensioN method) scaling.
@@ -793,7 +821,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
             )
 
 
-@rope_wraper("deepseek_yarn")
+@rope_wrapper("deepseek_yarn")
 class DeepseekScalingRotaryEmbedding(nn.Module):
     """
     RotaryEmbedding implementing a YaRN-like scaling method, potentially from Deepseek models.
@@ -939,7 +967,7 @@ class DeepseekScalingRotaryEmbedding(nn.Module):
         return query, key
 
 
-@rope_wraper("longrope")
+@rope_wrapper("longrope")
 class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
     """
     RotaryEmbedding using the Phi-3 LongRoPE scaling method.
@@ -1054,7 +1082,7 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
             )
 
 
-@rope_wraper("llama3")
+@rope_wrapper("llama3")
 class Llama3RotaryEmbedding(RotaryEmbedding):
     """
     RotaryEmbedding implementing the Llama-3 scaling method.

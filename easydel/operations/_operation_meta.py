@@ -1,3 +1,17 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import dataclasses
@@ -141,6 +155,8 @@ class OperationMetadata:
         self.set_attrs_carefully("runtime_dtype",  jnp.float32, "attn_dtype")
         self.set_attrs_carefully("runtime_softmax_dtype", jnp.float32, "attn_softmax_dtype")
         self.set_attrs_carefully("partition_axis", PartitionAxis())
+        if isinstance(self.partition_axis, dict):
+            self.partition_axis = PartitionAxis(**self.partition_axis)
         self.set_attrs_carefully("partition_manager", PartitionManager(self.partition_axis))
         # DON'T READ FROM CONFIG
         self.set_attrs_carefully("sequence_axis_name", "sp", "sequence_axis_name", use_base_config=False)
@@ -151,9 +167,10 @@ class OperationMetadata:
         # fmt:on
         if self._stored_mesh is NOT_GIVEN and self.base_config is None:
             mesh: jax.sharding.Mesh = jax.interpreters.pxla.thread_resources.env.physical_mesh
-            assert not mesh.empty, (
-                "You should pass 'mesh' to `OperationMetadata` or at least create that under mesh context manager"
-            )
+            if mesh.empty:
+                raise ValueError(
+                    "You should pass 'mesh' to `OperationMetadata` or at least create that under mesh context manager"
+                )
             self._stored_mesh = mesh
         self._safety_check()
         if self.backend is None:
@@ -224,8 +241,8 @@ class OperationMetadata:
                 "bhtd" (batch, heads, time, dim).
             qkv_mni_sharding: If True, use HEAD/HEAD_DIM for K/V instead of KV_HEAD/KV_HEAD_DIM.
                 Useful for multi-head attention (MHA) vs grouped-query attention (GQA/MQA).
-            softmax_aux_2d: If True, create sharding for 2D softmax auxiliary outputs
-                (e.g., log-sum-exp, max values) with shape [batch, num_heads].
+            softmax_aux: If provided, create sharding for softmax auxiliary outputs
+                (e.g., log-sum-exp, max values).
 
         Returns:
             AttnShardingRules: Named tuple containing PartitionSpecs for all attention tensors:
@@ -336,6 +353,7 @@ class OperationMetadata:
                 - "blocksparse": Block sparse attention
                 - "ragged_page_attention_v2": Ragged page attention v2
                 - "ragged_page_attention_v3": Ragged page attention v3
+                - "multi_latent_ragged_page_attention_v1": Multi-latent ragged page attention v1
                 - "unified_attention": Unified paged attention (vLLM-style)
                 - "paged_flash_attention": Paged FlashAttention (CUDA, block tables)
                 - "sdpa": Scaled dot product attention

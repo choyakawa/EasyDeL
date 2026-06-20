@@ -14,16 +14,40 @@
 
 from __future__ import annotations
 
+import typing as tp
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from easydel.inference.sampling_params import SamplingParams
 
+from ...stream_protocol import (
+    RequestOutputLike,
+    StreamEventFrame,
+    iter_chat_completion_stream_responses,
+    iter_responses_stream_frames,
+)
+from ...typed_models import ResponsesFinalizationOptions
+from ..logger import logger
+
 if TYPE_CHECKING:
+    from ...openai_api_modules import ChatCompletionStreamResponse
     from ..esurge_engine import RequestOutput
 
 
 class EngineIOMixin:
+    """Mixin providing input/output operations for the eSurge engine.
+
+    Handles blocking and streaming generation interfaces, multimodal chat
+    support, and orphaned request recovery. This mixin implements the
+    user-facing generate(), stream(), and chat() methods that coordinate
+    with the background scheduler to produce completions.
+
+    Methods:
+        generate: Blocking batch generation for one or more prompts.
+        stream: Streaming token-by-token generation with incremental output.
+        chat: High-level chat interface with multimodal and tool support.
+    """
+
     def _ensure_scheduler_running(self, *, context: str) -> None:
         """Raise a clear error when scheduler is unavailable.
 
@@ -35,12 +59,118 @@ class EngineIOMixin:
         self._raise_if_scheduler_failed()
         raise RuntimeError(f"Background scheduler is not running ({context}).")
 
+    def _recover_orphaned_request(self, request_id: str) -> bool:
+        """Abort a request when unresolved samples have no live scheduler/request state.
+
+        This prevents indefinite waits if a child request (especially in n>1
+        sampling) disappears from both scheduler and active-request tracking
+        without delivering a terminal output update.
+        """
+        with self._output_lock:
+            ro = self._request_outputs.get(request_id)
+            if ro is None or ro.finished:
+                return False
+            n_samples = len(ro.outputs)
+            unresolved_child_ids: list[str] = []
+            if n_samples <= 1:
+                if ro.outputs and ro.outputs[0].finish_reason is None:
+                    unresolved_child_ids.append(request_id)
+            else:
+                for sample_idx, comp in enumerate(ro.outputs):
+                    if comp.finish_reason is None:
+                        unresolved_child_ids.append(f"{request_id}-{sample_idx}")
+
+        if not unresolved_child_ids:
+            return False
+
+        with self._scheduler_lock:
+            if any(child_id in self.scheduler.requests for child_id in unresolved_child_ids):
+                return False
+
+        with self._request_lock:
+            if any(child_id in self._active_requests for child_id in unresolved_child_ids):
+                return False
+
+        # Re-check under output lock to avoid aborting if completion just arrived.
+        with self._output_lock:
+            ro_now = self._request_outputs.get(request_id)
+            if ro_now is None or ro_now.finished:
+                return False
+            if len(ro_now.outputs) != n_samples:
+                return False
+            if n_samples <= 1:
+                still_pending = bool(ro_now.outputs and ro_now.outputs[0].finish_reason is None)
+            else:
+                still_pending = any(comp.finish_reason is None for comp in ro_now.outputs)
+            if not still_pending:
+                return False
+
+        logger.warning(
+            "Recovering orphaned request %s: unresolved child samples are missing from scheduler/active state. "
+            "Forcing abort to avoid an indefinite wait.",
+            request_id,
+        )
+        self.abort_request(request_id)
+        return True
+
+    @staticmethod
+    def _build_tool_parser_request(
+        *,
+        prompt: str,
+        tools: list[dict] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ):
+        """Build a minimal chat request for parser-side schema access."""
+        if tools is None and tool_choice is None:
+            return None
+
+        from easydel.inference.openai_api_modules import ChatCompletionRequest
+
+        normalized_tools: list[dict[str, Any]] | None = None
+        if tools is not None:
+            normalized_tools = []
+            for tool in tools:
+                if hasattr(tool, "model_dump"):
+                    raw_tool = tool.model_dump(exclude_none=True)
+                elif isinstance(tool, dict):
+                    raw_tool = dict(tool)
+                else:
+                    continue
+
+                function_payload = raw_tool.get("function")
+                if isinstance(function_payload, dict):
+                    normalized_tools.append(
+                        {
+                            "type": str(raw_tool.get("type") or "function"),
+                            "function": function_payload,
+                        }
+                    )
+                    continue
+
+                if isinstance(raw_tool.get("name"), str):
+                    normalized_tools.append(
+                        {
+                            "type": "function",
+                            "function": raw_tool,
+                        }
+                    )
+
+        return ChatCompletionRequest.model_validate(
+            {
+                "model": "dummy",
+                "messages": [{"role": "user", "content": prompt}],
+                "tools": normalized_tools,
+                "tool_choice": tool_choice,
+            }
+        )
+
     def generate(
         self,
         prompts: str | list[str],
         sampling_params: SamplingParams | None = None,
         request_id: str | list[str] | None = None,
         use_tqdm: bool = True,
+        tool_parser_request: Any | None = None,
     ) -> list[RequestOutput]:
         """Generate completions for one or more prompts (blocking).
 
@@ -107,7 +237,13 @@ class EngineIOMixin:
                 request_id=req_id,
                 prompt=prompt,
             )
-            self._add_request(req_id, prompt, effective_params, prompt_token_ids=prompt_tokens)
+            self._add_request(
+                req_id,
+                prompt,
+                effective_params,
+                prompt_token_ids=prompt_tokens,
+                tool_parser_request=tool_parser_request,
+            )
 
         outputs = []
         pbar = None
@@ -129,6 +265,9 @@ class EngineIOMixin:
                 for rid in pending_ids:
                     self.abort_request(rid)
                 raise RuntimeError("Background scheduler stopped while waiting for generation outputs.")
+            for req_id in request_ids:
+                if req_id not in completed:
+                    self._recover_orphaned_request(req_id)
             with self._output_lock:
                 for req_id in request_ids:
                     if req_id not in completed and req_id in self._request_outputs:
@@ -162,6 +301,7 @@ class EngineIOMixin:
         prompts: str | list[str],
         sampling_params: SamplingParams | None = None,
         request_id: str | None = None,
+        tool_parser_request: Any | None = None,
     ) -> Iterator[RequestOutput]:
         """Stream generation output as tokens are produced.
 
@@ -221,7 +361,13 @@ class EngineIOMixin:
             request_id=request_id,
             prompt=prompt,
         )
-        self._add_request(request_id, prompt, effective_params, prompt_token_ids=prompt_tokens)
+        self._add_request(
+            request_id,
+            prompt,
+            effective_params,
+            prompt_token_ids=prompt_tokens,
+            tool_parser_request=tool_parser_request,
+        )
 
         self._ensure_scheduler_running(context="stream-start")
 
@@ -232,6 +378,7 @@ class EngineIOMixin:
 
         last_update_seq = -1
         last_accumulated_text = ""
+        last_raw_accumulated_text = ""
         last_accumulated_reasoning = ""
         from ..esurge_engine import CompletionOutput, RequestOutput
 
@@ -243,6 +390,8 @@ class EngineIOMixin:
                 if not self._scheduler_running:
                     self.abort_request(request_id)
                     raise RuntimeError("Background scheduler stopped while streaming request.")
+                if self._recover_orphaned_request(request_id):
+                    continue
 
                 snapshot = None
                 with self._output_lock:
@@ -264,6 +413,7 @@ class EngineIOMixin:
                                     finish_reason=comp.finish_reason,
                                     tool_calls=comp.tool_calls,
                                     reasoning_content=comp.reasoning_content,
+                                    raw_text=comp.raw_text,
                                 )
                             )
 
@@ -271,6 +421,11 @@ class EngineIOMixin:
                             ro.accumulated_text,
                             last_accumulated_text,
                             ro.delta_text,
+                        )
+                        snapshot_raw_delta = self._compute_snapshot_delta_text(
+                            ro.raw_accumulated_text,
+                            last_raw_accumulated_text,
+                            ro.raw_delta_text or "",
                         )
                         snapshot_reasoning_delta = self._compute_snapshot_delta_text(
                             ro.reasoning_content or "",
@@ -287,6 +442,8 @@ class EngineIOMixin:
                             metrics=dict(ro.metrics) if ro.metrics is not None else None,
                             accumulated_text=ro.accumulated_text,
                             delta_text=snapshot_delta,
+                            raw_accumulated_text=ro.raw_accumulated_text,
+                            raw_delta_text=snapshot_raw_delta,
                             tokens_per_second=ro.tokens_per_second,
                             num_generated_tokens=ro.num_generated_tokens,
                             time_spent_generating=ro.time_spent_generating,
@@ -301,6 +458,7 @@ class EngineIOMixin:
                         )
                         last_update_seq = ro.update_seq
                         last_accumulated_text = ro.accumulated_text
+                        last_raw_accumulated_text = ro.raw_accumulated_text
                         last_accumulated_reasoning = ro.reasoning_content or ""
 
                 if snapshot is not None:
@@ -324,17 +482,46 @@ class EngineIOMixin:
             else:
                 self.abort_request(request_id)
 
+    @overload
     def chat(
         self,
         messages: list[dict],
         tools: list[dict] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        sampling_params: SamplingParams | None = None,
+        request_id: str | None = None,
+        *,
+        stream: Literal[False] = ...,
+        chat_template: str | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+    ) -> RequestOutput: ...
+
+    @overload
+    def chat(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        sampling_params: SamplingParams | None = None,
+        request_id: str | None = None,
+        *,
+        stream: Literal[True],
+        chat_template: str | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+    ) -> Iterator[RequestOutput]: ...
+
+    def chat(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
         sampling_params: SamplingParams | None = None,
         request_id: str | None = None,
         stream: bool = False,
         chat_template: str | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
-    ):
-        """High-level chat interface compatible with vLLM and OpenAI APIs.
+    ) -> RequestOutput | Iterator[RequestOutput]:
+        """High-level chat interface compatible with OpenAI APIs.
 
         Provides a convenient chat-based interface for conversational AI applications.
         Automatically formats messages using the model's chat template and handles
@@ -414,6 +601,7 @@ class EngineIOMixin:
             return self._chat_multimodal(
                 messages=messages,
                 tools=tools,
+                tool_choice=tool_choice,
                 sampling_params=sampling_params,
                 request_id=request_id,
                 stream=stream,
@@ -421,6 +609,11 @@ class EngineIOMixin:
                 chat_template_kwargs=chat_template_kwargs,
             )
         else:
+            base_sampling_params = self._prepare_chat_sampling_params(
+                sampling_params or SamplingParams(max_tokens=128),
+                tools=tools,
+                tool_choice=tool_choice if isinstance(tool_choice, str) else None,
+            )
             prompt = self._format_chat_prompt(
                 messages,
                 tools=tools,
@@ -428,17 +621,94 @@ class EngineIOMixin:
                 chat_template=chat_template,
                 chat_template_kwargs=chat_template_kwargs,
             )
+            tool_parser_request = self._build_tool_parser_request(
+                prompt=prompt,
+                tools=tools,
+                tool_choice=tool_choice,
+            )
 
             if stream:
-                return self.stream(prompt, sampling_params=sampling_params, request_id=request_id)
+                return self.stream(
+                    prompt,
+                    sampling_params=base_sampling_params,
+                    request_id=request_id,
+                    tool_parser_request=tool_parser_request,
+                )
             else:
                 outs = self.generate(
                     prompt,
-                    sampling_params=sampling_params,
+                    sampling_params=base_sampling_params,
                     request_id=request_id,
                     use_tqdm=False,
+                    tool_parser_request=tool_parser_request,
                 )
                 return outs[0]
+
+    def iter_chat_completion_stream(
+        self,
+        *,
+        model: str,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        sampling_params: SamplingParams | None = None,
+        request_id: str | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+    ) -> Iterator[ChatCompletionStreamResponse]:
+        """Yield OpenAI chat stream chunks assembled from engine snapshots."""
+
+        outputs = self.chat(
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            sampling_params=sampling_params,
+            request_id=request_id,
+            stream=True,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        yield from iter_chat_completion_stream_responses(
+            tp.cast(Iterator[RequestOutputLike], outputs),
+            model=model,
+        )
+
+    def iter_responses_stream(
+        self,
+        *,
+        response_id: str,
+        model: str,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        sampling_params: SamplingParams | None = None,
+        request_id: str | None = None,
+        include_reasoning_summary: bool = False,
+        final_response_overrides: ResponsesFinalizationOptions | None = None,
+        created_at: int | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+    ) -> Iterator[StreamEventFrame]:
+        """Yield Responses API stream frames assembled from engine snapshots."""
+
+        outputs = self.chat(
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            sampling_params=sampling_params,
+            request_id=request_id,
+            stream=True,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        yield from iter_responses_stream_frames(
+            tp.cast(Iterator[RequestOutputLike], outputs),
+            response_id=response_id,
+            model=model,
+            include_reasoning_summary=include_reasoning_summary,
+            final_response_overrides=final_response_overrides,
+            created_at=created_at,
+        )
 
     def _messages_have_multimodal_content(self, messages: list[dict]) -> bool:
         """Check if messages contain multimodal content (images/videos).
@@ -465,12 +735,13 @@ class EngineIOMixin:
         self,
         messages: list[dict],
         tools: list[dict] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
         sampling_params: SamplingParams | None = None,
         request_id: str | None = None,
         stream: bool = False,
         chat_template: str | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
-    ):
+    ) -> RequestOutput | Iterator[RequestOutput]:
         """Handle multimodal chat with images/videos.
 
         Internal method that processes vision-language model requests.
@@ -498,7 +769,11 @@ class EngineIOMixin:
         if request_id is None:
             request_id = self._generate_request_id()
 
-        base_sampling_params = sampling_params or SamplingParams(max_tokens=128)
+        base_sampling_params = self._prepare_chat_sampling_params(
+            sampling_params or SamplingParams(max_tokens=128),
+            tools=tools,
+            tool_choice=tool_choice if isinstance(tool_choice, str) else None,
+        )
 
         images, videos = self._multimodal_manager.extract_media_from_messages(messages)
 
@@ -533,6 +808,11 @@ class EngineIOMixin:
             request_id=request_id,
             prompt=prompt,
         )
+        tool_parser_request = self._build_tool_parser_request(
+            prompt=prompt,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
 
         # Add request with vision data
         self._add_request(
@@ -540,6 +820,7 @@ class EngineIOMixin:
             prompt=prompt,
             sampling_params=effective_params,
             prompt_token_ids=prompt_token_ids,
+            tool_parser_request=tool_parser_request,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
             pixel_values_videos=pixel_values_videos,
@@ -573,6 +854,7 @@ class EngineIOMixin:
 
         last_update_seq = -1
         last_accumulated_text = ""
+        last_raw_accumulated_text = ""
         last_accumulated_reasoning = ""
         from ..esurge_engine import CompletionOutput, RequestOutput
 
@@ -584,6 +866,8 @@ class EngineIOMixin:
                 if not self._scheduler_running:
                     self.abort_request(request_id)
                     raise RuntimeError("Background scheduler stopped while streaming multimodal request.")
+                if self._recover_orphaned_request(request_id):
+                    continue
 
                 snapshot = None
                 with self._output_lock:
@@ -604,6 +888,7 @@ class EngineIOMixin:
                                     finish_reason=comp.finish_reason,
                                     tool_calls=comp.tool_calls,
                                     reasoning_content=comp.reasoning_content,
+                                    raw_text=comp.raw_text,
                                 )
                             )
 
@@ -611,6 +896,11 @@ class EngineIOMixin:
                             ro.accumulated_text,
                             last_accumulated_text,
                             ro.delta_text,
+                        )
+                        snapshot_raw_delta = self._compute_snapshot_delta_text(
+                            ro.raw_accumulated_text,
+                            last_raw_accumulated_text,
+                            ro.raw_delta_text or "",
                         )
                         snapshot_reasoning_delta = self._compute_snapshot_delta_text(
                             ro.reasoning_content or "",
@@ -627,6 +917,8 @@ class EngineIOMixin:
                             metrics=dict(ro.metrics) if ro.metrics is not None else None,
                             accumulated_text=ro.accumulated_text,
                             delta_text=snapshot_delta,
+                            raw_accumulated_text=ro.raw_accumulated_text,
+                            raw_delta_text=snapshot_raw_delta,
                             tokens_per_second=ro.tokens_per_second,
                             num_generated_tokens=ro.num_generated_tokens,
                             time_spent_generating=ro.time_spent_generating,
@@ -641,6 +933,7 @@ class EngineIOMixin:
                         )
                         last_update_seq = ro.update_seq
                         last_accumulated_text = ro.accumulated_text
+                        last_raw_accumulated_text = ro.raw_accumulated_text
                         last_accumulated_reasoning = ro.reasoning_content or ""
 
                 if snapshot is not None:
@@ -688,6 +981,8 @@ class EngineIOMixin:
             if not self._scheduler_running:
                 self.abort_request(request_id)
                 raise RuntimeError("Background scheduler stopped while waiting for request completion.")
+            if self._recover_orphaned_request(request_id):
+                continue
             with self._output_lock:
                 output = self._request_outputs.get(request_id)
                 if output is not None and output.finished:

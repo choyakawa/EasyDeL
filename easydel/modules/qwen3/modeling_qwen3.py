@@ -41,7 +41,7 @@ from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers import RMSNorm as RMSNorm
 from easydel.layers.attention import UnifiedAttention
-from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
+from easydel.modules._base import BaseCausalLMModule, BaseEmbeddingModule, BaseSequenceClassificationModule
 
 from .qwen3_configuration import Qwen3Config
 
@@ -227,17 +227,7 @@ class Qwen3DecoderLayer(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        attn_block = Qwen3Attention
-        mlp_block = Qwen3MLP
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
-        self.self_attn = attn_block(
+        self.self_attn = Qwen3Attention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -246,7 +236,7 @@ class Qwen3DecoderLayer(nn.Module):
             layer_idx=layer_idx,
         )
 
-        self.mlp = mlp_block(
+        self.mlp = Qwen3MLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -388,9 +378,15 @@ class Qwen3Model(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        layer_block = auto_remat(
+            Qwen3DecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Qwen3DecoderLayer(
+                layer_block(
                     config=config,
                     layer_idx=layer_idx,
                     dtype=dtype,
@@ -655,4 +651,56 @@ class Qwen3ForSequenceClassification(BaseSequenceClassificationModule[Qwen3Model
             rngs=rngs,
             pooling_strategy="last",
             score_head_bias=False,
+        )
+
+
+@register_module(TaskType.EMBEDDING, config=Qwen3Config, model_type="qwen3")
+class Qwen3ForEmbedding(BaseEmbeddingModule[Qwen3Model, Qwen3Config]):
+    """Qwen3 model for text embedding and similarity tasks.
+
+    Produces dense vector representations by pooling the last hidden state
+    of the Qwen3 transformer and L2-normalizing. Compatible with
+    Qwen3-based embedding checkpoints.
+
+    Uses ``last`` token pooling by default (matching decoder-only embedding
+    conventions where the final token aggregates sequence information).
+
+    Example:
+        >>> model = Qwen3ForEmbedding(config, rngs=rngs)
+        >>> outputs = model(input_ids=input_ids, attention_mask=mask)
+        >>> embeddings = outputs.embeddings  # (batch, hidden_size)
+    """
+
+    _task_type = TaskType.EMBEDDING
+    _model_type = "qwen3"
+    _config_class = Qwen3Config
+
+    def __init__(
+        self,
+        config: Qwen3Config,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike | None = None,
+        *,
+        rngs: nn.Rngs,
+    ):
+        """Initialize Qwen3 embedding model.
+
+        Args:
+            config: Qwen3 model configuration.
+            dtype: Computation data type. Defaults to bfloat16.
+            param_dtype: Parameter data type. Defaults to bfloat16.
+            precision: JAX precision setting.
+            rngs: Flax random number generators.
+        """
+        super().__init__(
+            config=config,
+            base_model_class=Qwen3Model,
+            base_model_name="model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            pooling_strategy="last",
+            normalize_embeddings=True,
         )

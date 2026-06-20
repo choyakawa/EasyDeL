@@ -1,10 +1,22 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Shared pytest fixtures for model testing.
 
 This module provides reusable fixtures for testing EasyDeL models across different
 configurations, attention mechanisms, and hardware setups.
 """
-
-# pyright: reportPrivateLocalImportUsage=false
 
 import gc
 
@@ -57,7 +69,7 @@ def small_model_config():
         "rope_theta": 10000.0,
         "attention_bias": False,
         "tie_word_embeddings": False,
-        "gradient_checkpointing": EasyDeLGradientCheckPointers.NONE,
+        "gradient_checkpointing": EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
         "fcm_min_ratio": -1,
         "fcm_max_ratio": -1,
         "rope_scaling": None,
@@ -87,11 +99,12 @@ def small_model_config():
 
 
 @pytest.fixture(scope="session")
-def jax_mesh():
+def jax_mesh(small_model_config):
     """Create a JAX mesh for distributed computation tests."""
+    dims = small_model_config["sharding_axis_dims"]
     mesh = jax.sharding.Mesh(
-        np.array(jax.devices()).reshape((1, 1, -1, 1, 1)),
-        ("dp", "fsdp", "tp", "sp", "pp"),
+        np.array(jax.devices()).reshape(dims),
+        ("dp", "fsdp", "ep", "tp", "sp"),
     )
     return mesh
 

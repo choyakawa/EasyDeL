@@ -15,11 +15,28 @@
 # pyright:reportUnusedImport=none
 # pyright:reportImportCycles=none
 
+"""EasyDeL: JAX/Flax library for training and serving large language models.
+
+Provides lazy-loaded access to all EasyDeL modules, model implementations,
+trainers, inference engines, and utilities. Configures default environment
+variables and JAX/XLA flags for optimal performance on TPU and GPU
+backends when ``EASYDEL_AUTO`` is enabled (the default).
+
+At import time this module also applies compatibility patches for
+HuggingFace Transformers remote-code models that would otherwise fail
+to load on newer Transformers versions or in environments lacking
+optional dependencies (e.g. ``deepspeed``).
+"""
+
 __version__ = "0.3.0"
 
 import os as _os
+import pickle as _pickle
 import sys as _sys
+import types as _types
 import typing as _tp
+from importlib import machinery as _machinery
+from importlib import util as _importlib_util
 from logging import getLogger as _getlogger
 
 try:
@@ -38,6 +55,33 @@ from .utils import check_bool_flag as _check_bool_flag
 from .utils import is_package_available as _is_package_available
 
 _logger = _get_logger("EasyDeL")
+
+
+def _ensure_optional_deepspeed_stub() -> None:
+    """Provide a minimal deepspeed module for remote-code import checks.
+
+    Some HF Hub remote modules import `deepspeed` unconditionally even when
+    they can run without it. In environments where deepspeed is unavailable,
+    this keeps class loading functional without pretending the full package is
+    installed (`transformers.integrations.deepspeed.is_deepspeed_available()`
+    still returns `False` because distribution metadata is absent).
+    """
+    try:
+        if _importlib_util.find_spec("deepspeed") is not None:
+            return
+    except (ModuleNotFoundError, ValueError):
+        return
+
+    if "deepspeed" in _sys.modules:
+        return
+
+    _stub = _types.ModuleType("deepspeed")
+    _stub.__version__ = "0.0.0"
+    _stub.__spec__ = _machinery.ModuleSpec(name="deepspeed", loader=None)
+    _sys.modules["deepspeed"] = _stub
+
+
+_ensure_optional_deepspeed_stub()
 
 
 def _patch_transformers_import_utils() -> None:
@@ -63,7 +107,13 @@ _patch_transformers_import_utils()
 
 
 def _patch_transformers_rope_scaling_property() -> None:
-    """Normalize HF rope_scaling access for legacy DeepSeek remote modules."""
+    """Normalize HF ``rope_scaling`` property for legacy DeepSeek remote modules.
+
+    DeepSeek v2/v3 remote configs may store ``rope_scaling`` with a ``type``
+    or ``rope_type`` of ``"default"`` or ``None``, which triggers validation
+    errors in newer HF Transformers. This patch returns ``None`` for those
+    cases, effectively disabling rope scaling (the default behavior).
+    """
     try:
         from transformers.configuration_utils import PretrainedConfig as _HFPretrainedConfig
     except Exception:
@@ -98,7 +148,13 @@ _patch_transformers_rope_scaling_property()
 
 
 def _patch_transformers_init_weights_tie_signature() -> None:
-    """Handle legacy remote-model `tie_weights()` signatures on new HF versions."""
+    """Handle legacy remote-model ``tie_weights()`` signature changes.
+
+    Older remote-model code may call ``tie_weights()`` without the
+    ``recompute_mapping`` parameter introduced in newer HF Transformers.
+    This patch catches the resulting ``TypeError`` and falls back to the
+    no-argument call.
+    """
     try:
         from transformers.modeling_utils import PreTrainedModel as _HFPreTrainedModel
     except Exception:
@@ -123,8 +179,71 @@ def _patch_transformers_init_weights_tie_signature() -> None:
 _patch_transformers_init_weights_tie_signature()
 
 
+def _patch_eformer_exception_serialization() -> None:
+    """Replace non-picklable remote exceptions with a safe fallback.
+
+    Some third-party exceptions, including
+    ``google.api_core.exceptions.RetryError``, do not round-trip through
+    ``pickle`` correctly because their constructor signatures do not match
+    their serialized ``Exception.args``. eFormer's Ray bridge stores the
+    original exception object inside ``ExceptionInfo``, so one such error can
+    break exception transport before the parent process sees the real failure.
+
+    This patch keeps the original traceback but swaps the exception object for
+    a plain ``RuntimeError`` when the original cannot be pickled and unpickled
+    safely.
+    """
+    try:
+        from eformer.executor.ray.types import ExceptionInfo as _ExceptionInfo
+    except Exception:
+        return
+
+    original_ser_exc_info = _ExceptionInfo.ser_exc_info.__func__
+    if getattr(original_ser_exc_info, "_easydel_picklable_exc_patch", False):
+        return
+
+    def _coerce_picklable_exception(exception: BaseException | None) -> BaseException | None:
+        if exception is None:
+            return None
+        try:
+            _pickle.loads(_pickle.dumps(exception))
+            return exception
+        except Exception:
+            exc_type = f"{exception.__class__.__module__}.{exception.__class__.__qualname__}"
+            try:
+                message = str(exception)
+            except Exception:
+                message = repr(exception)
+            fallback = RuntimeError(f"{exc_type}: {message}")
+            notes = getattr(exception, "__notes__", None)
+            if notes:
+                for note in notes:
+                    try:
+                        fallback.add_note(note)
+                    except Exception:
+                        break
+            return fallback
+
+    def _patched_ser_exc_info(cls, exception: BaseException | None = None):
+        exc_info = original_ser_exc_info(cls, exception)
+        exc_info.ex = _coerce_picklable_exception(exc_info.ex)
+        return exc_info
+
+    _patched_ser_exc_info._easydel_picklable_exc_patch = True  # type: ignore[attr-defined]
+    _ExceptionInfo.ser_exc_info = classmethod(_patched_ser_exc_info)
+
+
+_patch_eformer_exception_serialization()
+
+
 def _patch_transformers_autoconfig_gated_repo_skip() -> None:
-    """Convert gated-repo config load failures to pytest skips."""
+    """Convert gated-repo config load failures to ``pytest.skip``.
+
+    When running under pytest (``PYTEST_CURRENT_TEST`` is set), an
+    ``OSError`` raised by ``AutoConfig.from_pretrained`` for gated
+    HuggingFace repos is caught and re-raised as ``unittest.SkipTest``
+    so the test is skipped rather than failing.
+    """
     try:
         from transformers import AutoConfig as _HFAutoConfig
     except Exception:
@@ -192,7 +311,7 @@ if _check_bool_flag("EASYDEL_AUTO", True):
     _os.environ["KMP_AFFINITY"] = "noverbose"
     _os.environ["GRPC_VERBOSITY"] = "ERROR"
     _os.environ["GLOG_minloglevel"] = "3"
-
+    _os.environ.setdefault("HF_ALLOW_CODE_EVAL", "1")
     _os.environ["CACHE_TRITON_KERNELS"] = "1"
     _os.environ["TPU_MIN_LOG_LEVEL"] = "4"
     _os.environ["TPU_STDERR_LOG_LEVEL"] = "4"
@@ -200,11 +319,6 @@ if _check_bool_flag("EASYDEL_AUTO", True):
     _os.environ["TPU_LOG_DIR"] = "disabled"
     _os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-    _os.environ["JAX_ENABLE_PGLE"] = "true"
-    _os.environ["JAX_CAPTURED_CONSTANTS_WARN_BYTES"] = "-1"
-
-    _os.environ["JAX_PGLE_PROFILING_RUNS"] = "3"
-    _os.environ["JAX_PGLE_AGGREGATION_PERCENTILE"] = "85"
     _os.environ["XLA_FLAGS"] = (
         _os.getenv("XLA_FLAGS", "") + " "
         "--xla_gpu_triton_gemm_any=true  "
@@ -265,6 +379,8 @@ _import_structure = {
         "ejit",
         "ePath",
         "ePathLike",
+        "is_inference_mode",
+        "set_inference_mode",
         "traversals",
     ],
     "inference": [
@@ -293,6 +409,7 @@ _import_structure = {
         "Rngs",
         "auto_pytree",
         "eLargeModel",
+        "BenchmarkConfig",
         "escale",
         "init_cluster",
     ],
@@ -319,6 +436,7 @@ _import_structure = {
         "EasyDeLQuantizationConfig",
         "EasyQuantizer",
         "QuantizationType",
+        "TurboQuantConfig",
     ],
     "operations": [
         "AttentionConfig",
@@ -361,8 +479,10 @@ _import_structure = {
         "AutoEasyDeLModel",
         "AutoEasyDeLModelForCausalLM",
         "AutoEasyDeLModelForDiffusionLM",
+        "AutoEasyDeLModelForEmbedding",
         "AutoEasyDeLModelForImageTextToText",
         "AutoEasyDeLModelForSeq2SeqLM",
+        "AutoEasyDeLModelForEmbedding",
         "AutoEasyDeLModelForSequenceClassification",
         "AutoEasyDeLModelForSpeechSeq2Seq",
         "AutoEasyDeLModelForZeroShotImageClassification",
@@ -372,6 +492,7 @@ _import_structure = {
         "AutoStateAnyToAnyModel",
         "AutoStateForCausalLM",
         "AutoStateForDiffusionLM",
+        "AutoStateForEmbedding",
         "AutoStateForImageSequenceClassification",
         "AutoStateForImageTextToText",
         "AutoStateForSeq2SeqLM",
@@ -473,6 +594,18 @@ _import_structure = {
         "Gemma3TextConfig",
         "Gemma3TextModel",
     ],
+    "modules.gemma4": [
+        "Gemma4Config",
+        "Gemma4ForCausalLM",
+        "Gemma4ForConditionalGeneration",
+        "Gemma4Model",
+        "Gemma4MultimodalEmbedder",
+        "Gemma4RMSNorm",
+        "Gemma4TextConfig",
+        "Gemma4TextModel",
+        "Gemma4VisionConfig",
+        "Gemma4VisionModel",
+    ],
     "modules.gidd": [
         "GiddConfig",
         "GiddModel",
@@ -500,6 +633,11 @@ _import_structure = {
         "Glm4MoeLiteConfig",
         "Glm4MoeLiteForCausalLM",
         "Glm4MoeLiteModel",
+    ],
+    "modules.glm_moe_dsa": [
+        "GlmMoeDsaConfig",
+        "GlmMoeDsaForCausalLM",
+        "GlmMoeDsaModel",
     ],
     "modules.glm4v": [
         "Glm4vConfig",
@@ -675,6 +813,7 @@ _import_structure = {
     "modules.qwen2": [
         "Qwen2Config",
         "Qwen2ForCausalLM",
+        "Qwen2ForEmbedding",
         "Qwen2ForSequenceClassification",
         "Qwen2Model",
     ],
@@ -689,9 +828,28 @@ _import_structure = {
         "Qwen2VLForConditionalGeneration",
         "Qwen2VLModel",
     ],
+    "modules.qwen3_5": [
+        "Qwen3_5Config",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5Model",
+        "Qwen3_5TextConfig",
+        "Qwen3_5TextModel",
+        "Qwen3_5VisionConfig",
+    ],
+    "modules.qwen3_5_moe": [
+        "Qwen3_5MoeConfig",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5MoeModel",
+        "Qwen3_5MoeTextConfig",
+        "Qwen3_5MoeTextModel",
+        "Qwen3_5MoeVisionConfig",
+    ],
     "modules.qwen3": [
         "Qwen3Config",
         "Qwen3ForCausalLM",
+        "Qwen3ForEmbedding",
         "Qwen3ForSequenceClassification",
         "Qwen3Model",
     ],
@@ -798,43 +956,66 @@ _import_structure = {
         "Xerxes2Model",
     ],
     "trainers": [
-        "BaseTrainer",
+        "AgenticMoshPitConfig",
+        "AgenticMoshPitTrainer",
         "BCOConfig",
+        "BCOPreprocessTransform",
         "BCOTrainer",
+        "BaseTrainer",
         "CPOConfig",
+        "CPOPreprocessTransform",
         "CPOTrainer",
+        "DPOConfig",
+        "DPOPreprocessTransform",
+        "DPOTrainer",
         "DistillationConfig",
         "DistillationTrainer",
-        "DPOConfig",
-        "DPOTrainer",
+        "EmbeddingConfig",
+        "EmbeddingTrainer",
         "GFPOConfig",
         "GFPOTrainer",
         "GKDConfig",
         "GKDTrainer",
         "GRPOConfig",
+        "GRPOPreprocessTransform",
         "GRPOTrainer",
         "GSPOConfig",
         "GSPOTrainer",
         "KTOConfig",
+        "KTOPreprocessTransform",
         "KTOTrainer",
+        "LogWatcher",
         "NashMDConfig",
         "NashMDTrainer",
-        "PPOConfig",
-        "PPOTrainer",
-        "XPOConfig",
-        "XPOTrainer",
         "ORPOConfig",
+        "ORPOPreprocessTransform",
         "ORPOTrainer",
+        "OnPolicyDistillationConfig",
+        "OnPolicyDistillationTrainer",
+        "PPOConfig",
+        "PPOPreprocessTransform",
+        "PPOTrainer",
+        "RLVRConfig",
+        "RLVRTrainer",
         "RayDistributedTrainer",
         "RewardConfig",
+        "RewardPreprocessTransform",
         "RewardTrainer",
         "SDPOConfig",
         "SDPOTrainer",
         "SFTConfig",
+        "SFTPreprocessTransform",
         "SFTTrainer",
+        "SeqKDConfig",
+        "SeqKDTrainer",
+        "SparseDistillationConfig",
+        "SparseDistillationTrainer",
         "Trainer",
         "TrainingArguments",
+        "XPOConfig",
+        "XPOTrainer",
         "pack_sequences",
+        "prompt_transforms",
     ],
 }
 
@@ -857,6 +1038,7 @@ if _tp.TYPE_CHECKING:
     )
     from .inference.evaluations import eSurgeLMEvalAdapter
     from .infra import (
+        BenchmarkConfig,
         EasyDeLBaseConfig,
         EasyDeLBaseConfigDict,
         EasyDeLBaseModule,
@@ -881,7 +1063,7 @@ if _tp.TYPE_CHECKING:
     from .infra.factory import ConfigType, TaskType, register_config, register_module
     from .layers.attention import AttentionMechanisms, AttentionModule, FlexibleAttentionModule
     from .layers.moe import MoEMethods
-    from .layers.quantization import EasyDeLQuantizationConfig, EasyQuantizer, QuantizationType
+    from .layers.quantization import EasyDeLQuantizationConfig, EasyQuantizer, QuantizationType, TurboQuantConfig
     from .modules.arctic import ArcticConfig, ArcticForCausalLM, ArcticModel
     from .modules.auto import (
         AutoEasyDeLAnyToAnyModel,
@@ -889,6 +1071,7 @@ if _tp.TYPE_CHECKING:
         AutoEasyDeLModel,
         AutoEasyDeLModelForCausalLM,
         AutoEasyDeLModelForDiffusionLM,
+        AutoEasyDeLModelForEmbedding,
         AutoEasyDeLModelForImageTextToText,
         AutoEasyDeLModelForSeq2SeqLM,
         AutoEasyDeLModelForSequenceClassification,
@@ -900,6 +1083,7 @@ if _tp.TYPE_CHECKING:
         AutoStateAnyToAnyModel,
         AutoStateForCausalLM,
         AutoStateForDiffusionLM,
+        AutoStateForEmbedding,
         AutoStateForImageSequenceClassification,
         AutoStateForImageTextToText,
         AutoStateForSeq2SeqLM,
@@ -947,6 +1131,18 @@ if _tp.TYPE_CHECKING:
         Gemma3TextConfig,
         Gemma3TextModel,
     )
+    from .modules.gemma4 import (
+        Gemma4Config,
+        Gemma4ForCausalLM,
+        Gemma4ForConditionalGeneration,
+        Gemma4Model,
+        Gemma4MultimodalEmbedder,
+        Gemma4RMSNorm,
+        Gemma4TextConfig,
+        Gemma4TextModel,
+        Gemma4VisionConfig,
+        Gemma4VisionModel,
+    )
     from .modules.gidd import GiddConfig, GiddForDiffusionLM, GiddModel
     from .modules.glm import GlmConfig, GlmForCausalLM, GlmForSequenceClassification, GlmModel
     from .modules.glm4 import Glm4Config, Glm4ForCausalLM, Glm4ForSequenceClassification, Glm4Model
@@ -971,6 +1167,7 @@ if _tp.TYPE_CHECKING:
         Glm4vMoeVisionModel,
     )
     from .modules.glm46v import Glm46VConfig, Glm46VForConditionalGeneration, Glm46VModel
+    from .modules.glm_moe_dsa import GlmMoeDsaConfig, GlmMoeDsaForCausalLM, GlmMoeDsaModel
     from .modules.gpt2 import GPT2Config, GPT2LMHeadModel, GPT2Model
     from .modules.gpt_j import GPTJConfig, GPTJForCausalLM, GPTJModel
     from .modules.gpt_neox import GPTNeoXConfig, GPTNeoXForCausalLM, GPTNeoXModel
@@ -1012,10 +1209,40 @@ if _tp.TYPE_CHECKING:
     from .modules.phi3 import Phi3Config, Phi3ForCausalLM, Phi3Model
     from .modules.phimoe import PhiMoeConfig, PhiMoeForCausalLM, PhiMoeModel
     from .modules.pixtral import PixtralVisionConfig, PixtralVisionModel
-    from .modules.qwen2 import Qwen2Config, Qwen2ForCausalLM, Qwen2ForSequenceClassification, Qwen2Model
+    from .modules.qwen2 import (
+        Qwen2Config,
+        Qwen2ForCausalLM,
+        Qwen2ForEmbedding,
+        Qwen2ForSequenceClassification,
+        Qwen2Model,
+    )
     from .modules.qwen2_moe import Qwen2MoeConfig, Qwen2MoeForCausalLM, Qwen2MoeForSequenceClassification, Qwen2MoeModel
     from .modules.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration, Qwen2VLModel
-    from .modules.qwen3 import Qwen3Config, Qwen3ForCausalLM, Qwen3ForSequenceClassification, Qwen3Model
+    from .modules.qwen3 import (
+        Qwen3Config,
+        Qwen3ForCausalLM,
+        Qwen3ForEmbedding,
+        Qwen3ForSequenceClassification,
+        Qwen3Model,
+    )
+    from .modules.qwen3_5 import (
+        Qwen3_5Config,
+        Qwen3_5ForCausalLM,
+        Qwen3_5ForConditionalGeneration,
+        Qwen3_5Model,
+        Qwen3_5TextConfig,
+        Qwen3_5TextModel,
+        Qwen3_5VisionConfig,
+    )
+    from .modules.qwen3_5_moe import (
+        Qwen3_5MoeConfig,
+        Qwen3_5MoeForCausalLM,
+        Qwen3_5MoeForConditionalGeneration,
+        Qwen3_5MoeModel,
+        Qwen3_5MoeTextConfig,
+        Qwen3_5MoeTextModel,
+        Qwen3_5MoeVisionConfig,
+    )
     from .modules.qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM, Qwen3MoeForSequenceClassification, Qwen3MoeModel
     from .modules.qwen3_next import (
         Qwen3NextConfig,
@@ -1115,41 +1342,66 @@ if _tp.TYPE_CHECKING:
         VanillaAttn,
     )
     from .trainers import (
+        AgenticMoshPitConfig,
+        AgenticMoshPitTrainer,
         BaseTrainer,
         BCOConfig,
+        BCOPreprocessTransform,
         BCOTrainer,
         CPOConfig,
+        CPOPreprocessTransform,
         CPOTrainer,
         DistillationConfig,
         DistillationTrainer,
         DPOConfig,
+        DPOPreprocessTransform,
         DPOTrainer,
+        EmbeddingConfig,
+        EmbeddingTrainer,
         GFPOConfig,
         GFPOTrainer,
         GKDConfig,
         GKDTrainer,
         GRPOConfig,
+        GRPOPreprocessTransform,
         GRPOTrainer,
         GSPOConfig,
         GSPOTrainer,
         KTOConfig,
+        KTOPreprocessTransform,
         KTOTrainer,
+        LogWatcher,
         NashMDConfig,
         NashMDTrainer,
+        OnPolicyDistillationConfig,
+        OnPolicyDistillationTrainer,
         ORPOConfig,
+        ORPOPreprocessTransform,
         ORPOTrainer,
+        PPOConfig,
+        PPOPreprocessTransform,
+        PPOTrainer,
         RayDistributedTrainer,
         RewardConfig,
+        RewardPreprocessTransform,
         RewardTrainer,
+        RLVRConfig,
+        RLVRTrainer,
         SDPOConfig,
         SDPOTrainer,
+        SeqKDConfig,
+        SeqKDTrainer,
         SFTConfig,
+        SFTPreprocessTransform,
         SFTTrainer,
+        SparseDistillationConfig,
+        SparseDistillationTrainer,
         Trainer,
         TrainingArguments,
         XPOConfig,
         XPOTrainer,
         pack_sequences,
+        prompt_transforms,
     )
     from .utils import (
         ModelConverter,
@@ -1159,6 +1411,8 @@ if _tp.TYPE_CHECKING:
         ejit,
         ePath,
         ePathLike,
+        is_inference_mode,
+        set_inference_mode,
         traversals,
     )
 else:
@@ -1170,8 +1424,8 @@ else:
         extra_objects={"__version__": __version__},
     )
 
-    _targeted_eformer_versions = ["0.0.98"]
-    _targeted_ejkernel_versions = ["0.0.66"]
+    _targeted_eformer_versions = ["0.0.99.12"]
+    _targeted_ejkernel_versions = ["0.0.78"]
 
     from eformer import __version__ as _eform_version
     from ejkernel import __version__ as _ejker_version
@@ -1197,19 +1451,24 @@ else:
 
 
 # Keep import side effects minimal: distributed/JAX backend initialization is opt-in.
-_distributed_init_enabled = _check_bool_flag("ENABLE_DISTRIBUTED_INIT", False)
+_os.environ.setdefault("JAX_ENABLE_PREEMPTION_SERVICE", "true")
+_distributed_init_enabled = _check_bool_flag("ENABLE_DISTRIBUTED_INIT", True)
 if _distributed_init_enabled:
-    from eformer.executor import DistributedConfig as _DistributedConfig
+    import jax as _jax
 
-    try:
-        _DistributedConfig().initialize()
-    except RuntimeError as e:
-        _logger.warning(
-            f"Failed to initialize jax-dist if you have initialized that manually you can ignore this warning {e}"
-        )
-    except Exception:  # maybe it's a single process
-        _logger.warning("Failed to initialize jax-dist")
-    del _DistributedConfig
+    _jax.config.update("jax_enable_preemption_service", True)
+    if _jax.distributed.is_initialized():
+        _logger.debug("JAX distributed already initialized; using existing setup.")
+    else:
+        from eformer.executor import DistributedConfig as _DistributedConfig
+
+        try:
+            _DistributedConfig().initialize()
+        except RuntimeError:
+            if _jax.distributed.is_initialized():
+                _logger.debug("JAX distributed already initialized; using existing setup.")
+            else:
+                raise
 else:
     _distributed_msg = (
         "Skipping initialization of `DistributedConfig` (ENABLE_DISTRIBUTED_INIT=0), "

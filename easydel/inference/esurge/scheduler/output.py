@@ -324,8 +324,26 @@ class SchedulerOutput:
     finished_req_ids: set[str]
     """Set of request IDs that finished in the previous scheduling step."""
 
+    preempted_req_ids: set[str] = field(default_factory=set)
+    """Set of request IDs that were preempted (evicted from running to waiting)."""
+
     suggested_bucket: int | None = None
     """Optimal bucket size hint for runner's buffer selection."""
 
-    async_scheduling: bool = False
+    async_scheduling: bool = True
     """Enable async token sampling for overlapped execution."""
+
+    num_running_reqs: int = 0
+    """Snapshot of total running requests after scheduling."""
+
+    num_waiting_reqs: int = 0
+    """Snapshot of total waiting requests after scheduling."""
+
+    free_pages: int | None = None
+    """Number of free KV-cache pages after scheduling."""
+
+    token_budget_initial: int | None = None
+    """Token budget available at the start of scheduling."""
+
+    token_budget_remaining: int | None = None
+    """Token budget remaining after scheduling."""

@@ -64,9 +64,6 @@ from pydantic import BaseModel, Field
 
 from .openai_api_modules import ChatCompletionRequest, CompletionRequest, ResponsesRequest
 
-if tp.TYPE_CHECKING:
-    from pydantic import BaseModel
-
 TIMEOUT_KEEP_ALIVE = 5.0
 
 
@@ -397,6 +394,7 @@ class InferenceApiRouter:
             "top_p": request.top_p,
             "frequency_penalty": request.frequency_penalty,
             "presence_penalty": request.presence_penalty,
+            "repetition_penalty": request.repetition_penalty,
             "stop": request.stop,
             "stream": request.stream,
             "n": request.n,
@@ -427,6 +425,7 @@ class InferenceApiRouter:
             "top_p": request.top_p,
             "frequency_penalty": request.frequency_penalty,
             "presence_penalty": request.presence_penalty,
+            "repetition_penalty": request.repetition_penalty,
             "stop": request.stop,
             "stream": request.stream,
             "n": request.n,

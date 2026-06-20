@@ -1,6 +1,18 @@
-"""Tests for GLM4V model."""
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-# pyright: reportPrivateLocalImportUsage=false
+"""Tests for GLM4V model."""
 
 import numpy as np
 import pytest
@@ -80,6 +92,7 @@ class TestGlm4v:
             "pixel_values_shape": (total_patches, patch_features),
             "image_grid_thw": image_grid_thw,
             "num_images": num_images_per_batch,
+            "use_mm_token_type_ids": True,
         }
 
     def test_vision_language(self, glm4v_config, small_model_config, vlm_config, hf_glm4v_class):

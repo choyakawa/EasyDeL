@@ -59,7 +59,7 @@ from easydel.infra.modeling_outputs import (
     Seq2SeqModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN
+from easydel.infra.utils import ACT2FN, auto_remat
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import LayerNorm
@@ -275,6 +275,7 @@ class WhisperAttention(AttentionModule):
         query_states = self._split_heads(query_states)
         key_states = self._split_heads(key_states)
         value_states = self._split_heads(value_states)
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
         init_attention_bias = lambda: None  # noqa
 
@@ -436,15 +437,17 @@ class WhisperEncoderLayer(nn.Module):
             key_value_states=None,
         )
         hidden_states = self.dropout_layer(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = checkpoint_name(residual + hidden_states, "residual")
 
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = self.activation_fn(self.fc1(hidden_states))
+        hidden_states = checkpoint_name(self.fc1(hidden_states), "mlp_up")
+        hidden_states = self.activation_fn(hidden_states)
         hidden_states = self.activation_dropout_layer(hidden_states)
         hidden_states = checkpoint_name(self.fc2(hidden_states), "mlp_down")
         hidden_states = self.dropout_layer(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = checkpoint_name(residual + hidden_states, "residual")
+        hidden_states = checkpoint_name(hidden_states, "layer_output")
 
         outputs = (hidden_states,)
 
@@ -613,7 +616,7 @@ class WhisperDecoderLayer(nn.Module):
             cache_metadata=cache_metadata,
         )
         hidden_states = self.dropout_layer(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = checkpoint_name(residual + hidden_states, "residual")
 
         # Cross-Attention Block
         cross_attn_weights = None
@@ -627,16 +630,18 @@ class WhisperDecoderLayer(nn.Module):
                 key_value_states=encoder_hidden_states,
             )
             hidden_states = self.dropout_layer(hidden_states)
-            hidden_states = residual + hidden_states
+            hidden_states = checkpoint_name(residual + hidden_states, "residual")
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = self.activation_fn(self.fc1(hidden_states))
+        hidden_states = checkpoint_name(self.fc1(hidden_states), "mlp_up")
+        hidden_states = self.activation_fn(hidden_states)
         hidden_states = self.activation_dropout_layer(hidden_states)
         hidden_states = checkpoint_name(self.fc2(hidden_states), "mlp_down")
         hidden_states = self.dropout_layer(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = checkpoint_name(residual + hidden_states, "residual")
+        hidden_states = checkpoint_name(hidden_states, "layer_output")
         outputs = (hidden_states,)
 
         if output_attentions:
@@ -724,7 +729,12 @@ class WhisperEncoder(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        block = WhisperEncoderLayer
+        block = auto_remat(
+            WhisperEncoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
                 block(
@@ -794,7 +804,7 @@ class WhisperEncoder(EasyDeLBaseModule):
 
         embed_positions = self.embed_positions(jnp.arange(self.config.max_source_positions))
         embed_positions = jax.lax.stop_gradient(embed_positions)
-        hidden_states = hidden_states + embed_positions
+        hidden_states = checkpoint_name(hidden_states + embed_positions, "embeddings")
 
         hidden_states = self.dropout_layer(hidden_states)
 
@@ -820,7 +830,7 @@ class WhisperEncoder(EasyDeLBaseModule):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        hidden_states = self.layer_norm(hidden_states)
+        hidden_states = checkpoint_name(self.layer_norm(hidden_states), "model_output")
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
@@ -895,9 +905,15 @@ class WhisperDecoder(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = auto_remat(
+            WhisperDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                WhisperDecoderLayer(
+                remat_layer_block(
                     config=config,
                     dtype=dtype,
                     param_dtype=param_dtype,
@@ -967,7 +983,7 @@ class WhisperDecoder(EasyDeLBaseModule):
             )
             encoder_mask_info = MaskInfo.from_attention_mask(cross_attention_mask)
 
-        inputs_embeds = self.embed_tokens(input_ids)
+        inputs_embeds = checkpoint_name(self.embed_tokens(input_ids), "embeddings")
         if position_ids is None:
             position_ids = (
                 jnp.arange(inputs_embeds.shape[1])
@@ -981,7 +997,7 @@ class WhisperDecoder(EasyDeLBaseModule):
         position_ids = position_ids.astype("i4")
         position_embeds = self.embed_positions(position_ids)
 
-        hidden_states = inputs_embeds + position_embeds
+        hidden_states = checkpoint_name(inputs_embeds + position_embeds, "embeddings")
         hidden_states = self.dropout_layer(hidden_states)
 
         all_hidden_states = () if output_hidden_states else None
@@ -1031,7 +1047,7 @@ class WhisperDecoder(EasyDeLBaseModule):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        hidden_states = self.layer_norm(hidden_states)
+        hidden_states = checkpoint_name(self.layer_norm(hidden_states), "model_output")
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
@@ -1457,7 +1473,7 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
         )
         lm_logits = None
         if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
+            lm_logits = self.compute_lm_logits(hidden_states)
 
         return Seq2SeqLMOutput(
             logits=lm_logits,

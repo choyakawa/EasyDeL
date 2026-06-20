@@ -69,6 +69,7 @@ TASK_ALIASES: dict[str, TaskType] = {
     "image_text_to_text": TaskType.IMAGE_TEXT_TO_TEXT,
     "zero_shot_image_classification": TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION,
     "diffusion_lm": TaskType.DIFFUSION_LM,
+    "embedding": TaskType.EMBEDDING,
     "base": TaskType.BASE_MODULE,
 }
 
@@ -206,6 +207,9 @@ def infer_task_from_hf_config(model_name_or_path: str) -> TaskType | None:
         elif "ForZeroShotImageClassification" in arch:
             return TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION
 
+        elif "ForEmbedding" in arch or "ForSentenceEmbedding" in arch:
+            return TaskType.EMBEDDING
+
         if "vision" in model_type or "clip" in model_type:
             return TaskType.BASE_VISION
         elif "diffusion" in model_type:
@@ -225,7 +229,21 @@ def infer_task_from_hf_config(model_name_or_path: str) -> TaskType | None:
 
 
 class AutoEasyDeLConfig:
-    """Factory helpers to load EasyDeL configs from identifiers or checkpoints."""
+    """Factory class for automatically loading EasyDeL model configurations.
+
+    Provides ``from_pretrained`` to load a model config from a HuggingFace Hub
+    identifier or local checkpoint path, automatically resolving the correct
+    config class based on the model type and task. Supports auto-binding of
+    task types from model architectures, sharding configuration, and
+    conversion from PyTorch configs.
+
+    Example::
+
+        config = AutoEasyDeLConfig.from_pretrained(
+            "meta-llama/Llama-2-7b",
+            sharding_axis_dims=(1, -1, 1, 1, 1),
+        )
+    """
 
     @staticmethod
     def bind_model_task(model_task: TaskType, architectures: list[str] | str):
@@ -356,13 +374,7 @@ class AutoShardAndGatherFunctions:
         """
         _, module = get_modules_by_type(config.model_type, model_task)
         model = module.lazy_init(config=config, rngs=flax.nnx.Rngs(0))
-        if partition_rules is None:
-            try:
-                partition_rules = config.get_partition_rules(True)
-            except Exception:
-                partition_rules = None
-        if partition_rules is None:
-            partition_rules = model.resolve_shardings_automatically()
+        partition_rules = model._get_partition_rules(partition_rules)
 
         partition_specs = match_partition_rules(partition_rules, model.graphtree_shape)
 

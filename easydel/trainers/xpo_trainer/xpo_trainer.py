@@ -186,6 +186,7 @@ class XPOTrainer(GRPOTrainer):
         )
 
         self._train_shared_fn_static_args = (
+            self.arguments.logprob_vocab_chunk_size,
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
@@ -194,6 +195,7 @@ class XPOTrainer(GRPOTrainer):
             straight_through_emulator,
         )
         self._eval_shared_fn_static_args = (
+            self.arguments.logprob_vocab_chunk_size,
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
@@ -202,7 +204,7 @@ class XPOTrainer(GRPOTrainer):
             straight_through_emulator,
         )
 
-        static_argnums = (3, 4, 5, 6, 7, 8)
+        static_argnums = (3, 4, 5, 6, 7, 8, 9)
         sharded_training_step_function = ejit(
             xpo_step,
             in_shardings=(self.state_shardings, empty_sharding, self.ref_state.shardings),
@@ -239,6 +241,9 @@ class XPOTrainer(GRPOTrainer):
         *,
         prompt_texts: list[str] | None,
         completion_texts: list[str] | None,
+        raw_text: list[str] | None = None,
+        reasoning: list[str | None] | None = None,
+        tool_calls: list[tp.Any | None] | None = None,
     ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
         """Score completions using configured reward functions.
 
@@ -305,11 +310,19 @@ class XPOTrainer(GRPOTrainer):
                     ).logits[:, 0]
                     values = jnp.asarray(logits, dtype=jnp.float32)
                 else:
-                    outputs = reward_func(
+                    reward_call_kwargs = self._build_reward_call_kwargs(
+                        reward_func,
                         prompts=prompt_texts,
                         completions=completion_texts,
+                        raw_completions=raw_text,
+                        prompt_texts=prompt_texts,
+                        completion_texts=completion_texts,
+                        raw_text=raw_text,
+                        reasoning=reasoning,
+                        tool_calls=tool_calls,
                         max_length=self.arguments.max_length,
                     )
+                    outputs = reward_func(**reward_call_kwargs)
                     values = jnp.asarray(np.asarray(list(outputs), dtype=np.float32))
             rewards.append(values)
             breakdown[name] = values
@@ -413,18 +426,49 @@ class XPOTrainer(GRPOTrainer):
                     skip_special_tokens=True,
                 )
             )
-            policy_texts = list(
-                self.processing_class.batch_decode(
-                    np.asarray(jax.device_get(policy_completion_ids)),
-                    skip_special_tokens=True,
+            policy_texts = self._coerce_generation_texts(policy_results.text)
+            ref_texts = self._coerce_generation_texts(ref_results.text)
+            if not policy_texts:
+                policy_texts = list(
+                    self.processing_class.batch_decode(
+                        np.asarray(jax.device_get(policy_completion_ids)),
+                        skip_special_tokens=True,
+                    )
                 )
-            )
-            ref_texts = list(
-                self.processing_class.batch_decode(
-                    np.asarray(jax.device_get(ref_completion_ids)),
-                    skip_special_tokens=True,
+            if not ref_texts:
+                ref_texts = list(
+                    self.processing_class.batch_decode(
+                        np.asarray(jax.device_get(ref_completion_ids)),
+                        skip_special_tokens=True,
+                    )
                 )
-            )
+
+        policy_raw_texts = self._coerce_generation_texts(
+            policy_results.raw_text,
+            fallback=policy_texts,
+        )
+        ref_raw_texts = self._coerce_generation_texts(
+            ref_results.raw_text,
+            fallback=ref_texts,
+        )
+        policy_target_len = int(policy_completion_ids.shape[0])
+        ref_target_len = int(ref_completion_ids.shape[0])
+        policy_reasoning = self._coerce_optional_generation_texts(
+            policy_results.reasoning,
+            target_len=policy_target_len,
+        )
+        policy_tool_calls = self._coerce_generation_metadata_list(
+            policy_results.tool_calls,
+            target_len=policy_target_len,
+        )
+        ref_reasoning = self._coerce_optional_generation_texts(
+            ref_results.reasoning,
+            target_len=ref_target_len,
+        )
+        ref_tool_calls = self._coerce_generation_metadata_list(
+            ref_results.tool_calls,
+            target_len=ref_target_len,
+        )
 
         policy_scores, reward_breakdown = self._score_rewards(
             prompt_ids,
@@ -433,6 +477,9 @@ class XPOTrainer(GRPOTrainer):
             policy_completion_mask,
             prompt_texts=prompt_texts,
             completion_texts=policy_texts,
+            raw_text=policy_raw_texts,
+            reasoning=policy_reasoning,
+            tool_calls=policy_tool_calls,
         )
         ref_scores, _ = self._score_rewards(
             prompt_ids,
@@ -441,6 +488,9 @@ class XPOTrainer(GRPOTrainer):
             ref_completion_mask,
             prompt_texts=prompt_texts,
             completion_texts=ref_texts,
+            raw_text=ref_raw_texts,
+            reasoning=ref_reasoning,
+            tool_calls=ref_tool_calls,
         )
 
         if self.arguments.missing_eos_penalty is not None:
@@ -471,6 +521,28 @@ class XPOTrainer(GRPOTrainer):
         }
         for name, value in reward_breakdown.items():
             metrics_dict[f"reward/{name}"] = float(jnp.mean(value))
+        self._log_training_generations_to_wandb(
+            state=state,
+            prompts=prompt_texts if prompt_texts is not None else prompt_ids,
+            prompt_mask=None if prompt_texts is not None else prompt_mask,
+            completions=policy_texts,
+            completion_mask=policy_completion_mask,
+            generation_time=policy_generation_time,
+            reasoning=policy_reasoning,
+            tool_calls=policy_tool_calls,
+            source="policy",
+        )
+        self._log_training_generations_to_wandb(
+            state=state,
+            prompts=prompt_texts if prompt_texts is not None else prompt_ids,
+            prompt_mask=None if prompt_texts is not None else prompt_mask,
+            completions=ref_texts,
+            completion_mask=ref_completion_mask,
+            generation_time=ref_generation_time,
+            reasoning=ref_reasoning,
+            tool_calls=ref_tool_calls,
+            source="reference",
+        )
 
         processed_batch = {
             "prompt_ids": self._all_gather(prompt_ids),

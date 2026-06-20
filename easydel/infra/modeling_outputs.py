@@ -411,6 +411,9 @@ class EmbeddingInfo:
             May be modified for multimodal inputs.
         rope_deltas: Delta values for multi-dimensional RoPE computation.
             Used in models like Qwen2-VL for spatial-temporal positional encoding.
+        per_layer_inputs: Auxiliary per-layer token embeddings for models that
+            need extra residual inputs when calling the forward pass with
+            precomputed `inputs_embeds`.
         visual_pos_masks: Masks indicating positions of visual tokens in the
             sequence. Shape: (batch_size, sequence_length).
         deepstack_visual_embeds: List of visual embeddings at different layers
@@ -429,6 +432,7 @@ class EmbeddingInfo:
 
     position_ids: Array | None = None
     rope_deltas: Array | None = None
+    per_layer_inputs: Array | None = None
     visual_pos_masks: Array | None = None
     deepstack_visual_embeds: list[Array] | None = None
     deepstack_image_embeds: list[Array] | None = None
@@ -1114,6 +1118,40 @@ class SequenceClassifierOutput(ModelOutput):
     past_key_values: TransformerCache | None = None
     loss: Array | None = None
     aux_loss: Array | None = None
+
+
+@auto_pytree
+class EmbeddingOutput(ModelOutput):
+    """Output class for embedding models.
+
+    Used for models that produce dense vector representations of input
+    sequences for tasks like semantic search, retrieval, clustering, and
+    similarity computation.
+
+    Attributes:
+        embeddings: Pooled and optionally L2-normalized embedding vectors.
+            Shape: ``(batch_size, embedding_dim)``.
+        hidden_states: Tuple of Arrays (one for the output of the embeddings +
+            one for the output of each layer). Shape of each:
+            ``(batch_size, sequence_length, hidden_size)``.
+        attentions: Tuple of Arrays (one for each layer). Shape of each:
+            ``(batch_size, num_heads, sequence_length, sequence_length)``.
+        past_key_values: Cached key-values for efficient generation.
+        loss: Optional contrastive loss when training with paired examples.
+
+    Example:
+        >>> output = EmbeddingOutput(
+        ...     embeddings=jnp.ones((2, 768)),  # 2 sequences, 768-dim embeddings
+        ... )
+        >>> output.embeddings.shape
+        (2, 768)
+    """
+
+    embeddings: Array = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
+    past_key_values: TransformerCache | None = None
+    loss: Array | None = None
 
 
 @auto_pytree

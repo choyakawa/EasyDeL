@@ -22,6 +22,7 @@ import typing
 from typing import Any
 
 from easydel.inference.sampling_params import SamplingParams
+from easydel.inference.stream_protocol import compute_stream_delta_text
 from easydel.workers.esurge.pipeline import DetokenizerResult
 
 from ..logger import logger
@@ -32,6 +33,17 @@ WORKER_DRAIN_INITIAL_DELAY = 0.1
 
 
 class EngineUtilsMixin:
+    """Mixin providing utility helpers for the eSurge engine.
+
+    Contains shared helper methods for JSON/mapping coercion, chat template
+    normalization, tokenization, detokenization, streaming delta computation,
+    sampling parameter preparation, worker pipeline management, idle-reset
+    monitoring, and KV cache event logging.
+
+    These utilities are used across other engine mixins and the main engine
+    class to support robust input processing and output formatting.
+    """
+
     @staticmethod
     def _coerce_mapping_like(value: Any) -> Any:
         """Coerce JSON-string payloads into mapping-like objects when possible."""
@@ -51,6 +63,8 @@ class EngineUtilsMixin:
         normalized_messages: list[dict[str, Any]] = []
         for message in messages:
             msg = dict(message)
+            if msg.get("content") is None:
+                msg["content"] = ""
 
             tool_calls = msg.get("tool_calls")
             if isinstance(tool_calls, list):
@@ -86,7 +100,77 @@ class EngineUtilsMixin:
 
             normalized_messages.append(msg)
 
-        return normalized_messages
+        return EngineUtilsMixin._collapse_system_messages(normalized_messages)
+
+    @staticmethod
+    def _content_to_text_parts(content: Any) -> list[dict[str, Any]]:
+        """Convert arbitrary message content into text-part arrays."""
+
+        if content is None:
+            return []
+        if isinstance(content, list):
+            parts: list[dict[str, Any]] = []
+            for item in content:
+                if isinstance(item, dict):
+                    parts.append(copy.deepcopy(item))
+                elif item is not None:
+                    parts.append({"type": "text", "text": str(item)})
+            return parts
+        return [{"type": "text", "text": str(content)}]
+
+    @staticmethod
+    def _merge_system_content(existing: Any, new_content: Any) -> Any:
+        """Merge multiple system-message contents into a single leading turn."""
+
+        if isinstance(existing, list) or isinstance(new_content, list):
+            return EngineUtilsMixin._content_to_text_parts(existing) + EngineUtilsMixin._content_to_text_parts(
+                new_content
+            )
+
+        existing_text = "" if existing is None else str(existing)
+        new_text = "" if new_content is None else str(new_content)
+        if existing_text and new_text:
+            return f"{existing_text}\n\n{new_text}"
+        return existing_text or new_text
+
+    @staticmethod
+    def _collapse_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Fold all system turns into one leading system message for strict templates."""
+
+        if not messages:
+            return messages
+
+        system_indices = [idx for idx, msg in enumerate(messages) if msg.get("role") == "system"]
+        if len(system_indices) <= 1 and (not system_indices or system_indices[0] == 0):
+            return messages
+
+        merged_system: dict[str, Any] | None = None
+        ordered_messages: list[dict[str, Any]] = []
+        for message in messages:
+            if message.get("role") != "system":
+                ordered_messages.append(message)
+                continue
+
+            msg_copy = dict(message)
+            msg_copy.pop("tool_calls", None)
+            msg_copy.pop("function_call", None)
+            if merged_system is None:
+                merged_system = msg_copy
+                continue
+            merged_system["content"] = EngineUtilsMixin._merge_system_content(
+                merged_system.get("content"),
+                msg_copy.get("content"),
+            )
+
+        if merged_system is None:
+            return ordered_messages
+
+        if system_indices != [0]:
+            logger.warning(
+                "Collapsing %d system messages into the first position for chat-template compatibility.",
+                len(system_indices),
+            )
+        return [merged_system, *ordered_messages]
 
     @staticmethod
     def _normalize_chat_template_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
@@ -149,6 +233,49 @@ class EngineUtilsMixin:
             normalized.append(payload)
 
         return normalized or None
+
+    @staticmethod
+    def _normalize_wrapped_chat_template_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        """Normalize tools into OpenAI-style ``{"type":"function","function":...}`` wrappers.
+
+        Some tokenizer chat templates, including Gemma-style templates, expect
+        each tool entry to expose a ``function`` mapping rather than a bare
+        function payload. This helper sanitizes the inner function schema using
+        ``_normalize_chat_template_tools`` and wraps it back into the expected
+        outer structure.
+        """
+
+        normalized = EngineUtilsMixin._normalize_chat_template_tools(tools)
+        if not normalized:
+            return None
+
+        wrapped: list[dict[str, Any]] = []
+        source_tools = [tool for tool in (tools or []) if isinstance(tool, dict)]
+        for idx, payload in enumerate(normalized):
+            source = source_tools[idx] if idx < len(source_tools) else {}
+            tool_type = source.get("type") if isinstance(source.get("type"), str) and source.get("type") else "function"
+            wrapped.append({"type": tool_type, "function": payload})
+        return wrapped or None
+
+    @staticmethod
+    def _is_recoverable_chat_template_tool_error(exc: Exception) -> bool:
+        """Return True for template/tool shape mismatches we can retry around."""
+
+        if isinstance(exc, KeyError):
+            missing_key = exc.args[0] if len(exc.args) > 0 else None
+            if missing_key in {"items", "function"}:
+                return True
+
+        exc_text = str(exc)
+        if exc_text.strip("'\"") in {"items", "function"}:
+            return True
+
+        return (
+            "has no attribute 'items'" in exc_text
+            or "items" in exc_text
+            or "has no attribute 'function'" in exc_text
+            or "tool_data['function']" in exc_text
+        )
 
     @staticmethod
     def _to_structured_text_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -287,6 +414,7 @@ class EngineUtilsMixin:
             chat_template_kwargs = {}
         normalized_messages = self._normalize_chat_template_messages(messages)
         normalized_tools = self._normalize_chat_template_tools(tools)
+        normalized_wrapped_tools = self._normalize_wrapped_chat_template_tools(tools)
         try:
             return self.tokenizer.apply_chat_template(
                 normalized_messages,
@@ -297,18 +425,18 @@ class EngineUtilsMixin:
                 **chat_template_kwargs,
             )
         except Exception as exc:
-            # Some tokenizer chat templates expect `.items()` on tools/content parts
-            # and can fail when malformed payloads are passed in.
-            exc_text = str(exc)
-            if tools is None or ("has no attribute 'items'" not in exc_text and "items" not in exc_text):
+            # Some tokenizer chat templates expect `.items()` on nested mappings,
+            # while others expect OpenAI-style tool wrappers with `.function`.
+            recoverable_tool_error = self._is_recoverable_chat_template_tool_error(exc)
+            if tools is None or not recoverable_tool_error:
                 raise
 
             structured_messages = self._to_structured_text_messages(normalized_messages)
 
             retries = [
-                ("normalized_tools", normalized_messages, normalized_tools),
+                ("wrapped_tools", normalized_messages, normalized_wrapped_tools),
                 ("structured_messages", structured_messages, normalized_tools),
-                ("structured_messages+normalized_tools", structured_messages, normalized_tools),
+                ("structured_messages+wrapped_tools", structured_messages, normalized_wrapped_tools),
                 ("structured_messages_no_tools", structured_messages, None),
             ]
             if len(normalized_tools or []) != len(tools or []):
@@ -333,8 +461,7 @@ class EngineUtilsMixin:
                     logger.warning("Recovered chat template rendering via %s fallback.", label)
                     return prompt
                 except Exception as retry_exc:
-                    retry_text = str(retry_exc)
-                    if "has no attribute 'items'" not in retry_text and "items" not in retry_text:
+                    if not self._is_recoverable_chat_template_tool_error(retry_exc):
                         raise
                     last_error = retry_exc
 
@@ -415,6 +542,7 @@ class EngineUtilsMixin:
         *,
         finished: bool,
         skip_special_tokens: bool = False,
+        spaces_between_special_tokens: bool = True,
         prompt_context: list[int] | None = None,
     ) -> DetokenizerResult:
         """Decode tokens using the detokenizer worker pipeline.
@@ -426,6 +554,8 @@ class EngineUtilsMixin:
             generated_tokens: Full list of generated tokens so far.
             finished: Whether generation is complete (triggers final flush).
             skip_special_tokens: Whether to skip special tokens in output.
+            spaces_between_special_tokens: Whether to preserve tokenizer-inserted
+                spacing between adjacent special tokens.
             prompt_context: Last N prompt token IDs for first-token context.
 
         Returns:
@@ -437,6 +567,7 @@ class EngineUtilsMixin:
             tokens_for_decode,
             finished=finished,
             skip_special_tokens=skip_special_tokens,
+            spaces_between_special_tokens=spaces_between_special_tokens,
             prompt_context=prompt_context,
         )
 
@@ -448,42 +579,7 @@ class EngineUtilsMixin:
         chunks when text has not advanced. If prefix alignment is lost, attempt
         suffix-prefix overlap recovery before falling back.
         """
-
-        current_text = current_text or ""
-        previous_text = previous_text or ""
-        fallback_delta = fallback_delta or ""
-
-        if current_text.startswith(previous_text):
-            return current_text[len(previous_text) :]
-
-        if not current_text and previous_text and not fallback_delta:
-            # Tool-call parsers can collapse previously emitted protocol markup
-            # into empty visible content; treat as benign rollback.
-            return ""
-
-        max_overlap = min(len(previous_text), len(current_text))
-        for overlap in range(max_overlap, 0, -1):
-            if previous_text.endswith(current_text[:overlap]):
-                return current_text[overlap:]
-
-        if len(current_text) < len(previous_text):
-            # Parser normalization can rewrite previously emitted snapshots into a
-            # shorter canonical form (e.g. stripping protocol/control markup).
-            # Treat as benign realignment and avoid noisy warnings.
-            if fallback_delta and not previous_text.endswith(fallback_delta):
-                return fallback_delta
-            return ""
-
-        if previous_text:
-            logger.warning(
-                "Stream delta alignment mismatch. prev_len=%s, curr_len=%s; using guarded fallback.",
-                len(previous_text),
-                len(current_text),
-            )
-
-        if fallback_delta and (not previous_text or not previous_text.endswith(fallback_delta)):
-            return fallback_delta
-        return current_text if not previous_text else ""
+        return compute_stream_delta_text(current_text, previous_text, fallback_delta)
 
     @staticmethod
     def _to_python_scalar(value: Any) -> Any:
@@ -653,6 +749,54 @@ class EngineUtilsMixin:
             logger.debug("Idle monitor thread did not stop gracefully")
         self._idle_monitor_thread = None
 
+    _TOOL_TOKEN_PATTERNS = ("tool_call", "tool_response", "tool")
+
+    def _prepare_chat_sampling_params(
+        self,
+        sampling_params: SamplingParams | None,
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | None = None,
+    ) -> SamplingParams:
+        """Prepare sampling params with tool-token awareness.
+
+        When no tools are active, tool-related special tokens are suppressed
+        via ``logit_bias`` and ``skip_special_tokens`` is enabled.  When tools
+        are present, the protocol tokens are left untouched so the model can
+        emit tool calls.
+        """
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+        else:
+            sampling_params = self._clone_sampling_params(sampling_params)
+
+        if tools:
+            sampling_params.skip_special_tokens = False
+            sampling_params.logit_bias = None
+            return sampling_params
+
+        vocab: dict[str, int] = {}
+        if hasattr(self, "tokenizer") and hasattr(self.tokenizer, "get_vocab"):
+            try:
+                vocab = self.tokenizer.get_vocab()
+            except Exception:
+                pass
+
+        tool_token_ids: list[int] = []
+        for token_text, token_id in vocab.items():
+            for pattern in self._TOOL_TOKEN_PATTERNS:
+                if pattern in token_text.lower():
+                    tool_token_ids.append(token_id)
+                    break
+
+        if tool_token_ids:
+            merged_logit_bias = dict(sampling_params.logit_bias or {})
+            for tid in tool_token_ids:
+                merged_logit_bias[tid] = min(float(merged_logit_bias.get(tid, 0.0)), -100.0)
+            sampling_params.logit_bias = merged_logit_bias
+        sampling_params.skip_special_tokens = True
+        return sampling_params
+
     def _clone_sampling_params(self, sampling_params: SamplingParams) -> SamplingParams:
         """Create a deep copy of sampling parameters.
 
@@ -691,6 +835,10 @@ class EngineUtilsMixin:
         callback = self._sampling_params_callback
 
         def _finalize(prepared: SamplingParams) -> SamplingParams:
+            if getattr(prepared, "ignore_stop_strings_in_reasoning", None) is None:
+                prepared.ignore_stop_strings_in_reasoning = bool(
+                    getattr(self, "ignore_stop_strings_in_reasoning", False)
+                )
             prepared = self._apply_extra_stops_to_sampling_params(prepared)
             prepared = self._apply_generation_config_to_sampling_params(prepared)
             return prepared

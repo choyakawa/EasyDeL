@@ -44,7 +44,7 @@ class CPOConfig(TrainingArguments):
     """
 
     trainer_prefix: str | None = field(
-        default="cpotrainer",
+        default="CPO",
         metadata={"help": "Default prefix used when generating checkpoint names or logs."},
     )
     beta: float = field(
@@ -124,6 +124,15 @@ class CPOConfig(TrainingArguments):
             )
         },
     )
+    logprob_vocab_chunk_size: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Vocabulary chunk size used when computing selected-token log probabilities. "
+                "Set to `None` to disable chunking."
+            )
+        },
+    )
     is_encoder_decoder: bool | None = field(
         default=None,
         metadata={"help": "Override automatic detection for encoder-decoder architectures."},
@@ -133,7 +142,11 @@ class CPOConfig(TrainingArguments):
         metadata={"help": "Number of processes used when tokenising datasets (datasets.map `num_proc`)."},
     )
 
-    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
+    def __post_init__(
+        self,
+        max_sequence_length: int | None,
+        quantization_block: int | None,
+    ):
         self._handle_deprecated_max_sequence_length(max_sequence_length)
         if self.max_length is not None and self.max_prompt_length is not None:
             if self.max_completion_length is None:
@@ -143,8 +156,14 @@ class CPOConfig(TrainingArguments):
         if self.loss_type == "alphapo":
             self.loss_type = "simpo"
             self.cpo_alpha = 0.0
+        if self.logprob_vocab_chunk_size is not None:
+            normalized_chunk_size = int(self.logprob_vocab_chunk_size)
+            self.logprob_vocab_chunk_size = normalized_chunk_size if normalized_chunk_size > 0 else None
 
         if hasattr(super(), "__post_init__"):
-            super().__post_init__(max_sequence_length=None, quantization_block=quantization_block)
+            super().__post_init__(
+                max_sequence_length=None,
+                quantization_block=quantization_block,
+            )
 
     __hash__ = hash_fn

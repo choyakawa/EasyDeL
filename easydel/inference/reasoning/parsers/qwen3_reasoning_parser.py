@@ -39,8 +39,13 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
     end_token = "</think>"
 
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
-        # Qwen3 strictness: missing end tag is always content.
+        """Extract reasoning with strict tag requirements (both tags needed unless prompt-gated)."""
         if self.end_token not in model_output:
+            # If an explicit reasoning start tag is present, keep the whole
+            # unfinished segment hidden as reasoning rather than surfacing it
+            # as visible content.
+            if self.start_token in model_output or self._is_prompt_reasoning_active():
+                return super().extract_reasoning(model_output, request)
             return None, model_output
 
         # Missing start tag is only allowed when prompt context indicates
@@ -62,6 +67,7 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         delta_token_ids: Sequence[int],
         request=None,
     ) -> DeltaMessage | None:
+        """Stream with strict mode: treat as content if no start tag seen early enough."""
         has_start_in_current = self.start_token in current_text or (
             self._start_token_id is not None and self._start_token_id in current_token_ids
         )

@@ -665,7 +665,16 @@ class Qwen2VLVisionAttention(UnifiedAttention):
         self.head_dim = dim // num_heads
 
         class ConfigAdapter:
+            """Adapts Qwen2VL vision config to a format compatible with UnifiedAttention."""
+
             def __init__(self, config, dim, num_heads):
+                """Create adapter by mapping vision config fields to attention-compatible names.
+
+                Args:
+                    config: Original vision encoder configuration.
+                    dim: Hidden dimension for attention.
+                    num_heads: Number of attention heads.
+                """
                 self.hidden_size = dim
                 self.num_attention_heads = num_heads
                 self.num_key_value_heads = num_heads
@@ -1099,17 +1108,8 @@ class Qwen2VLDecoderLayer(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        attn_block = Qwen2VLAttention
-        mlp_block = Qwen2VLMLP
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
 
-        self.self_attn = attn_block(
+        self.self_attn = Qwen2VLAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1118,7 +1118,7 @@ class Qwen2VLDecoderLayer(nn.Module):
             layer_idx=layer_idx,
         )
 
-        self.mlp = mlp_block(
+        self.mlp = Qwen2VLMLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1488,9 +1488,15 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = auto_remat(
+            Qwen2VLDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Qwen2VLDecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=idx,
                     dtype=dtype,
@@ -2254,7 +2260,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
 
         lm_logits = None
         if apply_lm_head:
-            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
+            lm_logits = self.compute_lm_logits(hidden_states)
             lm_logits = self.apply_logit_cap(lm_logits)
 
         return VLMCausalLMOutput(

@@ -120,6 +120,14 @@ class RMSNorm(nn.Module):
         return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
 
     def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specifications for RMSNorm parameters.
+
+        Marks the kernel weight as replicated across all devices since
+        normalization parameters are small and needed on every device.
+
+        Returns:
+            dict[str, object]: Mapping of parameter names to sharding specs.
+        """
         return {"kernel": Replicated}
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -351,17 +359,8 @@ class CohereBlock(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-        attn_block = CohereAttention
-        mlp_block = CohereMLP
 
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.self_attn = attn_block(
+        self.self_attn = CohereAttention(
             config,
             layer_idx=layer_idx,
             dtype=dtype,
@@ -370,7 +369,7 @@ class CohereBlock(nn.Module):
             rngs=rngs,
         )
 
-        self.mlp = mlp_block(
+        self.mlp = CohereMLP(
             config,
             layer_idx=layer_idx,
             dtype=dtype,
@@ -509,9 +508,15 @@ class CohereModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            CohereBlock,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                CohereBlock(
+                remat_layer_block(
                     config=config,
                     layer_idx=i,
                     dtype=dtype,
@@ -783,19 +788,9 @@ class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
             inputs_embeds=inputs_embeds,
         )
 
-        hidden_states = outputs.last_hidden_state
-
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-
         lm_logits = None
         if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
-
-        lm_logits = lm_logits * self.logit_scale
+            lm_logits = self.compute_lm_logits(self.prepare_lm_head_inputs(outputs.last_hidden_state))
 
         return CausalLMOutput(
             logits=lm_logits,
@@ -811,6 +806,32 @@ class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
         For CohereForCausalLM (decoder-only), this is not applicable.
         """
         raise NotImplementedError("CohereForCausalLM is a decoder-only model and does not have a separate encoder.")
+
+    def compute_lm_logits(self, hidden_states: Array) -> Array:
+        """Project hidden states to vocabulary logits and apply Cohere's logit scaling.
+
+        Calls the base LM-head projection and multiplies the result by
+        ``self.logit_scale`` (from ``config.logit_scale``), which Cohere
+        models use to control the temperature of the output distribution.
+
+        Args:
+            hidden_states: Hidden representations, shape ``[B, T, H]``.
+
+        Returns:
+            Scaled logits with shape ``[B, T, V]``.
+        """
+        logits = super().compute_lm_logits(hidden_states)
+        return logits * self.logit_scale
+
+    def make_lm_head_fn(self):
+        """Trace-safe projection with Cohere logit scaling."""
+        base_fn = super().make_lm_head_fn()
+        scale = self.logit_scale
+
+        def _project(hidden_states):
+            return base_fn(hidden_states) * scale
+
+        return _project
 
     def get_decoder(self) -> nn.Module:
         """

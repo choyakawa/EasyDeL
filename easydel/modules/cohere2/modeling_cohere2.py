@@ -107,6 +107,14 @@ class Cohere2LayerNorm(nn.Module):
         return (x - mean) * jax.lax.rsqrt(variance + self.eps)
 
     def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specifications for Cohere2LayerNorm parameters.
+
+        Marks the kernel weight as replicated across all devices since
+        normalization parameters are small and needed on every device.
+
+        Returns:
+            dict[str, object]: Mapping of parameter names to sharding specs.
+        """
         return {"kernel": Replicated}
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -350,17 +358,8 @@ class Cohere2Block(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-        attn_block = Cohere2Attention
-        mlp_block = Cohere2MLP
 
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.self_attn = attn_block(
+        self.self_attn = Cohere2Attention(
             config,
             layer_idx=layer_idx,
             dtype=dtype,
@@ -368,7 +367,7 @@ class Cohere2Block(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.mlp = mlp_block(
+        self.mlp = Cohere2MLP(
             config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -508,9 +507,15 @@ class Cohere2Model(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            Cohere2Block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Cohere2Block(
+                remat_layer_block(
                     config=config,
                     layer_idx=idx,
                     dtype=dtype,
@@ -793,7 +798,7 @@ class Cohere2ForCausalLM(BaseCausalLMModule[Cohere2Model, Cohere2Config]):
 
         lm_logits = None
         if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
+            lm_logits = self.compute_lm_logits(hidden_states)
 
         return CausalLMOutput(
             logits=lm_logits,
@@ -817,6 +822,19 @@ class Cohere2ForCausalLM(BaseCausalLMModule[Cohere2Model, Cohere2Config]):
         if self.logit_scale is not None:
             lm_logits *= self.logit_scale
         return lm_logits
+
+    def make_lm_head_fn(self):
+        """Trace-safe projection with Cohere2 logit scaling."""
+        base_fn = super().make_lm_head_fn()
+        scale = self.logit_scale
+
+        def _project(hidden_states):
+            logits = base_fn(hidden_states)
+            if scale is not None:
+                logits = logits * scale
+            return logits
+
+        return _project
 
     def get_encoder(self) -> nn.Module:
         """

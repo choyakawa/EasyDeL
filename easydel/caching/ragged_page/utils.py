@@ -1,3 +1,17 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Utility functions for paged attention cache operations.
 
 This module provides low-level utilities for efficient paged KV cache
@@ -65,14 +79,19 @@ def localize_slice_indices_for_page_shard(
     destination offsets into local shard coordinates and zeroes non-local slices.
 
     Args:
-        slice_indices: Global slice mapping ``[3, num_slices]``.
-        total_update_slices: Number of valid slices.
-        page_size: Tokens per page.
-        local_flat_cache_positions: Local flattened cache capacity on this shard.
-        page_shard_index: Linear page-shard index for current shard.
+        slice_indices: Global slice mapping of shape [3, num_slices].
+            Row 0: cache start positions, Row 1: new KV start positions,
+            Row 2: slice lengths.
+        total_update_slices: Scalar array with number of valid slices.
+        page_size: Number of tokens per cache page.
+        local_flat_cache_positions: Total flattened cache capacity on this
+            shard (num_local_pages * page_size).
+        page_shard_index: Linear index identifying which page shard this
+            device owns. Defaults to 0 (unsharded).
 
     Returns:
-        Localized slice mapping with same shape/dtype as ``slice_indices``.
+        Int[Array, "3 num_slices"]: Localized slice mapping with same
+            shape and dtype as the input. Non-local slices are zeroed out.
     """
     num_valid_slices = jnp.asarray(total_update_slices).reshape(-1)[0].astype(jnp.int32)
     num_slices = int(slice_indices.shape[1])
@@ -223,7 +242,7 @@ def kv_cache_update(
         jax.Array: Updated KV cache pages with same shape as kv_cache_pages.
 
     Raises:
-        AssertionError: If dimensions are incompatible or alignment is wrong.
+        ValueError: If dimensions are incompatible or alignment is wrong.
 
     Note:
         - Requires TPU backend for hardware acceleration
@@ -246,13 +265,15 @@ def kv_cache_update(
         local_flat_cache_positions=kv_cache_pages.shape[0],
         page_shard_index=page_shard_index,
     )
-    assert slice_indices.shape[1] % slices_per_processing_page == 0, (
-        f"{slices_per_processing_page=}, {slice_indices.shape[1]=}"
-    )
+    if slice_indices.shape[1] % slices_per_processing_page != 0:
+        raise ValueError(f"{slices_per_processing_page=}, {slice_indices.shape[1]=}")
     _, num_kv_heads, head_dimension = new_kv_tokens.shape
-    assert kv_cache_pages.shape[1] == num_kv_heads
-    assert kv_cache_pages.shape[2] == head_dimension, f"{kv_cache_pages.shape[2]=}!={head_dimension=}"
-    assert head_dimension % 128 == 0
+    if kv_cache_pages.shape[1] != num_kv_heads:
+        raise ValueError(f"kv_cache_pages num_kv_heads mismatch: {kv_cache_pages.shape[1]=} != {num_kv_heads=}")
+    if kv_cache_pages.shape[2] != head_dimension:
+        raise ValueError(f"{kv_cache_pages.shape[2]=}!={head_dimension=}")
+    if head_dimension % 128 != 0:
+        raise ValueError(f"head_dimension must be divisible by 128, got {head_dimension=}")
 
     prefetch_scalars = [slice_indices]
     vmem_scratch_buffer = pltpu.VMEM(
@@ -290,14 +311,29 @@ def kv_cache_update_jax(
 ) -> Float[Array, "total_cache_positions num_kv_heads head_dim"]:
     """Portable JAX implementation of paged KV-cache update.
 
-    The v2 slot-mapping format describes updates as *slices* (start positions +
-    lengths) to minimize metadata size. A naive loop/scan over slices becomes
-    a latency bottleneck on GPU due to sequential dependence.
+    The v2 slot-mapping format describes updates as slices (start positions +
+    lengths) to minimize metadata size. This implementation vectorizes the
+    slice representation into per-token scatter indices and applies a single
+    `.at[...].set(...)` update. For GPU workloads this is typically much
+    faster than a `lax.scan` of `dynamic_update_slice`.
 
-    This implementation vectorizes the slice representation into per-token
-    scatter indices and applies a single `.at[...].set(...)` update. For GPU
-    workloads this is typically much faster than a `lax.scan` of
-    `dynamic_update_slice`.
+    Args:
+        new_kv_tokens: New key-value tokens to insert.
+            Shape: [total_tokens, num_kv_heads, head_dim]
+        slice_indices: Mapping of update operations.
+            Shape: [3, num_slices] where each column contains:
+            - Row 0: Starting position in cache
+            - Row 1: Starting position in new_kv_tokens
+            - Row 2: Length of slice to copy
+        kv_cache_pages: Existing cache pages to update.
+            Shape: [total_cache_positions, num_kv_heads, head_dim]
+        total_update_slices: Number of valid slices to process. Shape: [1].
+        page_size: Number of tokens per cache page. Default: 32.
+        page_shard_index: Linear page-shard index for local cache buffer
+            when pages are sharded. Defaults to 0 (unsharded).
+
+    Returns:
+        jax.Array: Updated KV cache pages with same shape as kv_cache_pages.
     """
     slice_indices = localize_slice_indices_for_page_shard(
         slice_indices,

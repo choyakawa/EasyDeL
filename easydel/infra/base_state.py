@@ -75,10 +75,12 @@ from __future__ import annotations
 
 import collections.abc
 import contextlib
+import datetime as dt
+import json
 import os
 import pickle
-import traceback
 import typing as tp
+import uuid
 from typing import Self
 
 import jax
@@ -95,7 +97,8 @@ from jax.sharding import PartitionSpec
 
 from easydel.infra.factory import TaskType
 from easydel.utils.compiling_utils import ejit
-from easydel.utils.traversals import flatten_dict, specs_to_name_sharding, unflatten_dict
+from easydel.utils.helpers import is_remote_path
+from easydel.utils.traversals import deepcopy_model, flatten_dict, unflatten_dict
 
 from .utils import materialize_meta_leaves, sanitize_partition_spec_for_shape
 
@@ -123,7 +126,84 @@ OPTIMIZER_STRUCT_NAME = "easydel-optstate.structure"
 TX_STRUCT_JSON = "tx_structure.json"
 """Filename for optimizer transformation structure in JSON format."""
 
+RESUME_MODEL_SUBDIR = "_resume_model"
+"""Subdirectory used for the LoRA-preserving model copy inside merged state checkpoints."""
+
 logger = get_logger(__name__)
+
+
+def _read_checkpoint_metadata(load_directory: str | os.PathLike | ePathLike) -> dict[str, tp.Any]:
+    """Best-effort read of the checkpoint discovery metadata."""
+    metadata_path = ePath(load_directory) / "metadata.json"
+    if not metadata_path.exists():
+        return {}
+    try:
+        metadata = json.loads(metadata_path.read_text())
+    except Exception:
+        logger.debug("Failed to read checkpoint metadata from %s.", metadata_path, exc_info=True)
+        return {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _has_saved_optimizer_state(load_directory: str | os.PathLike | ePathLike) -> bool:
+    """Return whether a checkpoint directory contains resumable optimizer artifacts.
+
+    When ``metadata.json`` explicitly records ``has_optimizer_state``, that
+    value is treated as authoritative so stale optimizer files left behind in a
+    reused directory do not accidentally turn a weights-only checkpoint back
+    into a resumable one. Older checkpoints without that metadata still fall
+    back to artifact discovery for backward compatibility.
+    """
+    load_directory = ePath(load_directory)
+    metadata = _read_checkpoint_metadata(load_directory)
+    if "has_optimizer_state" in metadata:
+        return bool(metadata["has_optimizer_state"])
+    if (load_directory / TX_STRUCT_JSON).exists():
+        return True
+    if (load_directory / OPTIMIZER_STRUCT_NAME).exists():
+        return True
+    if (load_directory / "tx").exists():
+        return True
+    if (load_directory / OPTIMIZER_NAME).exists():
+        return True
+    return False
+
+
+def _has_resume_model(load_directory: str | os.PathLike | ePathLike) -> bool:
+    """Return whether ``load_state`` should load model weights from ``_resume_model``.
+
+    New merged-LoRA checkpoints record this explicitly in ``metadata.json`` so
+    model-only resumes can still restore the original LoRA graph while stale
+    directories can opt out cleanly. Older checkpoints fall back to the
+    historical rule: only prefer ``_resume_model`` when optimizer state is
+    present at the checkpoint root.
+    """
+    load_directory = ePath(load_directory)
+    metadata = _read_checkpoint_metadata(load_directory)
+    if "has_resume_model" in metadata:
+        return bool(metadata["has_resume_model"])
+    return (load_directory / RESUME_MODEL_SUBDIR).exists() and _has_saved_optimizer_state(load_directory)
+
+
+def _get_checkpoint_step(load_directory: str | os.PathLike | ePathLike) -> int | None:
+    """Return the recorded checkpoint step from ``metadata.json`` when available."""
+    metadata = _read_checkpoint_metadata(load_directory)
+    step = metadata.get("step")
+    if step is None:
+        return None
+    try:
+        return int(step)
+    except (TypeError, ValueError):
+        logger.debug("Ignoring non-integer checkpoint step %r from %s.", step, load_directory)
+        return None
+
+
+def _is_optimizer_template_incompatibility(exc: Exception) -> bool:
+    """Return whether an optimizer restore error signals a template mismatch."""
+    message = str(exc)
+    return (isinstance(exc, KeyError) and "Missing array for key" in message) or (
+        isinstance(exc, ValueError) and "Array shape mismatch for key" in message
+    )
 
 
 def _sanitize_partition_specs_for_shape_tree(
@@ -203,6 +283,8 @@ class EasyDeLState(struct.PyTreeNode):
         apply_fn (tp.Callable | None): Optional model application function for custom
             forward pass implementations. Defaults to None, in which case the standard
             model call is used.
+        esurge_cache_scope_key (str): Unique key used to scope eSurge compiled caches
+            to this state instance. Auto-generated from a UUID on creation.
 
     Example:
         Creating state from a model and training::
@@ -263,6 +345,10 @@ class EasyDeLState(struct.PyTreeNode):
     tx: optax.GradientTransformation | None = struct.field(pytree_node=False)
     opt_state: optax.OptState | None = struct.field(pytree_node=True)
     apply_fn: tp.Callable | None = struct.field(pytree_node=False, default=None)
+    esurge_cache_scope_key: str = struct.field(
+        pytree_node=False,
+        default_factory=lambda: f"state-{uuid.uuid4().hex}",
+    )
 
     def apply_gradients(self: Self, *, grads) -> Self:
         """Apply gradients to update parameters and optimizer state.
@@ -318,8 +404,10 @@ class EasyDeLState(struct.PyTreeNode):
             - :meth:`create`: Create state with optimizer initialization.
             - :meth:`init_tx`: Initialize optimizer for existing state.
         """
-        assert self.opt_state is not None
-        assert self.tx is not None
+        if self.opt_state is None:
+            raise RuntimeError("Optimizer state is not initialized. Call `init_tx()` first.")
+        if self.tx is None:
+            raise RuntimeError("Optimizer (tx) is not set. Call `init_tx()` first.")
 
         updates, new_opt_state = self.tx.update(updates=grads, state=self.opt_state, params=self.graphstate)
 
@@ -429,9 +517,10 @@ class EasyDeLState(struct.PyTreeNode):
                 ... )
 
         Note:
-            When using `model`, the function internally calls `nn.split(model, nn.Param, ...)`
-            to extract the graph components. The first split (`nn.Param`) contains trainable
-            parameters, and the ellipsis (`...`) captures all other state.
+            When using `model`, the function defers to the model's own split
+            logic (``model.split_module()`` when available) so specialized
+            parameter types such as ``nn.LoRAParam`` are preserved. Plain NNX
+            modules fall back to ``nn.split(model, nn.Param, ...)``.
 
         See Also:
             - :meth:`init_tx`: Initialize optimizer after state creation.
@@ -445,7 +534,10 @@ class EasyDeLState(struct.PyTreeNode):
             )
 
         if model is not None:
-            graphdef, graphstate, graphother = nn.split(model, nn.Param, ...)
+            if hasattr(model, "split_module"):
+                graphdef, graphstate, graphother = model.split_module()
+            else:
+                graphdef, graphstate, graphother = nn.split(model, nn.Param, ...)
         else:
             has_graphdef = graphdef is not None
             has_graphstate = graphstate is not None
@@ -541,6 +633,7 @@ class EasyDeLState(struct.PyTreeNode):
         def make(graphstate):
             return tx.init(graphstate)
 
+        input_shardings = es.extract_shardings(self.graphstate, mesh=mesh)
         eval_opt_state = jax.eval_shape(lambda: make(self.graphstate))
         partition_specs = match_partition_rules(partition_rules, eval_opt_state)
         partition_specs, adjusted = _sanitize_partition_specs_for_shape_tree(
@@ -550,12 +643,24 @@ class EasyDeLState(struct.PyTreeNode):
         )
         if adjusted:
             logger.warning("Adjusted %d non-divisible optimizer sharding specs during init_tx.", adjusted)
-        named_shardings = specs_to_name_sharding(partition_specs, mesh)
+
+        # Build explicit output shardings from partition specs while correcting invalid
+        # mesh-axis references and non-divisible placements per concrete leaf shape.
+        with mesh:
+            named_shardings = jax.tree_util.tree_map(
+                lambda spec, shape_obj: (
+                    es.get_corrected_named_sharding(tuple(shape_obj.shape), spec)
+                    if isinstance(spec, PartitionSpec) and hasattr(shape_obj, "shape")
+                    else None
+                ),
+                partition_specs,
+                eval_opt_state,
+            )
 
         opt_state = ejit(
             make,
             out_shardings=named_shardings,
-            in_shardings=(es.extract_shardings(self.graphstate, mesh=mesh),),
+            in_shardings=(input_shardings,),
         )(self.graphstate)
 
         return self.replace(tx=tx, opt_state=opt_state)
@@ -663,7 +768,8 @@ class EasyDeLState(struct.PyTreeNode):
             - :meth:`shard_optimizer_state`: Reverse operation to shard state.
             - :meth:`gather_state`: Gather entire state including model.
         """
-        assert self.opt_state is not None, "Optimizer state is not initialized."
+        if self.opt_state is None:
+            raise RuntimeError("Optimizer state is not initialized.")
         partition_rules = self.model._get_partition_rules(partition_rules)
         mesh = self.model._get_mesh(None)
 
@@ -717,7 +823,11 @@ class EasyDeLState(struct.PyTreeNode):
             - :attr:`model`: Property that returns the reconstructed model.
             - :meth:`merge_to_state`: Update state with new parameters.
         """
-        return nn.merge(self.graphdef, tree, self.graphother)
+        other = jax.tree_util.tree_map(
+            lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
+            self.graphother,
+        )
+        return nn.merge(self.graphdef, tree, other)
 
     def merge_to_state(self: Self, tree) -> Self:
         """Create a new state with updated parameters.
@@ -782,7 +892,9 @@ class EasyDeLState(struct.PyTreeNode):
         See Also:
             - :meth:`merge`: Explicit merge with custom parameters.
         """
-        return nn.merge(self.graphdef, self.graphstate, self.graphother)
+        model = nn.merge(self.graphdef, self.graphstate, self.graphother)
+        model._esurge_cache_scope_key = self.esurge_cache_scope_key
+        return model
 
     @property
     def size(self) -> int:
@@ -911,19 +1023,39 @@ class EasyDeLState(struct.PyTreeNode):
             """Load using modern TensorStore format."""
             path = str(AsyncCheckpointManager.safe_loadpath(org_path))
             tx_template = tx_template if tx_template is not None else self.tx
+
+            def _load_tensorstore(template):
+                return checkpointer.load_pytree(
+                    mesh=self.model.mesh,
+                    path=path,
+                    partition_rules=partition_rules,
+                    prefix="tx",
+                    load_treedef=True,
+                    discover_latest=True,
+                    discover_raise=False,
+                    template=template,
+                )
+
             template = None
             if tx_template is not None:
-                template = jax.eval_shape(tx_template.init, self.graphstate)
-            opt_state, metadata = checkpointer.load_pytree(
-                mesh=self.model.mesh,
-                path=path,
-                partition_rules=partition_rules,
-                prefix="tx",
-                load_treedef=True,
-                discover_latest=True,
-                discover_raise=False,
-                template=template,
-            )
+                try:
+                    template = jax.eval_shape(tx_template.init, self.graphstate)
+                except Exception:
+                    logger.warning(
+                        "Failed to build an optimizer template for TensorStore restore; "
+                        "retrying using the saved optimizer structure.",
+                        exc_info=True,
+                    )
+
+            try:
+                opt_state, metadata = _load_tensorstore(template)
+            except KeyError as exc:
+                if template is not None and "Missing array for key" in str(exc):
+                    logger.error(
+                        "Optimizer checkpoint is incompatible with the current optimizer template.",
+                        exc_info=True,
+                    )
+                raise
             step = metadata.get("step", 0)
             return opt_state, step
 
@@ -932,8 +1064,10 @@ class EasyDeLState(struct.PyTreeNode):
                 opt_state, step = new_method(tx_template)
                 logger.info(f"Optimizer state loaded from {load_directory} (step {step}).")
                 return self.replace(opt_state=opt_state, step=jnp.asarray(step))
-            except Exception:
-                traceback.print_exc()
+            except Exception as exc:
+                if _is_optimizer_template_incompatibility(exc):
+                    raise
+                logger.exception("Failed to load optimizer state via TensorStore format.")
 
         try:
             if not AsyncCheckpointManager.is_tensorstore(optim_path):
@@ -963,9 +1097,9 @@ class EasyDeLState(struct.PyTreeNode):
                     opt_state, step = new_method(tx_template)
                     return self.replace(opt_state=opt_state, step=jnp.asarray(step))
                 except Exception:
-                    ...
+                    logger.warning("Fallback optimizer load also failed.", exc_info=True)
             logger.error(f"Optimizer load failed: {e!s}")
-            raise e
+            raise
 
     def save_optimizer(
         self,
@@ -1040,7 +1174,8 @@ class EasyDeLState(struct.PyTreeNode):
                 step_policies=[],
             )
         if self.opt_state is not None:
-            save_directory.mkdir(parents=True, exist_ok=True)
+            if not is_remote_path(save_directory) or jax.process_index() == 0:
+                save_directory.mkdir(parents=True, exist_ok=True)
             optim_path = save_directory
             logger.info(f"Coordinated optimizer save through {optim_path}")
             try:
@@ -1064,6 +1199,7 @@ class EasyDeLState(struct.PyTreeNode):
         save_directory: str | os.PathLike | ePathLike,
         float_dtype: jnp.dtype | None = None,
         save_optimizer: bool = True,
+        merge_lora_before_save: bool = False,
         step: int | None = None,
     ) -> None:
         """Save the complete EasyDeLState to a directory.
@@ -1082,6 +1218,12 @@ class EasyDeLState(struct.PyTreeNode):
             save_optimizer (bool): If True, saves the optimizer state alongside
                 the model parameters. Set to False for inference-only checkpoints.
                 Defaults to True.
+            merge_lora_before_save (bool): If True and the model currently has
+                LoRA adapters attached, saves a merged model export at the
+                checkpoint root. The original LoRA-wrapped model is also written
+                to ``{save_directory}/_resume_model`` so :meth:`load_state` can
+                restore the original training graph for both full and
+                weights-only resume flows.
             step (int | None): Training step to record in checkpoint metadata.
                 If None, uses the current `self.step` value. Defaults to None.
 
@@ -1107,11 +1249,22 @@ class EasyDeLState(struct.PyTreeNode):
                 ...     float_dtype=jnp.bfloat16
                 ... )
 
+            Save a merged LoRA export::
+
+                >>> state.save_state(
+                ...     "checkpoints/merged_export",
+                ...     merge_lora_before_save=True
+                ... )
+
         Note:
             The saved checkpoint directory will contain:
             - Model configuration (config.json)
             - Model parameters (easydel-model.parameters or TensorStore)
             - Optimizer state if `save_optimizer=True` (TensorStore format)
+            - ``_resume_model/`` when saving a merged LoRA checkpoint,
+              containing the original unmerged model tree for checkpoint resume
+            - The current model tree exactly as stored in the state; call
+              ``state.gather_model()`` first if you need gathered weights
 
         See Also:
             - :meth:`load_state`: Load complete state from checkpoint.
@@ -1120,17 +1273,51 @@ class EasyDeLState(struct.PyTreeNode):
         save_directory = ePath(save_directory)
         if step is None:
             step = self.step.item() if isinstance(self.step, jnp.ndarray) else self.step
+        should_save_merged_lora = merge_lora_before_save and getattr(self.model, "lora_is_enabled", False)
+        has_resumable_optimizer = save_optimizer and getattr(self, "opt_state", None) is not None
+        resume_model_to_save = self.model if should_save_merged_lora else None
         if save_optimizer:
             self.save_optimizer(save_directory=save_directory, float_dtype=float_dtype, step=step)
         else:
             logger.info("Skipping optimizer saving as requested.")
 
-        self.model.save_pretrained(
+        if resume_model_to_save is not None:
+            resume_directory = save_directory / RESUME_MODEL_SUBDIR
+            logger.info(
+                "Saving merged LoRA checkpoint to %s with a resume-safe LoRA copy in %s.",
+                save_directory,
+                resume_directory,
+            )
+            resume_model_to_save.save_pretrained(
+                save_directory=resume_directory,
+                float_dtype=float_dtype,
+                step=step,
+            )
+
+        model_to_save = self.model
+        if should_save_merged_lora:
+            # Work on a detached copy so export-time LoRA unwrapping does not
+            # mutate the live training state.
+            model_to_save = deepcopy_model(self.model)
+            model_to_save.unwrap_lora_to_layers(verbose=False)
+
+        model_to_save.save_pretrained(
             save_directory=save_directory,
-            gather_fns=self.model._gather_fns,
             float_dtype=float_dtype,
             step=step,
         )
+        try:
+            if jax.process_index() == 0:
+                metadata = {
+                    "step": int(step),
+                    "timestamp": dt.datetime.now(dt.UTC).isoformat(),
+                    "is_temporary": False,
+                    "has_optimizer_state": bool(has_resumable_optimizer),
+                    "has_resume_model": bool(resume_model_to_save is not None),
+                }
+                (save_directory / "metadata.json").write_text(json.dumps(metadata))
+        except Exception as exc:
+            logger.warning(f"Failed to write checkpoint discovery metadata for {save_directory}: {exc}")
 
     @classmethod
     def load_state(
@@ -1263,9 +1450,15 @@ class EasyDeLState(struct.PyTreeNode):
 
         Note:
             - The model configuration is automatically loaded from `config.json`
-              in the checkpoint directory.
-            - Optimizer state loading is attempted but failures are logged as
-              info (not errors), allowing inference-only usage.
+              in the checkpoint directory. If the checkpoint metadata declares
+              ``_resume_model/`` as the state-load source, the model/config are
+              loaded from that subdirectory so merged LoRA checkpoints can
+              still restore the original training graph while leaving a merged
+              model at the checkpoint root for direct inference loading.
+            - Optimizer state loading is only attempted when the checkpoint
+              metadata or legacy artifacts indicate optimizer state is present.
+              Failures are logged as info (not errors), allowing weights-only
+              resume or inference-style usage.
             - When `auto_shard_model=True`, both model and optimizer state are
               sharded according to the specified rules.
 
@@ -1277,8 +1470,25 @@ class EasyDeLState(struct.PyTreeNode):
 
         from .base_module import EasyDeLBaseModule
 
+        load_directory = ePath(load_directory)
+        checkpoint_step = _get_checkpoint_step(load_directory)
+        has_optimizer_state = _has_saved_optimizer_state(load_directory)
+        has_resume_model = _has_resume_model(load_directory)
+        model_load_directory = load_directory
+        resume_model_directory = load_directory / RESUME_MODEL_SUBDIR
+        if resume_model_directory.exists() and has_resume_model:
+            model_load_directory = resume_model_directory
+        elif resume_model_directory.exists():
+            logger.info(
+                "Ignoring %s because checkpoint %s does not declare it as the state-load source; loading merged root model.",
+                resume_model_directory,
+                load_directory,
+            )
+        if not model_load_directory.exists():
+            model_load_directory = load_directory
+
         config = AutoEasyDeLConfig.from_pretrained(
-            load_directory,
+            model_load_directory,
             sharding_axis_dims=sharding_axis_dims,
             sharding_dcn_axis_dims=sharding_dcn_axis_dims,
             sharding_axis_names=sharding_axis_names,
@@ -1296,7 +1506,7 @@ class EasyDeLState(struct.PyTreeNode):
             _model_task = model_task
 
         model = _BaseModuleLoader.from_pretrained(
-            pretrained_model_name_or_path=load_directory,
+            pretrained_model_name_or_path=model_load_directory,
             device=device,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1317,13 +1527,19 @@ class EasyDeLState(struct.PyTreeNode):
             **kwargs,
         )
 
-        state = cls.create(step=jnp.array(0), model=model)
-        try:
-            cmg = jax.default_device(device) if device is not None else contextlib.nullcontext()
-            with cmg:
-                state = state.load_optimizer(load_directory=load_directory, tx_template=tx_template)
-        except Exception:
-            logger.info("EasyDeLState couldn't restore the optimizer/tx (maybe there wasn't any!).")
+        state = cls.create(
+            step=jnp.asarray(0 if checkpoint_step is None else checkpoint_step, dtype=jnp.int32),
+            model=model,
+        )
+        if has_optimizer_state:
+            try:
+                cmg = jax.default_device(device) if device is not None else contextlib.nullcontext()
+                with cmg:
+                    state = state.load_optimizer(load_directory=load_directory, tx_template=tx_template)
+            except Exception:
+                logger.info("EasyDeLState couldn't restore the optimizer/tx (maybe there wasn't any!).")
+        else:
+            logger.info("Checkpoint %s does not contain optimizer state; skipping optimizer restore.", load_directory)
         if auto_shard_model:
             state = state.shard_state()
         return state
@@ -1430,12 +1646,12 @@ class EasyDeLState(struct.PyTreeNode):
             - :meth:`shard_optimizer_state`: Shard only optimizer state.
             - :meth:`gather_state`: Reverse operation to gather state.
         """
-        from eformer.escale import make_shard_and_gather_fns, match_partition_rules
+        from eformer.escale import match_partition_rules
 
         rules = partition_rules or self.model._get_partition_rules(None)
         mesh = mesh or self.model._get_mesh(None)
 
-        def appy_sharding_on_tree(tree):
+        def apply_sharding_on_tree(tree):
             """Apply sharding functions to a pytree."""
             partition_specs = match_partition_rules(rules, tree)
             partition_specs, adjusted = _sanitize_partition_specs_for_shape_tree(
@@ -1445,11 +1661,31 @@ class EasyDeLState(struct.PyTreeNode):
             )
             if adjusted:
                 logger.warning("Adjusted %d non-divisible sharding specs before shard_state.", adjusted)
-            shard_fns, _ = make_shard_and_gather_fns(partition_specs, mesh)
-            return jax.tree_util.tree_map(lambda f, o: f(o), shard_fns, tree)
+            # Use explicit device_put with corrected NamedShardings. This ensures
+            # replicated specs (PartitionSpec()) are still concretely placed across
+            # the mesh, including scalar leaves such as RNG counters.
+            with mesh:
+                named_shardings = jax.tree_util.tree_map(
+                    lambda spec, shape_obj: (
+                        es.get_corrected_named_sharding(tuple(shape_obj.shape), spec)
+                        if isinstance(spec, PartitionSpec) and hasattr(shape_obj, "shape")
+                        else None
+                    ),
+                    partition_specs,
+                    tree,
+                )
+            return jax.tree_util.tree_map(
+                lambda sharding, leaf: jax.device_put(leaf, sharding) if sharding is not None else leaf,
+                named_shardings,
+                tree,
+                is_leaf=lambda x: x is None,
+            )
 
-        state_for_shard = self.replace(graphother=materialize_meta_leaves(self.graphother, seed=42))
-        return appy_sharding_on_tree(state_for_shard)
+        step = self.step
+        if not isinstance(step, jax.Array):
+            step = jnp.asarray(step, dtype=jnp.int32)
+        state_for_shard = self.replace(step=step, graphother=materialize_meta_leaves(self.graphother, seed=42))
+        return apply_sharding_on_tree(state_for_shard)
 
     def gather_state(self) -> Self:
         """Gather the entire state from distributed devices.
@@ -1603,7 +1839,7 @@ class EasyDeLState(struct.PyTreeNode):
         rules = partition_rules or self.model._get_partition_rules(None)
         mesh = mesh or self.model._get_mesh(None)
 
-        def appy_sharding_on_tree(tree):
+        def apply_sharding_on_tree(tree):
             """Apply sharding functions to a pytree."""
             from eformer.escale import make_shard_and_gather_fns, match_partition_rules
 
@@ -1619,8 +1855,8 @@ class EasyDeLState(struct.PyTreeNode):
             shard_fns, _ = make_shard_and_gather_fns(partition_specs, mesh)
             return jax.tree_util.tree_map(lambda f, o: f(o), shard_fns, tree)
 
-        graphstate = appy_sharding_on_tree(self.graphstate)
-        graphother = appy_sharding_on_tree(self.graphother)
+        graphstate = apply_sharding_on_tree(self.graphstate)
+        graphother = apply_sharding_on_tree(self.graphother)
 
         self = self.replace(graphstate=graphstate, graphother=graphother)
         return self

@@ -113,16 +113,6 @@ class ScaledDotProductAttn(OperationImpl):
         """
         return "sdpa", "cudnn", "cuda_flash_attn2"
 
-    def get_impl_metadata(self) -> OperationMetadata:
-        """
-        Returns the metadata associated with this attention implementation instance.
-
-        Returns:
-            The `OperationMetadata` provided during initialization.
-        """
-        assert self.metadata is not None
-        return self.metadata
-
     @classmethod
     def get_requirements(cls, mode: ExecutionMode = ExecutionMode.MIXED) -> OperationRequirements:
         """Returns requirements for ScaledDotProductAttn.
@@ -136,6 +126,26 @@ class ScaledDotProductAttn(OperationImpl):
             supported_cache=CacheType.TRANSFORMER | CacheType.HYBRID,
             cache_view_class=TransformerCacheView,
         )
+
+    @staticmethod
+    def get_unsupported_fallback_features(
+        *,
+        softmax_aux: tp.Any = None,
+        logits_soft_cap: float | None = None,
+        dropout_prob: float = 0.0,
+        normalize_output: bool = True,
+    ) -> tuple[str, ...]:
+        """Returns attention features that the SDPA fallback cannot preserve."""
+        unsupported_features: list[str] = []
+        if softmax_aux is not None:
+            unsupported_features.append("softmax_aux")
+        if logits_soft_cap is not None:
+            unsupported_features.append("logits_soft_cap")
+        if dropout_prob != 0.0:
+            unsupported_features.append("dropout_prob")
+        if not normalize_output:
+            unsupported_features.append("normalize_output=False")
+        return tuple(unsupported_features)
 
     @jax.named_scope("easydel-sdpa-impl-ejkernel")
     def forward_native(
@@ -162,7 +172,7 @@ class ScaledDotProductAttn(OperationImpl):
             query: Query tensor (B, T, H, D).
             key: Key tensor (B, S, H_kv, D).
             value: Value tensor (B, S, H_kv, D_v).
-            attention_mask: Optional boolean attention attention_mask (broadcastable to B, 1, T, S).
+            attention_mask: Optional boolean attention_mask (broadcastable to B, 1, T, S).
                 Passed directly to the primitive.
             bias: Optional attention bias tensor (broadcastable to B, H, T, S).
                 Passed directly to the primitive. If bias is provided, `causal` is forced to False.
@@ -330,7 +340,7 @@ class ScaledDotProductAttn(OperationImpl):
             query: Query tensor.
             key: Key tensor.
             value: Value tensor.
-            attention_mask: Optional attention attention_mask.
+            attention_mask: Optional attention_mask.
             bias: Optional attention bias.
             init_bias: Optional callable to initialize bias.
             causal: Boolean indicating if causal masking should be applied.

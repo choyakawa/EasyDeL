@@ -29,6 +29,7 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.caching import (
     HybridCache,
+    MLARaggedPagesCacheView,
     OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -61,7 +62,12 @@ from .glm4_moe_lite_configuration import Glm4MoeLiteConfig
 
 
 class Glm4MoeLiteMLP(nn.Module):
-    """Dense MLP block for GLM-4-MoE-Lite layers."""
+    """Dense MLP block for GLM-4-MoE-Lite layers.
+
+    Implements the standard gated feedforward network with separate gate and up
+    projections, used in dense layers of the GLM-4-MoE-Lite hybrid architecture.
+    Supports configurable hidden and intermediate sizes.
+    """
 
     def __init__(
         self,
@@ -121,7 +127,12 @@ class Glm4MoeLiteMLP(nn.Module):
 
 
 class Glm4MoeLiteMLPStack(nn.Module):
-    """MoE expert MLP stack for GLM-4-MoE-Lite."""
+    """Expert MLP stack for GLM-4-MoE-Lite using parallel MoE linear layers.
+
+    Implements the feedforward network for multiple experts using efficient
+    batched computation with ColumnParallelMoELinear and RowParallelMoELinear
+    layers. Supports expert tensor mode for optimized expert computation.
+    """
 
     reform_param: typing.ClassVar = {
         "gate_up_proj$": {
@@ -222,7 +233,12 @@ class Glm4MoeLiteMLPStack(nn.Module):
 
 
 class Glm4MoeLiteTopKRouter(nn.Module):
-    """Router module for GLM-4-MoE-Lite grouped top-k gating."""
+    """Top-K expert router for GLM-4-MoE-Lite with grouped expert selection.
+
+    Implements routing using a learned weight matrix and e-score correction bias
+    for improved load balancing. Computes router logits via matrix multiplication
+    in float32 precision for numerical stability.
+    """
 
     def __init__(
         self,
@@ -260,7 +276,13 @@ class Glm4MoeLiteTopKRouter(nn.Module):
 
 
 class Glm4MoeLiteMoE(BaseMoeModule):
-    """Mixture-of-experts feed-forward block for GLM-4-MoE-Lite."""
+    """Mixture-of-Experts feed-forward module for GLM-4-MoE-Lite.
+
+    Combines the Top-K router, expert MLP stack, and shared experts into
+    a unified MoE layer. Routes tokens to selected experts using grouped
+    routing with sigmoid scoring and e-score correction, then combines
+    outputs with shared expert outputs.
+    """
 
     def __init__(
         self,
@@ -381,7 +403,13 @@ class Glm4MoeLiteMoE(BaseMoeModule):
 
 
 class Glm4MoeLiteAttention(UnifiedAttention):
-    """Multi-head Latent Attention for GLM-4-MoE-Lite."""
+    """Multi-head Latent Attention (MLA) for GLM-4-MoE-Lite.
+
+    Implements attention with low-rank KV/Q compression using LoRA-style
+    projections. Queries are compressed via q_a_proj/q_b_proj and KV pairs
+    via kv_a_proj/kv_b_proj, with separate nope and rope head dimensions.
+    Supports YaRN-based mscale softmax scaling for extended context.
+    """
 
     projection_mapping: ClassVar[dict[str, str]] = {
         "mla_q_proj": "q_proj",
@@ -664,6 +692,30 @@ class Glm4MoeLiteAttention(UnifiedAttention):
         softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
         softmax_aux = getattr(softmax_aux, "value", softmax_aux)
 
+        # Absorbed MLA: absorb kv_b_proj weights into queries so the kernel
+        # works directly on the compressed latent (non-head-aware path).
+        mla_kwargs: dict = {}
+        _absorbed_W_v = None
+        if isinstance(cache_view, MLARaggedPagesCacheView):
+            W = self.mla_kv_b_proj.kernel.value  # [kv_lora_rank, local_heads*(nope+v)]
+            local_heads = W.shape[1] // (self.qk_nope_head_dim + self.v_head_dim)
+            W = W.reshape(self.kv_lora_rank, local_heads, self.qk_nope_head_dim + self.v_head_dim)
+            W_nope = W[:, :, : self.qk_nope_head_dim]  # [kv_lora_rank, local_heads, nope]
+            _absorbed_W_v = W[:, :, self.qk_nope_head_dim :]  # [kv_lora_rank, local_heads, v]
+
+            # q_nope: [bsz, heads, seq, nope] @ W_nope: [kv_lora_rank, heads, nope]
+            # -> q_absorbed: [bsz, heads, seq, kv_lora_rank]
+            q_absorbed = jnp.einsum("bhsd,khd->bhsk", q_nope, W_nope)
+
+            mla_kwargs["queries_nope"] = q_absorbed.transpose(0, 2, 1, 3)  # [bsz, seq, heads, kv_lora_rank]
+            mla_kwargs["queries_pe"] = q_pe.transpose(0, 2, 1, 3)  # [bsz, seq, heads, rope_dim]
+            # Store layernormed latent — kv_b_proj weights were trained against
+            # layernorm output, so the cached latent must match.
+            mla_kwargs["keys_values"] = self.mla_kv_a_layernorm(compressed_kv)  # [bsz, seq, kv_lora_rank]
+            mla_kwargs["keys_pe"] = k_pe[:, 0, :, :]  # [bsz, seq, rope_dim]
+            # Explicit softmax_scale: must use original q_head_dim, not absorbed dim
+            mla_kwargs["softmax_scale"] = (self.qk_nope_head_dim + self.qk_rope_head_dim) ** -0.5
+
         attentions = self.attention_performer.forward(
             query_states=query_states,
             key_states=key_states,
@@ -677,9 +729,46 @@ class Glm4MoeLiteAttention(UnifiedAttention):
             causal=causal_for_kernel,
             sliding_window=sliding_window_for_kernel,
             softmax_aux=softmax_aux,
+            **mla_kwargs,
         )
 
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
+        attn_out = attentions.attention_outputs
+        if _absorbed_W_v is not None and attn_out.ndim == 3:
+            # Absorbed MLA output: [total_tokens, heads, kv_lora_rank]
+            # Value up-projection: recover per-head v_head_dim
+            # _absorbed_W_v: [kv_lora_rank, heads, v_head_dim]
+            attn_out = jnp.einsum("thk,khv->thv", attn_out, _absorbed_W_v)
+            # attn_out: [total_tokens, heads, v_head_dim]
+            batch_size = hidden_states.shape[0]
+            seq_len = hidden_states.shape[1]
+            attn_output = attn_out.reshape(batch_size, seq_len, -1)
+        elif isinstance(cache_view, MLARaggedPagesCacheView) and attn_out.ndim == 3:
+            batch_size = hidden_states.shape[0]
+            seq_len = hidden_states.shape[1]
+            attn_output = attn_out.reshape(batch_size, seq_len, -1)
+        else:
+            attn_output = self._merge_heads(attn_out)
+        expected_attn_dim = self.num_heads * self.v_head_dim
+        if attn_output.shape[-1] != expected_attn_dim:
+            actual_attn_dim = int(attn_output.shape[-1])
+            if actual_attn_dim % self.num_heads == 0 and expected_attn_dim % self.num_heads == 0:
+                actual_head_dim = actual_attn_dim // self.num_heads
+                expected_head_dim = expected_attn_dim // self.num_heads
+                attn_output = attn_output.reshape(*attn_output.shape[:-1], self.num_heads, actual_head_dim)
+                if actual_head_dim > expected_head_dim:
+                    attn_output = attn_output[..., :expected_head_dim]
+                elif actual_head_dim < expected_head_dim:
+                    pad_width = [(0, 0)] * attn_output.ndim
+                    pad_width[-1] = (0, expected_head_dim - actual_head_dim)
+                    attn_output = jnp.pad(attn_output, pad_width)
+                attn_output = attn_output.reshape(*attn_output.shape[:-2], expected_attn_dim)
+            elif actual_attn_dim > expected_attn_dim:
+                attn_output = attn_output[..., :expected_attn_dim]
+            else:
+                pad_width = [(0, 0)] * attn_output.ndim
+                pad_width[-1] = (0, expected_attn_dim - actual_attn_dim)
+                attn_output = jnp.pad(attn_output, pad_width)
+        attn_output = self.shard_attention_prod(attn_output)
         attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
 
         return AttentionLayerOutput(
@@ -690,7 +779,13 @@ class Glm4MoeLiteAttention(UnifiedAttention):
 
 
 class Glm4MoeLiteDecoderLayer(nn.Module):
-    """Single decoder layer for GLM-4-MoE-Lite."""
+    """Single decoder layer for GLM-4-MoE-Lite.
+
+    Combines Multi-head Latent Attention (MLA) and either dense MLP or MoE
+    feedforward networks with RMS normalization and residual connections.
+    Uses dense MLP for layers marked as "dense" in mlp_layer_types and
+    sparse MoE for layers marked as "sparse".
+    """
 
     def __init__(
         self,
@@ -710,19 +805,9 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
 
-        attn_block = Glm4MoeLiteAttention
-        mlp_block = Glm4MoeLiteMLP
         mlp_moe_block = Glm4MoeLiteMoE
 
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
-        self.self_attn = attn_block(
+        self.self_attn = Glm4MoeLiteAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -745,7 +830,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
                 rngs=rngs,
             )
         else:
-            self.mlp = mlp_block(
+            self.mlp = Glm4MoeLiteMLP(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -822,7 +907,13 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Glm4MoeLiteConfig, model_type="glm4_moe_lite")
 class Glm4MoeLiteModel(EasyDeLBaseModule):
-    """Base GLM-4-MoE-Lite model."""
+    """GLM-4-MoE-Lite base model implementation.
+
+    Implements the GLM-4-MoE-Lite architecture, a lightweight sparse mixture-of-experts
+    transformer model featuring Multi-head Latent Attention (MLA) with low-rank KV/Q
+    compression, grouped top-k MoE routing with shared experts, and a configurable
+    dense-to-sparse MLP schedule across layers.
+    """
 
     def __init__(
         self,
@@ -854,9 +945,15 @@ class Glm4MoeLiteModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            Glm4MoeLiteDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Glm4MoeLiteDecoderLayer(
+                remat_layer_block(
                     config=config,
                     dtype=dtype,
                     param_dtype=param_dtype,
@@ -982,7 +1079,12 @@ class Glm4MoeLiteModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=Glm4MoeLiteConfig, model_type="glm4_moe_lite")
 class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteConfig]):  # type: ignore
-    """GLM-4-MoE-Lite model with causal LM head."""
+    """GLM-4-MoE-Lite model with a language modeling head for causal language modeling.
+
+    Combines the GLM-4-MoE-Lite base model with a linear language modeling head
+    for autoregressive text generation. Uses the sparse MoE architecture with
+    MLA attention for efficient inference and training.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "glm4_moe_lite"
@@ -1038,6 +1140,21 @@ class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteCon
             case _:
                 version = "v3"
 
+        attn_mechanism = getattr(text_config, "attn_mechanism", None)
+        if hasattr(attn_mechanism, "value"):
+            attn_mechanism = attn_mechanism.value
+        is_mla_ragged = str(attn_mechanism) in (
+            "multi_latent_ragged_page_attention_v1",
+            "multi_latent_ragged_page_attention_v2",
+        )
+        if is_mla_ragged:
+            return self._create_mla_ragged_page_cache_config(
+                max_length=max_length,
+                page_size=page_size,
+                hbm_utilization=hbm_utilization,
+                dtype=dtype,
+            )
+
         return RaggedPagesCacheConfig.create(
             mesh=self.mesh,
             partition_manager=text_config.partition_manager,
@@ -1051,6 +1168,39 @@ class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteCon
             hbm_utilization=hbm_utilization,
             page_size=page_size,
             version=version,
+        )
+
+    def _create_mla_ragged_page_cache_config(
+        self,
+        max_length: int,
+        *,
+        page_size: int = 128,
+        hbm_utilization: float = 0.9,
+        dtype: jnp.dtype | None = None,
+        num_hidden_layers_override: int | None = None,
+    ):
+        """Create the MLA ragged cache using GLM4-MoE-Lite's compressed KV width."""
+        from easydel.caching import MLARaggedPagesCacheConfig
+
+        text_config = self.config.get_text_config()
+        kvdtype = text_config.kvdtype if dtype is None else dtype
+        num_hidden_layers = (
+            int(num_hidden_layers_override) if num_hidden_layers_override is not None else self.config.num_hidden_layers
+        )
+
+        # GLM4-MoE-Lite sends the absorbed MLA kernel the compressed latent
+        # ``compressed_kv`` with width ``kv_lora_rank`` plus the RoPE branch.
+        return MLARaggedPagesCacheConfig.create(
+            mesh=self.mesh,
+            partition_manager=text_config.partition_manager,
+            kvdtype=kvdtype,
+            max_model_length=max_length,
+            num_hidden_layers=num_hidden_layers,
+            num_kv_heads=self.config.num_attention_heads,
+            kv_lora_rank=self.config.kv_lora_rank,
+            qk_rope_head_dim=self.config.qk_rope_head_dim,
+            hbm_utilization=hbm_utilization,
+            page_size=page_size,
         )
 
 

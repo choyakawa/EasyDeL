@@ -39,8 +39,8 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput, DecoderLayerOutput
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
-from easydel.layers import RMSNorm as RMSNorm
 from easydel.layers.attention import UnifiedAttention
+from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseCausalLMModule
 
 from .phimoe_configuration import PhiMoeConfig
@@ -298,21 +298,6 @@ class PhiMoeSparseMoeBlock(nn.Module):
                 routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32)),
                 axis=-1,
             )
-        # HF compatibility: Phimoe router returns a dense expert-weight matrix
-        # by scattering top-k multipliers into expert columns. The current HF
-        # expert block then indexes this dense matrix by top-k *position* (0/1)
-        # rather than expert id. Reproduce this behavior for strict parity.
-        routing_weights_dense = jnp.zeros(
-            (routing_weights.shape[0], self.config.num_local_experts),
-            dtype=routing_weights.dtype,
-        )
-        token_indices = jnp.arange(routing_weights.shape[0])
-        for topk_pos in range(selected_experts.shape[-1]):
-            routing_weights_dense = routing_weights_dense.at[
-                token_indices,
-                selected_experts[:, topk_pos],
-            ].set(routing_weights[:, topk_pos])
-
         final_hidden_state = jnp.zeros_like(hidden_states)
         for index in range(self.config.num_local_experts):
             expert_layer_output = (
@@ -328,7 +313,7 @@ class PhiMoeSparseMoeBlock(nn.Module):
             for topk_pos in range(selected_experts.shape[-1]):
                 expert_weight = expert_weight + jnp.where(
                     selected_experts[:, topk_pos] == index,
-                    routing_weights_dense[:, topk_pos],
+                    routing_weights[:, topk_pos],
                     0.0,
                 )
             expert_layer_output_exp = expert_layer_output * expert_weight[:, None]
@@ -405,16 +390,7 @@ class PhiMoeDecoderLayer(nn.Module):
             "mlp.experts.down_proj$": {"splits": down_splits},
         }
 
-        attn_block = PhiMoEAttention
-        mlp_block = PhiMoeSparseMoeBlock
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.self_attn = attn_block(
+        self.self_attn = PhiMoEAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -422,7 +398,7 @@ class PhiMoeDecoderLayer(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.block_sparse_moe = mlp_block(
+        self.block_sparse_moe = PhiMoeSparseMoeBlock(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -430,17 +406,17 @@ class PhiMoeDecoderLayer(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.input_layernorm = RMSNorm(
-            dim=config.hidden_size,
-            eps=config.rms_norm_eps,
+        self.input_layernorm = LayerNorm(
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
 
-        self.post_attention_layernorm = RMSNorm(
-            dim=config.hidden_size,
-            eps=config.rms_norm_eps,
+        self.post_attention_layernorm = LayerNorm(
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
@@ -572,9 +548,15 @@ class PhiMoeModel(EasyDeLBaseModule):
         )
 
         self.embed_dropout = nn.Dropout(config.embd_pdrop)
+        remat_layer_block = auto_remat(
+            PhiMoeDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                PhiMoeDecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=idx,
                     dtype=dtype,
@@ -585,9 +567,9 @@ class PhiMoeModel(EasyDeLBaseModule):
                 for idx in range(self.config.num_hidden_layers)
             ]
         )
-        self.norm = RMSNorm(
-            dim=config.hidden_size,
-            eps=config.rms_norm_eps,
+        self.norm = LayerNorm(
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
@@ -851,7 +833,7 @@ class PhiMoeForCausalLM(BaseCausalLMModule[PhiMoeModel, PhiMoeConfig]):
         hidden_states = outputs.last_hidden_state
         lm_logits = None
         if apply_lm_head:
-            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
+            lm_logits = self.compute_lm_logits(hidden_states)
 
         return CausalLMOutput(
             logits=lm_logits,

@@ -137,7 +137,15 @@ class WeightScheduler:
 
 @dataclass
 class MixedShardState:
-    """State for tracking position in mixed iteration."""
+    """State for tracking position in mixed iteration.
+
+    Attributes:
+        source_index: Index of the current source dataset.
+        shard_index: Index of the current shard within the source.
+        row_index: Current row position within the shard.
+        block_index: Current mixing block index.
+        examples_yielded: Total number of examples yielded so far.
+    """
 
     source_index: int
     shard_index: int
@@ -183,8 +191,16 @@ class MixedShardedSource(ShardedDataSource[dict]):
             n = len(self._names)
             self._weights = {name: 1.0 / n for name in self._names}
         else:
-            total = sum(weights.values())
-            self._weights = {k: v / total for k, v in weights.items()}
+            missing = set(self._names) - set(weights.keys())
+            if missing:
+                raise ValueError(f"Weight keys must match source names. Missing: {sorted(missing)}")
+            extra = set(weights.keys()) - set(self._names)
+            if extra:
+                raise ValueError(f"Weight keys must match source names. Extra: {sorted(extra)}")
+            total = float(sum(weights[name] for name in self._names))
+            if total <= 0:
+                raise ValueError("Sum of mixture weights must be > 0.")
+            self._weights = {name: float(weights[name]) / total for name in self._names}
 
     @property
     def shard_names(self) -> "Sequence[str]":
@@ -213,7 +229,17 @@ class MixedShardedSource(ShardedDataSource[dict]):
         return {name: int(counts_arr[i]) for i, name in enumerate(self._names)}
 
     def open_shard(self, _shard_name: str) -> "Iterator[dict]":
-        """Open the mixed shard and iterate."""
+        """Open the mixed shard and iterate over interleaved examples.
+
+        Yields examples from all sources in deterministic blocks, with
+        per-block shuffling for randomness within each block.
+
+        Args:
+            _shard_name: Shard identifier (ignored, single virtual shard).
+
+        Yields:
+            Examples from the mixed sources, with "__source__" metadata added.
+        """
         # Create iterators for all sources (from all their shards)
         iters = {}
         for name, source in self._sources.items():
@@ -289,9 +315,12 @@ class MixedShardedSource(ShardedDataSource[dict]):
 
 
 class MixStage(BaseStage):
-    """Pipeline stage for mixing multiple datasets.
+    """Pipeline stage for mixing multiple datasets into one.
 
-    Supports static weights and dynamic weight scheduling.
+    Supports static weights and dynamic weight scheduling. When only
+    one dataset is present, passes it through unchanged. Creates a
+    MixedShardedSource that interleaves examples from multiple sources
+    in deterministic blocks.
     """
 
     def __init__(self, config: MixStageConfig | None = None):

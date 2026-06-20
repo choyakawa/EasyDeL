@@ -60,6 +60,8 @@ Example:
 import jax
 from eformer import common_types
 from ejkernel.modules import ragged_decode_attention  # pyright: ignore[reportMissingTypeStubs]
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
+from jax import numpy as jnp
 from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array, Float
 
@@ -67,7 +69,7 @@ from easydel.caching import TransformerCacheView
 from easydel.caching.transformer import TransformerMetadata
 
 from .._attention_outputs import AttentionOutput
-from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
+from .._operation_impl import OperationImpl, OperationRegistry
 from ..requirements import (
     CacheType,
     ExecutionMode,
@@ -75,6 +77,99 @@ from ..requirements import (
     OperationRequirements,
 )
 from .vanilla_attention import VanillaAttn
+
+
+def _slice_decode_window_for_vanilla_fallback(
+    key: Float[Array, "batch kv_seq_len num_kv_heads head_dim"],
+    value: Float[Array, "batch kv_seq_len num_kv_heads head_dim"],
+    mask_info: MaskInfo | None,
+    cache_metadata: TransformerMetadata,
+    sliding_window: int | tuple[int, int] | None,
+) -> tuple[
+    Float[Array, "batch kv_seq_len num_kv_heads head_dim"],
+    Float[Array, "batch kv_seq_len num_kv_heads head_dim"],
+    MaskInfo | None,
+]:
+    """Bake the active decode KV window into TPU/CPU vanilla-attention fallback inputs.
+
+    GPU decode uses a dedicated kernel that interprets sliding windows in absolute
+    cache coordinates. The vanilla fallback does not, so for non-GPU decode we
+    explicitly slice the cached KV axis and the materialized mask to the live
+    per-request window before calling the generic attention implementation.
+    """
+    if sliding_window is None:
+        return key, value, mask_info
+
+    if isinstance(sliding_window, int):
+        left_window = right_window = int(sliding_window)
+    else:
+        left_window, right_window = map(int, sliding_window)
+
+    kv_len = int(key.shape[1])
+    if kv_len <= 0:
+        return key, value, mask_info
+
+    width = min(left_window + right_window + 1, kv_len)
+    cache_indexs = jnp.asarray(cache_metadata.indexs, dtype=jnp.int32).reshape(-1)
+    current_rows = jnp.maximum(cache_indexs - 1, 0)
+    start_k = jnp.clip(current_rows - left_window, 0, jnp.maximum(kv_len - width, 0))
+
+    key = jax.vmap(
+        lambda row, sk: jax.lax.dynamic_slice_in_dim(row, sk, width, axis=0),
+        in_axes=(0, 0),
+        out_axes=0,
+    )(key, start_k)
+    value = jax.vmap(
+        lambda row, sk: jax.lax.dynamic_slice_in_dim(row, sk, width, axis=0),
+        in_axes=(0, 0),
+        out_axes=0,
+    )(value, start_k)
+
+    if mask_info is None or mask_info.attention_mask is None:
+        return key, value, mask_info
+
+    attention_mask = mask_info.attention_mask
+    if attention_mask.ndim != 4 or attention_mask.shape[-1] != kv_len:
+        return key, value, mask_info
+
+    attention_mask = jax.vmap(
+        lambda row, sk: jax.lax.dynamic_slice_in_dim(row, sk, width, axis=2),
+        in_axes=(0, 0),
+        out_axes=0,
+    )(attention_mask, start_k)
+
+    replace_kwargs: dict[str, object] = {
+        "attention_mask": attention_mask,
+        "sliding_window_baked_in": True,
+    }
+
+    kv_segment_ids = mask_info.kv_segment_ids
+    if kv_segment_ids is not None:
+        if kv_segment_ids.ndim == 2 and kv_segment_ids.shape[-1] == kv_len:
+            kv_segment_ids = jax.vmap(
+                lambda row, sk: jax.lax.dynamic_slice_in_dim(row, sk, width, axis=0),
+                in_axes=(0, 0),
+                out_axes=0,
+            )(kv_segment_ids, start_k)
+            replace_kwargs["kv_segment_ids"] = kv_segment_ids
+        elif kv_segment_ids.ndim == 3 and kv_segment_ids.shape[-1] == kv_len:
+            kv_segment_ids = jax.vmap(
+                lambda row, sk: jax.lax.dynamic_slice_in_dim(row, sk, width, axis=1),
+                in_axes=(0, 0),
+                out_axes=0,
+            )(kv_segment_ids, start_k)
+            replace_kwargs["kv_segment_ids"] = kv_segment_ids
+
+    kv_positions = mask_info.kv_positions
+    if kv_positions is not None and kv_positions.shape[-1] == kv_len:
+        kv_positions = jax.vmap(
+            lambda row, sk: jax.lax.dynamic_slice_in_dim(row, sk, width, axis=0),
+            in_axes=(0, 0),
+            out_axes=0,
+        )(kv_positions, start_k)
+        replace_kwargs["kv_positions"] = kv_positions
+
+    return key, value, mask_info.replace(**replace_kwargs)
 
 
 @OperationRegistry.register
@@ -101,16 +196,6 @@ class AutoRegressiveDecodeAttn(OperationImpl):
             The string "autoregressive_decodeattn".
         """
         return "autoregressive_decodeattn"
-
-    def get_impl_metadata(self) -> OperationMetadata:
-        """
-        Returns the metadata associated with this attention implementation instance.
-
-        Returns:
-            The `OperationMetadata` provided during initialization.
-        """
-        assert self.metadata is not None
-        return self.metadata
 
     @classmethod
     def get_requirements(
@@ -174,23 +259,35 @@ class AutoRegressiveDecodeAttn(OperationImpl):
                 - attention_weights: None (not computed for memory efficiency).
         """
         if jax.default_backend() != "gpu":
+            mask_info = ignores.pop("mask_info", None)
+            ignores.pop("causal", None)
+            key, value, mask_info = _slice_decode_window_for_vanilla_fallback(
+                key=key,
+                value=value,
+                mask_info=mask_info,
+                cache_metadata=cache_metadata,
+                sliding_window=sliding_window,
+            )
             vanilla_attn: VanillaAttn = VanillaAttn(self.metadata)
             fallback_output_1: AttentionOutput = vanilla_attn(
                 query=query,
                 key=key,
                 value=value,
+                mask_info=mask_info,
                 cache_metadata=cache_metadata,
                 softmax_scale=softmax_scale,
-                sliding_window=sliding_window,
+                sliding_window=None,
                 logits_soft_cap=logits_soft_cap,
                 softmax_aux=softmax_aux,
+                causal=False,
                 **ignores,
             )
             return fallback_output_1
         head_dim: int = query.shape[-1]
         softmax_scale_computed: float = softmax_scale if softmax_scale is not None else head_dim**-0.5
         model_mode: common_types.RUNTIME_MODE_TYPES = self.get_mode(query=query, BTHD=True)  # type: ignore
-        assert model_mode == common_types.MODE_DECODE, "AutoRegressiveDecodeAttn requires decode mode"
+        if model_mode != common_types.MODE_DECODE:
+            raise ValueError("AutoRegressiveDecodeAttn requires decode mode")
 
         shardings = self.metadata.get_shardings(model_mode, layout="bthd")
 

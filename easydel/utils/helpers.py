@@ -29,6 +29,7 @@ Functions:
     set_loggers_level: Set logging level globally
     capture_time: Context manager for timing
     get_cache_dir: Get EasyDeL cache directory
+    is_remote_path: Return whether a path uses a non-local URI scheme
     quiet: Context manager to suppress output
     check_bool_flag: Parse boolean environment variables
 
@@ -70,6 +71,23 @@ except ModuleNotFoundError:
     wandb = None
 
 logger = get_logger(__name__)
+
+
+def is_remote_path(path: os.PathLike[str] | str | object) -> bool:
+    """Return whether a path targets a remote/object-store backend.
+
+    Treats URI-style paths with a non-``file`` scheme as remote, such as
+    ``gs://...`` or ``s3://...``. Plain filesystem paths are treated as local.
+    """
+    try:
+        path_str = os.fspath(path)
+    except TypeError:
+        path_str = str(path)
+
+    scheme_end = path_str.find("://")
+    if scheme_end <= 0:
+        return False
+    return path_str[:scheme_end].lower() != "file"
 
 
 @contextlib.contextmanager
@@ -163,6 +181,7 @@ class Timer:
         self.started = False
 
     def reset(self):
+        """Reset the timer, clearing all accumulated elapsed time."""
         self.elapsed = 0.0
         self.started = False
         self.start_time = 0.0
@@ -234,7 +253,23 @@ class Timers:
         return self.timers[name]
 
     def write(self, names, iteration, normalizer=1.0, reset=False):
-        assert normalizer > 0.0
+        """Write timer values to configured logging backends.
+
+        Logs normalized elapsed times for the specified timers to
+        TensorBoard and/or Weights & Biases.
+
+        Args:
+            names: Iterable of timer names to write.
+            iteration: Training/evaluation step number for the log entry.
+            normalizer: Divisor applied to elapsed times (e.g., number
+                of accumulation steps). Must be positive.
+            reset: Whether to reset each timer after reading.
+
+        Raises:
+            ValueError: If ``normalizer`` is not positive.
+        """
+        if normalizer <= 0.0:
+            raise ValueError("normalizer must be greater than 0.0")
         for name in names:
             value = self.timers[name].elapsed_time(reset=reset) / normalizer
 
@@ -252,7 +287,21 @@ class Timers:
                     wandb.log({f"timers/{name}": value}, step=iteration)
 
     def log(self, names, normalizer=1.0, reset=True):
-        assert normalizer > 0.0
+        """Log timer values to the console with color-coded formatting.
+
+        Prints elapsed times in human-readable units (ms/sec/min/hr) with
+        color coding based on magnitude.
+
+        Args:
+            names: Timer name or iterable of timer names to log.
+            normalizer: Divisor applied to elapsed times. Must be positive.
+            reset: Whether to reset each timer after reading.
+
+        Raises:
+            ValueError: If ``normalizer`` is not positive.
+        """
+        if normalizer <= 0.0:
+            raise ValueError("normalizer must be greater than 0.0")
 
         if isinstance(names, str):
             names = [names]
@@ -278,6 +327,16 @@ class Timers:
 
     @contextlib.contextmanager
     def timed(self, name, log=True, reset=True):
+        """Context manager that times a block and optionally logs the result.
+
+        Args:
+            name: Timer name.
+            log: Whether to print the elapsed time on exit.
+            reset: Whether to reset the timer after logging.
+
+        Yields:
+            The ``Timer`` instance for the given name.
+        """
         timer = self(name)
         try:
             timer.start()

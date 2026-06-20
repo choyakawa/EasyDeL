@@ -75,6 +75,7 @@ from easydel.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
 from easydel.caching._metadatabuilder import AttentionMetadataBuilder
 from easydel.utils.helpers import check_bool_flag
 
+from ...core.dp_sharding import dp_shard_page_bounds, pages_per_dp_shard
 from ...page_table import PAGE_TABLE_PADDING_VAL, SLOT_MAPPING_PADDING_VAL
 from ..execution_types import BatchMetadata
 
@@ -178,7 +179,7 @@ class BatchMetadataPreparer:
         self._scheduled_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
         self._packed_qsl_seqlens_cpu = np.zeros((2, self.max_num_reqs + 1), dtype=np.int32)
         self._packed_i32_padded_cpu = np.zeros((3, self.max_num_reqs), dtype=np.int32)
-        self._packed_f32_padded_cpu = np.zeros((3, self.max_num_reqs), dtype=np.float32)
+        self._packed_f32_padded_cpu = np.zeros((6, self.max_num_reqs), dtype=np.float32)
         self._packed_misc_i32_cpu = np.zeros((5,), dtype=np.int32)
         self._arange_cpu = np.arange(self.max_num_tokens, dtype=np.int32)
         self._pages_tables_cpu = np.full(
@@ -200,7 +201,7 @@ class BatchMetadataPreparer:
         self._async_scheduled_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
         self._async_packed_qsl_seqlens_cpu = np.zeros((2, self.max_num_reqs + 1), dtype=np.int32)
         self._async_packed_i32_padded_cpu = np.zeros((3, self.max_num_reqs), dtype=np.int32)
-        self._async_packed_f32_padded_cpu = np.zeros((3, self.max_num_reqs), dtype=np.float32)
+        self._async_packed_f32_padded_cpu = np.zeros((6, self.max_num_reqs), dtype=np.float32)
         self._async_packed_misc_i32_cpu = np.zeros((5,), dtype=np.int32)
         self._async_pages_tables_cpu = np.full(
             (self._num_reqs_max_model_len, self._max_pages_per_req),
@@ -217,6 +218,9 @@ class BatchMetadataPreparer:
         self._async_top_p_cpu = np.zeros((self.max_num_reqs,), dtype=np.float32)
         self._async_top_k_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
         self._async_min_p_cpu = np.zeros((self.max_num_reqs,), dtype=np.float32)
+        self._async_frequency_penalties_cpu = np.zeros((self.max_num_reqs,), dtype=np.float32)
+        self._async_presence_penalties_cpu = np.zeros((self.max_num_reqs,), dtype=np.float32)
+        self._async_repetition_penalties_cpu = np.ones((self.max_num_reqs,), dtype=np.float32)
         self._async_page_table_cpu = np.zeros((self.max_num_reqs, self._max_pages_per_req), dtype=np.int32)
 
         # Device cache for `pages_tables`. This table is derived from the CPU page
@@ -292,14 +296,13 @@ class BatchMetadataPreparer:
             )
 
         total_pages = int(getattr(self.metadata, "num_pages", 0) or 0)
-        if total_pages <= 0 or total_pages % dp_size != 0:
-            raise ValueError(
-                "DP-local page-table invariant requires total pages divisible by data-parallel size: "
-                f"num_pages={total_pages}, dp_size={dp_size}."
-            )
+        pages_per_shard = pages_per_dp_shard(total_pages, dp_size)
+        if pages_per_shard is None:
+            # DP-local page partitioning is only valid when usable pages
+            # (excluding null page 0) split evenly across DP shards.
+            return
 
         rows_per_shard = total_rows // dp_size
-        pages_per_shard = total_pages // dp_size
         page_size = max(1, int(getattr(self.metadata, "page_size", 1)))
         max_pages_per_req = int(page_table_cpu.shape[1])
 
@@ -309,8 +312,7 @@ class BatchMetadataPreparer:
                 continue
 
             req_shard = min(req_idx // rows_per_shard, dp_size - 1)
-            page_lo = req_shard * pages_per_shard
-            page_hi = page_lo + pages_per_shard
+            page_lo, page_hi = dp_shard_page_bounds(req_shard, pages_per_shard)
             page_cnt = min((seq_len + page_size - 1) // page_size, max_pages_per_req)
 
             row = np.asarray(page_table_cpu[req_idx, :page_cnt], dtype=np.int32)
@@ -513,6 +515,9 @@ class BatchMetadataPreparer:
         top_p_cpu: np.ndarray,
         top_k_cpu: np.ndarray,
         min_p_cpu: np.ndarray,
+        frequency_penalties_cpu: np.ndarray,
+        presence_penalties_cpu: np.ndarray,
+        repetition_penalties_cpu: np.ndarray,
         page_table_cpu: np.ndarray,
         page_table_version: int | None,
         padded_num_reqs_in: int,
@@ -535,6 +540,9 @@ class BatchMetadataPreparer:
             top_p_cpu: Top-p sampling parameters per request.
             top_k_cpu: Top-k sampling parameters per request.
             min_p_cpu: Min-p sampling parameters per request.
+            frequency_penalties_cpu: Frequency penalties per request.
+            presence_penalties_cpu: Presence penalties per request.
+            repetition_penalties_cpu: Repetition penalties per request.
             page_table_cpu: Page table [max_reqs, max_pages_per_req].
             page_table_version: Optional version for cache invalidation.
             padded_num_reqs_in: Requested padding for request count.
@@ -647,6 +655,13 @@ class BatchMetadataPreparer:
                 out=seq_lens[:num_requests],
                 dtype=np.int32,
             )
+            # Zero out seq_lens for unscheduled rows (budget-skipped running
+            # requests that stay in the buffer). Without this, the attention
+            # kernel sees context_lens > 0 with 0 query tokens, which can
+            # cause Pallas kernel hangs.
+            _unsched = scheduled[:num_requests] == 0
+            if np.any(_unsched):
+                seq_lens[:num_requests] *= (~_unsched).astype(np.int32)
             self._enforce_dp_local_page_tables(
                 num_requests=num_requests,
                 scheduled=scheduled,
@@ -684,10 +699,13 @@ class BatchMetadataPreparer:
             if num_requests > 0:
                 is_decode = (scheduled[:num_requests] == 1) & (num_computed_tokens_cpu[:num_requests] > 0)
                 decode_count = int(np.sum(is_decode))
+                prefill_count = int(np.sum((scheduled[:num_requests] > 0) & (~is_decode)))
             else:
                 decode_count = 0
+                prefill_count = 0
+            prefill_end = decode_count + prefill_count
             request_distribution[0] = decode_count
-            request_distribution[1] = decode_count
+            request_distribution[1] = prefill_end
             request_distribution[2] = num_requests
 
         if self._use_slot_mapping:
@@ -719,20 +737,27 @@ class BatchMetadataPreparer:
         packed_f32_padded[0, :padded_num_reqs] = temperature_cpu[:padded_num_reqs]
         packed_f32_padded[1, :padded_num_reqs] = top_p_cpu[:padded_num_reqs]
         packed_f32_padded[2, :padded_num_reqs] = min_p_cpu[:padded_num_reqs]
+        packed_f32_padded[3, :padded_num_reqs] = frequency_penalties_cpu[:padded_num_reqs]
+        packed_f32_padded[4, :padded_num_reqs] = presence_penalties_cpu[:padded_num_reqs]
+        packed_f32_padded[5, :padded_num_reqs] = repetition_penalties_cpu[:padded_num_reqs]
 
         packed_misc_i32.fill(0)
         packed_misc_i32[0] = np.int32(num_requests)
         packed_misc_i32[1] = np.int32(padded_num_reqs)
         packed_misc_i32[2:5] = request_distribution
 
+        # Transfer full max_num_reqs arrays (not sliced to padded_num_reqs) so
+        # that BatchMetadata shapes are fixed and the backbone can be compiled
+        # once per num_tokens bucket.  The extra transfer is ~9KB at
+        # max_num_reqs=256 — negligible vs the compilation savings.
         if self._use_slot_mapping:
             host_payload = (
                 input_ids,
                 positions,
                 packed_qsl_seqlens,
                 pages_tables_payload,
-                packed_i32_padded[:, :padded_num_reqs],
-                packed_f32_padded[:, :padded_num_reqs],
+                packed_i32_padded,
+                packed_f32_padded,
                 packed_misc_i32,
                 slot_mapping_cpu if slot_mapping_cpu is not None else slot_mapping_placeholder,
                 num_kv_update_cpu,
@@ -745,8 +770,8 @@ class BatchMetadataPreparer:
                 positions,
                 packed_qsl_seqlens,
                 pages_tables_payload,
-                packed_i32_padded[:, :padded_num_reqs],
-                packed_f32_padded[:, :padded_num_reqs],
+                packed_i32_padded,
+                packed_f32_padded,
                 packed_misc_i32,
                 scheduled_full_cpu,
                 active_mask_full_cpu,
@@ -768,6 +793,9 @@ class BatchMetadataPreparer:
         top_p_cpu: np.ndarray,
         top_k_cpu: np.ndarray,
         min_p_cpu: np.ndarray,
+        frequency_penalties_cpu: np.ndarray,
+        presence_penalties_cpu: np.ndarray,
+        repetition_penalties_cpu: np.ndarray,
         page_table_cpu: np.ndarray,
         padded_num_reqs_in: int,
         page_table_version: int | None = None,
@@ -802,6 +830,9 @@ class BatchMetadataPreparer:
             top_p_cpu: Top-p per request [max_num_reqs].
             top_k_cpu: Top-k per request [max_num_reqs].
             min_p_cpu: Min-p per request [max_num_reqs].
+            frequency_penalties_cpu: Frequency penalty per request [max_num_reqs].
+            presence_penalties_cpu: Presence penalty per request [max_num_reqs].
+            repetition_penalties_cpu: Repetition penalty per request [max_num_reqs].
             page_table_cpu: Page table [max_num_reqs, max_pages_per_req].
             padded_num_reqs_in: Requested padding for request count bucketing.
             page_table_version: Optional version for page table caching.
@@ -837,6 +868,9 @@ class BatchMetadataPreparer:
             top_p_cpu=top_p_cpu,
             top_k_cpu=top_k_cpu,
             min_p_cpu=min_p_cpu,
+            frequency_penalties_cpu=frequency_penalties_cpu,
+            presence_penalties_cpu=presence_penalties_cpu,
+            repetition_penalties_cpu=repetition_penalties_cpu,
             page_table_cpu=page_table_cpu,
             page_table_version=page_table_version,
             padded_num_reqs_in=int(padded_num_reqs_in),
@@ -845,6 +879,13 @@ class BatchMetadataPreparer:
         host_build_took = time.time() - host_build_start
 
         device_put_start = time.time()
+
+        # Multi-host: broadcast host-side arrays from coordinator (process 0)
+        # so all hosts pass identical data to `device_put` with replicated sharding.
+        if jax.process_count() > 1:
+            from jax.experimental import multihost_utils
+
+            host_payload = multihost_utils.broadcast_one_to_all(host_payload)
 
         slot_mapping_dev = None
         num_kv_update_dev = None
@@ -988,6 +1029,9 @@ class BatchMetadataPreparer:
         top_p_cpu: np.ndarray,
         top_k_cpu: np.ndarray,
         min_p_cpu: np.ndarray,
+        frequency_penalties_cpu: np.ndarray,
+        presence_penalties_cpu: np.ndarray,
+        repetition_penalties_cpu: np.ndarray,
         page_table_cpu: np.ndarray,
         padded_num_reqs_in: int,
         page_table_version: int | None = None,
@@ -1015,6 +1059,9 @@ class BatchMetadataPreparer:
             top_p_cpu: Top-p per request.
             top_k_cpu: Top-k per request.
             min_p_cpu: Min-p per request.
+            frequency_penalties_cpu: Frequency penalty per request.
+            presence_penalties_cpu: Presence penalty per request.
+            repetition_penalties_cpu: Repetition penalty per request.
             page_table_cpu: Page table for all requests.
             padded_num_reqs_in: Requested padding for request count.
             page_table_version: Optional version for page table caching.
@@ -1038,6 +1085,9 @@ class BatchMetadataPreparer:
         np.copyto(self._async_top_p_cpu, top_p_cpu)
         np.copyto(self._async_top_k_cpu, top_k_cpu)
         np.copyto(self._async_min_p_cpu, min_p_cpu)
+        np.copyto(self._async_frequency_penalties_cpu, frequency_penalties_cpu)
+        np.copyto(self._async_presence_penalties_cpu, presence_penalties_cpu)
+        np.copyto(self._async_repetition_penalties_cpu, repetition_penalties_cpu)
         np.copyto(self._async_page_table_cpu, page_table_cpu)
 
         host_build_start = time.time()
@@ -1051,6 +1101,9 @@ class BatchMetadataPreparer:
             top_p_cpu=self._async_top_p_cpu,
             top_k_cpu=self._async_top_k_cpu,
             min_p_cpu=self._async_min_p_cpu,
+            frequency_penalties_cpu=self._async_frequency_penalties_cpu,
+            presence_penalties_cpu=self._async_presence_penalties_cpu,
+            repetition_penalties_cpu=self._async_repetition_penalties_cpu,
             page_table_cpu=self._async_page_table_cpu,
             page_table_version=page_table_version,
             padded_num_reqs_in=int(padded_num_reqs_in),
@@ -1060,6 +1113,10 @@ class BatchMetadataPreparer:
         host_build_took = time.time() - host_build_start
 
         device_put_start = time.time()
+        if jax.process_count() > 1:
+            from jax.experimental import multihost_utils
+
+            host_payload = multihost_utils.broadcast_one_to_all(host_payload)
         self._pending_transfer = jax.device_put(host_payload, self._empty_sharding)
         device_put_took = time.time() - device_put_start
         self._pending_transfer_metadata = {

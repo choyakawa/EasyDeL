@@ -54,7 +54,7 @@ class SDPOConfig(GRPOConfig):
     """
 
     trainer_prefix: str | None = field(
-        default="sdpotrainer",
+        default="SDPO",
         metadata={"help": "Default prefix name for the trainer checkpoint directory."},
     )
 
@@ -98,12 +98,23 @@ class SDPOConfig(GRPOConfig):
         },
     )
 
-    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
+    def __post_init__(
+        self,
+        max_sequence_length: int | None,
+        quantization_block: int | None,
+    ):
         if self.distillation_type not in ("kl", "jsd"):
             raise ValueError(f"`distillation_type` must be 'kl' or 'jsd', got '{self.distillation_type}'.")
         super().__post_init__(
             max_sequence_length=max_sequence_length,
             quantization_block=quantization_block,
         )
+        # The teacher context is [prompt | feedback | completion] and all three
+        # must fit within max_length.  Rather than growing max_length (which
+        # would break even-sized allocations), shrink max_completion_length so
+        # that prompt + feedback + completion == max_length.
+        teacher_total = self.max_prompt_length + self.max_feedback_length + self.max_completion_length
+        if teacher_total > self.max_length:
+            self.max_completion_length = self.max_length - self.max_prompt_length - self.max_feedback_length
 
     __hash__ = hash_fn

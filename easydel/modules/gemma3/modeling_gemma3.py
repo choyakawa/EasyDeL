@@ -429,18 +429,7 @@ class Gemma3DecoderLayer(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-        mlp_block = Gemma3MLP
-        attn_block = Gemma3Attention
-
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
-        self.self_attn = attn_block(
+        self.self_attn = Gemma3Attention(
             self.config,
             layer_idx=self.layer_idx,
             dtype=dtype,
@@ -449,7 +438,7 @@ class Gemma3DecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-        self.mlp = mlp_block(
+        self.mlp = Gemma3MLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -610,9 +599,15 @@ class Gemma3TextModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            Gemma3DecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Gemma3DecoderLayer(
+                remat_layer_block(
                     self.config,
                     layer_idx=i,
                     dtype=dtype,
@@ -641,7 +636,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
             max_position=self.config.granted_freq_max_position_embedding,
             base=self.config.rope_local_base_freq,
             rope_scaling=None,
-        ).astype(jnp.bfloat16)
+        )
 
         return ModuleCaches(frequencies)
 
@@ -953,20 +948,9 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]): 
             token_type_ids=token_type_ids,
         )
 
-        hidden_states = outputs.last_hidden_state
-
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
         lm_logits = None
         if apply_lm_head:
-            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
-        if self.config.final_logit_softcapping is not None:
-            assert lm_logits is not None
-            cap = jnp.array(self.config.final_logit_softcapping, dtype=lm_logits.dtype)
-            lm_logits = cap * jax.nn.tanh(lm_logits / cap)
+            lm_logits = self.compute_lm_logits(self.prepare_lm_head_inputs(outputs.last_hidden_state))
 
         return CausalLMOutput(
             logits=lm_logits,
@@ -982,6 +966,40 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]): 
         Decoder-Only models don't have an encoder.
         """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def compute_lm_logits(self, hidden_states: Array) -> Array:
+        """Project hidden states to vocabulary logits with optional soft-capping.
+
+        Calls the base LM-head projection, then applies Gemma-3's logit
+        soft-capping when ``config.final_logit_softcapping`` is set:
+        ``cap * tanh(logits / cap)``, which smoothly bounds logit
+        magnitudes to ``[-cap, cap]``.
+
+        Args:
+            hidden_states: Hidden representations, shape ``[B, T, H]``.
+
+        Returns:
+            Logits with shape ``[B, T, V]``, optionally soft-capped.
+        """
+        lm_logits = super().compute_lm_logits(hidden_states)
+        if self.config.final_logit_softcapping is not None:
+            cap = jnp.array(self.config.final_logit_softcapping, dtype=lm_logits.dtype)
+            lm_logits = cap * jax.nn.tanh(lm_logits / cap)
+        return lm_logits
+
+    def make_lm_head_fn(self):
+        """Trace-safe projection with Gemma-3 soft-capping."""
+        base_fn = super().make_lm_head_fn()
+        cap_value = self.config.final_logit_softcapping
+        if cap_value is None:
+            return base_fn
+
+        def _project(hidden_states):
+            logits = base_fn(hidden_states)
+            cap = jnp.array(cap_value, dtype=logits.dtype)
+            return cap * jax.nn.tanh(logits / cap)
+
+        return _project
 
     def get_decoder(self):
         """
@@ -1793,7 +1811,7 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
 
         lm_logits = None
         if apply_lm_head:
-            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
+            lm_logits = self.compute_lm_logits(hidden_states)
 
         return VLMCausalLMOutput(
             logits=lm_logits,
@@ -1821,6 +1839,21 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
             cap = jnp.array(self.config.get_text_config().final_logit_softcapping, dtype=lm_logits.dtype)
             lm_logits = cap * jax.nn.tanh(lm_logits / cap)
         return lm_logits
+
+    def make_lm_head_fn(self):
+        """Trace-safe projection with Gemma-3 VLM soft-capping (bypasses nn.remat)."""
+        _native = self.lm_head.native_forward
+        cap_value = self.config.get_text_config().final_logit_softcapping
+        _cap = self.apply_logit_cap
+
+        def _project(hidden_states):
+            lm_logits = _cap(_native(hidden_states))
+            if cap_value is not None:
+                cap = jnp.array(cap_value, dtype=lm_logits.dtype)
+                lm_logits = cap * jax.nn.tanh(lm_logits / cap)
+            return lm_logits
+
+        return _project
 
     def init_cache(
         self,
